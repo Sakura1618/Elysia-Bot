@@ -22,6 +22,8 @@ type RuntimeConfig struct {
 	LogLevel            string `yaml:"log_level"`
 	HTTPPort            int    `yaml:"http_port"`
 	SQLitePath          string `yaml:"sqlite_path,omitempty"`
+	SmokeStoreBackend   string `yaml:"smoke_store_backend,omitempty"`
+	PostgresDSN         string `yaml:"postgres_dsn,omitempty"`
 	SchedulerIntervalMs int    `yaml:"scheduler_interval_ms,omitempty"`
 }
 
@@ -111,6 +113,12 @@ func applyEnvOverride(cfg *Config) {
 	if value := strings.TrimSpace(os.Getenv("BOT_PLATFORM_RUNTIME_SQLITE_PATH")); value != "" {
 		cfg.Runtime.SQLitePath = value
 	}
+	if value := strings.TrimSpace(os.Getenv("BOT_PLATFORM_RUNTIME_SMOKE_STORE_BACKEND")); value != "" {
+		cfg.Runtime.SmokeStoreBackend = value
+	}
+	if value := strings.TrimSpace(os.Getenv("BOT_PLATFORM_RUNTIME_POSTGRES_DSN")); value != "" {
+		cfg.Runtime.PostgresDSN = value
+	}
 	if value := strings.TrimSpace(os.Getenv("BOT_PLATFORM_RUNTIME_SCHEDULER_INTERVAL_MS")); value != "" {
 		if interval, err := strconv.Atoi(value); err == nil {
 			cfg.Runtime.SchedulerIntervalMs = interval
@@ -121,6 +129,11 @@ func applyEnvOverride(cfg *Config) {
 func applyRuntimeDefaults(cfg *Config) {
 	if cfg.Runtime.SQLitePath == "" {
 		cfg.Runtime.SQLitePath = filepath.Join("data", "dev", "runtime.sqlite")
+	}
+	cfg.Runtime.SmokeStoreBackend = strings.ToLower(strings.TrimSpace(cfg.Runtime.SmokeStoreBackend))
+	cfg.Runtime.PostgresDSN = strings.TrimSpace(cfg.Runtime.PostgresDSN)
+	if cfg.Runtime.SmokeStoreBackend == "" {
+		cfg.Runtime.SmokeStoreBackend = "sqlite"
 	}
 	if cfg.Runtime.SchedulerIntervalMs <= 0 {
 		cfg.Runtime.SchedulerIntervalMs = 100

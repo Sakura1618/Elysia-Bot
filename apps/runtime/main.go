@@ -39,6 +39,7 @@ type runtimeApp struct {
 	onebotIngress   *adapteronebot.IngressConverter
 	audits          *runtimecore.InMemoryAuditLog
 	state           *runtimecore.SQLiteStateStore
+	smokeStore      runtimeSmokeStore
 	lifecycle       *runtimecore.PluginLifecycleService
 	queue           *runtimecore.JobQueue
 	scheduler       *runtimecore.Scheduler
@@ -49,7 +50,70 @@ type runtimeApp struct {
 
 type appRuntimeSettings struct {
 	SQLitePath          string
+	SmokeStoreBackend   string
+	PostgresDSN         string
 	SchedulerIntervalMs int
+}
+
+type runtimeSmokeStore interface {
+	RecordEvent(context.Context, eventmodel.Event) error
+	SaveIdempotencyKey(context.Context, string, string) error
+	HasIdempotencyKey(context.Context, string) (bool, error)
+	Counts(context.Context) (map[string]int, error)
+	Close() error
+}
+
+type sqliteRuntimeSmokeStore struct {
+	store *runtimecore.SQLiteStateStore
+}
+
+func (s sqliteRuntimeSmokeStore) RecordEvent(ctx context.Context, event eventmodel.Event) error {
+	return s.store.RecordEvent(ctx, event)
+}
+
+func (s sqliteRuntimeSmokeStore) SaveIdempotencyKey(ctx context.Context, key string, eventID string) error {
+	return s.store.SaveIdempotencyKey(ctx, key, eventID)
+}
+
+func (s sqliteRuntimeSmokeStore) HasIdempotencyKey(ctx context.Context, key string) (bool, error) {
+	return s.store.HasIdempotencyKey(ctx, key)
+}
+
+func (s sqliteRuntimeSmokeStore) Counts(ctx context.Context) (map[string]int, error) {
+	return s.store.Counts(ctx)
+}
+
+func (s sqliteRuntimeSmokeStore) Close() error {
+	return nil
+}
+
+type postgresRuntimeSmokeStore struct {
+	store *runtimecore.PostgresStore
+}
+
+func (s postgresRuntimeSmokeStore) RecordEvent(ctx context.Context, event eventmodel.Event) error {
+	return s.store.SaveEvent(ctx, event)
+}
+
+func (s postgresRuntimeSmokeStore) SaveIdempotencyKey(ctx context.Context, key string, eventID string) error {
+	return s.store.SaveIdempotencyKey(ctx, key, eventID)
+}
+
+func (s postgresRuntimeSmokeStore) HasIdempotencyKey(ctx context.Context, key string) (bool, error) {
+	_, found, err := s.store.FindIdempotencyKey(ctx, key)
+	if err != nil {
+		return false, err
+	}
+	return found, nil
+}
+
+func (s postgresRuntimeSmokeStore) Counts(ctx context.Context) (map[string]int, error) {
+	return s.store.Counts(ctx)
+}
+
+func (s postgresRuntimeSmokeStore) Close() error {
+	s.store.Close()
+	return nil
 }
 
 const scheduleCancelPermission = "schedule:cancel"
@@ -250,6 +314,11 @@ func newRuntimeApp(configPath string) (*runtimeApp, error) {
 		_ = state.Close()
 		return nil, fmt.Errorf("restore job queue: %w", err)
 	}
+	smokeStore, err := openRuntimeSmokeStore(settings, state)
+	if err != nil {
+		_ = state.Close()
+		return nil, err
+	}
 	scheduler := runtimecore.NewScheduler()
 	scheduler.SetObservability(logger, tracer, metrics)
 	scheduler.SetStore(state)
@@ -266,6 +335,7 @@ func newRuntimeApp(configPath string) (*runtimeApp, error) {
 
 	echoConfig, echoRawConfig, err := loadPersistedEchoConfig(state)
 	if err != nil {
+		_ = smokeStore.Close()
 		_ = state.Close()
 		return nil, fmt.Errorf("load echo plugin config: %w", err)
 	}
@@ -274,10 +344,12 @@ func newRuntimeApp(configPath string) (*runtimeApp, error) {
 	echoDefinition.InstanceConfig = echoRawConfig
 	echoDefinition.Handlers.Event = sourceScopedEventHandler{allowed: allowedSources("onebot", "runtime-demo-scheduler"), inner: echoPlugin}
 	if err := runtime.RegisterPlugin(echoDefinition); err != nil {
+		_ = smokeStore.Close()
 		_ = state.Close()
 		return nil, fmt.Errorf("register echo plugin: %w", err)
 	}
 	if err := state.SavePluginManifest(context.Background(), echoDefinition.Manifest); err != nil {
+		_ = smokeStore.Close()
 		_ = state.Close()
 		return nil, fmt.Errorf("save echo plugin manifest: %w", err)
 	}
@@ -285,20 +357,24 @@ func newRuntimeApp(configPath string) (*runtimeApp, error) {
 	aiDefinition := aiPlugin.Definition()
 	aiDefinition.Handlers.Event = sourceScopedEventHandler{allowed: allowedSources("runtime-ai"), inner: aiPlugin}
 	if err := runtime.RegisterPlugin(aiDefinition); err != nil {
+		_ = smokeStore.Close()
 		_ = state.Close()
 		return nil, fmt.Errorf("register ai plugin: %w", err)
 	}
 	if err := state.SavePluginManifest(context.Background(), aiDefinition.Manifest); err != nil {
+		_ = smokeStore.Close()
 		_ = state.Close()
 		return nil, fmt.Errorf("save ai plugin manifest: %w", err)
 	}
 	adminPlugin := pluginadmin.New(lifecycle, nil, nil, actorRoles(config.RBAC), policies(config.RBAC), audits)
 	adminDefinition := adminPlugin.Definition()
 	if err := runtime.RegisterPlugin(adminDefinition); err != nil {
+		_ = smokeStore.Close()
 		_ = state.Close()
 		return nil, fmt.Errorf("register admin plugin: %w", err)
 	}
 	if err := state.SavePluginManifest(context.Background(), adminDefinition.Manifest); err != nil {
+		_ = smokeStore.Close()
 		_ = state.Close()
 		return nil, fmt.Errorf("save admin plugin manifest: %w", err)
 	}
@@ -307,15 +383,18 @@ func newRuntimeApp(configPath string) (*runtimeApp, error) {
 		Source:  "onebot",
 		Adapter: registeredAdapter{id: "adapter-onebot-demo", source: "onebot"},
 	}); err != nil {
+		_ = smokeStore.Close()
 		_ = state.Close()
 		return nil, fmt.Errorf("register onebot demo adapter: %w", err)
 	}
 	onebotAdapterInstance, err := demoOneBotAdapterInstanceState(settings)
 	if err != nil {
+		_ = smokeStore.Close()
 		_ = state.Close()
 		return nil, err
 	}
 	if err := state.SaveAdapterInstance(context.Background(), onebotAdapterInstance); err != nil {
+		_ = smokeStore.Close()
 		_ = state.Close()
 		return nil, fmt.Errorf("save onebot demo adapter instance: %w", err)
 	}
@@ -337,6 +416,7 @@ func newRuntimeApp(configPath string) (*runtimeApp, error) {
 		onebotIngress: onebotIngress,
 		audits:        audits,
 		state:         state,
+		smokeStore:    smokeStore,
 		lifecycle:     lifecycle,
 		queue:         queue,
 		scheduler:     scheduler,
@@ -355,21 +435,25 @@ func newRuntimeApp(configPath string) (*runtimeApp, error) {
 				"/demo/replies",
 				"/demo/state/counts",
 			},
-			"sqlite_path":           settings.SQLitePath,
-			"scheduler_interval_ms": settings.SchedulerIntervalMs,
-			"ai_job_dispatcher":     "runtime-job-queue",
-			"console_mode":          "read+operator-plugin-enable-disable",
+			"sqlite_path":             settings.SQLitePath,
+			"smoke_store_backend":     settings.SmokeStoreBackend,
+			"smoke_store_debug_scope": "event_journal+idempotency_keys",
+			"scheduler_interval_ms":   settings.SchedulerIntervalMs,
+			"ai_job_dispatcher":       "runtime-job-queue",
+			"console_mode":            "read+operator-plugin-enable-disable",
 		},
 		mux: http.NewServeMux(),
 	}
 	schedulerCtx, cancel := context.WithCancel(context.Background())
 	app.schedulerCancel = cancel
 	if err := scheduler.Start(schedulerCtx, time.Duration(settings.SchedulerIntervalMs)*time.Millisecond, app.dispatchScheduledEvent); err != nil {
+		_ = smokeStore.Close()
 		_ = state.Close()
 		cancel()
 		return nil, fmt.Errorf("start scheduler: %w", err)
 	}
 	if err := queue.RegisterDispatcher("ai.chat", queuedRuntimeJobDispatcher{runtime: runtime, queue: queue}); err != nil {
+		_ = smokeStore.Close()
 		_ = state.Close()
 		cancel()
 		return nil, fmt.Errorf("register ai job dispatcher: %w", err)
@@ -382,8 +466,19 @@ func (a *runtimeApp) Close() error {
 	if a.schedulerCancel != nil {
 		a.schedulerCancel()
 	}
+	var errs []error
+	if a.smokeStore != nil {
+		if err := a.smokeStore.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	if a.state != nil {
-		return a.state.Close()
+		if err := a.state.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if len(errs) > 0 {
+		return errors.Join(errs...)
 	}
 	return nil
 }
@@ -893,7 +988,7 @@ func (a *runtimeApp) handleReplies(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (a *runtimeApp) handleStateCounts(w http.ResponseWriter, r *http.Request) {
-	counts, err := a.state.Counts(r.Context())
+	counts, err := a.runtimeStateCounts(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -1178,8 +1273,8 @@ func policies(cfg *runtimecore.RBACConfig) map[string]pluginadmin.RolePolicy {
 }
 
 func (a *runtimeApp) persistAndDispatchEvent(ctx context.Context, event eventmodel.Event) (bool, error) {
-	if a.state != nil && event.IdempotencyKey != "" {
-		exists, err := a.state.HasIdempotencyKey(ctx, event.IdempotencyKey)
+	if a.smokeStore != nil && event.IdempotencyKey != "" {
+		exists, err := a.smokeStore.HasIdempotencyKey(ctx, event.IdempotencyKey)
 		if err != nil {
 			return false, err
 		}
@@ -1190,17 +1285,37 @@ func (a *runtimeApp) persistAndDispatchEvent(ctx context.Context, event eventmod
 	if err := a.runtime.DispatchEvent(ctx, event); err != nil {
 		return false, err
 	}
-	if a.state != nil {
-		if err := a.state.RecordEvent(ctx, event); err != nil {
+	if a.smokeStore != nil {
+		if err := a.smokeStore.RecordEvent(ctx, event); err != nil {
 			return false, err
 		}
 		if event.IdempotencyKey != "" {
-			if err := a.state.SaveIdempotencyKey(ctx, event.IdempotencyKey, event.EventID); err != nil {
+			if err := a.smokeStore.SaveIdempotencyKey(ctx, event.IdempotencyKey, event.EventID); err != nil {
 				return false, err
 			}
 		}
 	}
 	return false, nil
+}
+
+func (a *runtimeApp) runtimeStateCounts(ctx context.Context) (map[string]int, error) {
+	counts, err := a.state.Counts(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if a.smokeStore == nil {
+		return counts, nil
+	}
+	if _, ok := a.smokeStore.(sqliteRuntimeSmokeStore); ok {
+		return counts, nil
+	}
+	smokeCounts, err := a.smokeStore.Counts(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("load %s smoke counts: %w", a.settings.SmokeStoreBackend, err)
+	}
+	counts["event_journal"] = smokeCounts["event_journal"]
+	counts["idempotency_keys"] = smokeCounts["idempotency_keys"]
+	return counts, nil
 }
 
 func (a *runtimeApp) dispatchScheduledEvent(event eventmodel.Event) error {
@@ -1313,6 +1428,8 @@ func loadAppRuntimeSettings(path string) (appRuntimeSettings, error) {
 	type rawConfig struct {
 		Runtime struct {
 			SQLitePath          string `yaml:"sqlite_path"`
+			SmokeStoreBackend   string `yaml:"smoke_store_backend"`
+			PostgresDSN         string `yaml:"postgres_dsn"`
 			SchedulerIntervalMs int    `yaml:"scheduler_interval_ms"`
 		} `yaml:"runtime"`
 	}
@@ -1327,10 +1444,18 @@ func loadAppRuntimeSettings(path string) (appRuntimeSettings, error) {
 	}
 	settings := appRuntimeSettings{
 		SQLitePath:          strings.TrimSpace(cfg.Runtime.SQLitePath),
+		SmokeStoreBackend:   strings.ToLower(strings.TrimSpace(cfg.Runtime.SmokeStoreBackend)),
+		PostgresDSN:         strings.TrimSpace(cfg.Runtime.PostgresDSN),
 		SchedulerIntervalMs: cfg.Runtime.SchedulerIntervalMs,
 	}
 	if value := strings.TrimSpace(os.Getenv("BOT_PLATFORM_RUNTIME_SQLITE_PATH")); value != "" {
 		settings.SQLitePath = value
+	}
+	if value := strings.TrimSpace(os.Getenv("BOT_PLATFORM_RUNTIME_SMOKE_STORE_BACKEND")); value != "" {
+		settings.SmokeStoreBackend = strings.ToLower(value)
+	}
+	if value := strings.TrimSpace(os.Getenv("BOT_PLATFORM_RUNTIME_POSTGRES_DSN")); value != "" {
+		settings.PostgresDSN = value
 	}
 	if value := strings.TrimSpace(os.Getenv("BOT_PLATFORM_RUNTIME_SCHEDULER_INTERVAL_MS")); value != "" {
 		if interval, convErr := strconv.Atoi(value); convErr == nil {
@@ -1340,8 +1465,29 @@ func loadAppRuntimeSettings(path string) (appRuntimeSettings, error) {
 	if settings.SQLitePath == "" {
 		settings.SQLitePath = "data/dev/runtime.sqlite"
 	}
+	if settings.SmokeStoreBackend == "" {
+		settings.SmokeStoreBackend = "sqlite"
+	}
 	if settings.SchedulerIntervalMs <= 0 {
 		settings.SchedulerIntervalMs = 100
 	}
 	return settings, nil
+}
+
+func openRuntimeSmokeStore(settings appRuntimeSettings, sqliteState *runtimecore.SQLiteStateStore) (runtimeSmokeStore, error) {
+	switch settings.SmokeStoreBackend {
+	case "", "sqlite":
+		return sqliteRuntimeSmokeStore{store: sqliteState}, nil
+	case "postgres":
+		if settings.PostgresDSN == "" {
+			return nil, fmt.Errorf("open runtime smoke store: postgres selected but runtime.postgres_dsn is empty")
+		}
+		store, err := runtimecore.OpenPostgresStore(context.Background(), settings.PostgresDSN)
+		if err != nil {
+			return nil, fmt.Errorf("open runtime smoke store: %w", err)
+		}
+		return postgresRuntimeSmokeStore{store: store}, nil
+	default:
+		return nil, fmt.Errorf("open runtime smoke store: unsupported runtime.smoke_store_backend %q", settings.SmokeStoreBackend)
+	}
 }

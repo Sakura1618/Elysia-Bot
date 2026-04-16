@@ -187,6 +187,32 @@ func TestPostgresStoreLoadMethodsIssueExpectedQueries(t *testing.T) {
 	}
 }
 
+func TestPostgresStoreCountsReadsSmokeTables(t *testing.T) {
+	t.Parallel()
+
+	pool := &fakePostgresPool{queryRowFunc: func(_ context.Context, sql string, _ ...any) pgx.Row {
+		switch {
+		case strings.Contains(sql, "FROM event_log"):
+			return fakeRow{values: []any{3}}
+		case strings.Contains(sql, "FROM idempotency_keys_pg"):
+			return fakeRow{values: []any{5}}
+		default:
+			return fakeRow{err: errors.New("unexpected query")}
+		}
+	}}
+	store := &PostgresStore{pool: pool}
+	counts, err := store.Counts(context.Background())
+	if err != nil {
+		t.Fatalf("count postgres smoke tables: %v", err)
+	}
+	if counts["event_journal"] != 3 || counts["idempotency_keys"] != 5 {
+		t.Fatalf("unexpected counts %+v", counts)
+	}
+	if len(pool.querySQL) != 2 {
+		t.Fatalf("expected 2 count queries, got %+v", pool.querySQL)
+	}
+}
+
 func TestPostgresStoreInitAndCloseDelegateToPool(t *testing.T) {
 	t.Parallel()
 

@@ -191,6 +191,22 @@ func (s *PostgresStore) FindIdempotencyKey(ctx context.Context, key string) (str
 	return decodePostgresIdempotencyLookup(row)
 }
 
+func (s *PostgresStore) Counts(ctx context.Context) (map[string]int, error) {
+	tables := map[string]string{
+		"event_journal":    `SELECT COUNT(*) FROM event_log`,
+		"idempotency_keys": `SELECT COUNT(*) FROM idempotency_keys_pg`,
+	}
+	counts := make(map[string]int, len(tables))
+	for name, query := range tables {
+		var count int
+		if err := s.pool.QueryRow(ctx, query).Scan(&count); err != nil {
+			return nil, fmt.Errorf("count %s: %w", name, err)
+		}
+		counts[name] = count
+	}
+	return counts, nil
+}
+
 func decodePostgresIdempotencyLookup(row rowScanner) (string, bool, error) {
 	var eventID string
 	err := row.Scan(&eventID)

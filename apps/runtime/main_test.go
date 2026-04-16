@@ -6,12 +6,15 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	runtimecore "github.com/ohmyopencode/bot-platform/packages/runtime-core"
 )
+
+const runtimePostgresTestDSNEnv = "BOT_PLATFORM_POSTGRES_TEST_DSN"
 
 func writeTestConfig(t *testing.T) string {
 	t.Helper()
@@ -23,6 +26,16 @@ func writeTestConfigAt(t *testing.T, dir string) string {
 	t.Helper()
 	path := filepath.Join(dir, "config.yaml")
 	content := "runtime:\n  environment: test\n  log_level: debug\n  http_port: 18080\n  sqlite_path: " + filepath.ToSlash(filepath.Join(dir, "runtime.sqlite")) + "\n  scheduler_interval_ms: 20\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	return path
+}
+
+func writeTestConfigWithPostgresSmokeStoreAt(t *testing.T, dir string, dsn string) string {
+	t.Helper()
+	path := filepath.Join(dir, "config.yaml")
+	content := "runtime:\n  environment: test\n  log_level: debug\n  http_port: 18080\n  sqlite_path: " + filepath.ToSlash(filepath.Join(dir, "runtime.sqlite")) + "\n  smoke_store_backend: postgres\n  postgres_dsn: \"" + strings.ReplaceAll(dsn, "\"", "\\\"") + "\"\n  scheduler_interval_ms: 20\n"
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
@@ -150,6 +163,105 @@ func TestRuntimeAppDemoOneBotMessage(t *testing.T) {
 	}
 	if !strings.Contains(countsResp.Body.String(), `"schedule_plans":0`) && !strings.Contains(countsResp.Body.String(), `"schedule_plans": 0`) {
 		t.Fatalf("expected sqlite counts to include schedule_plans counter, got %s", countsResp.Body.String())
+	}
+}
+
+func TestRuntimeAppPostgresSmokeStoreStartupFailsLoudlyOnBadDSN(t *testing.T) {
+	t.Parallel()
+
+	configPath := writeTestConfigWithPostgresSmokeStoreAt(t, t.TempDir(), "postgres://127.0.0.1:1/runtime_smoke?sslmode=disable")
+	_, err := newRuntimeApp(configPath)
+	if err == nil {
+		t.Fatal("expected postgres-selected startup to fail")
+	}
+	for _, expected := range []string{"open runtime smoke store", "postgres"} {
+		if !strings.Contains(err.Error(), expected) {
+			t.Fatalf("expected startup error to include %q, got %v", expected, err)
+		}
+	}
+}
+
+func TestRuntimeAppDemoOneBotMessageWithPostgresSmokeStore(t *testing.T) {
+	dsn := strings.TrimSpace(os.Getenv(runtimePostgresTestDSNEnv))
+	if dsn == "" {
+		t.Skipf("set %s to run runtime Postgres smoke test", runtimePostgresTestDSNEnv)
+	}
+
+	configPath := writeTestConfigWithPostgresSmokeStoreAt(t, t.TempDir(), dsn)
+	app, err := newRuntimeApp(configPath)
+	if err != nil {
+		t.Fatalf("new runtime app with postgres smoke store: %v", err)
+	}
+	defer func() { _ = app.Close() }()
+
+	beforeCounts, err := app.runtimeStateCounts(t.Context())
+	if err != nil {
+		t.Fatalf("runtime state counts before request: %v", err)
+	}
+	messageID := time.Now().UnixNano()
+	messageBody := `{"post_type":"message","message_type":"group","time":1712034000,"user_id":10001,"group_id":42,"message_id":` + strconv.FormatInt(messageID, 10) + `,"raw_message":"hello postgres runtime","sender":{"nickname":"alice"}}`
+
+	req := httptest.NewRequest(http.MethodPost, "/demo/onebot/message", strings.NewReader(messageBody))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+
+	app.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", resp.Code, resp.Body.String())
+	}
+	var payload struct {
+		Status    string        `json:"status"`
+		Duplicate bool          `json:"duplicate"`
+		Replies   []replyRecord `json:"replies"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if payload.Status != "ok" || payload.Duplicate {
+		t.Fatalf("expected successful non-duplicate response, got %+v", payload)
+	}
+	if len(payload.Replies) != 1 || payload.Replies[0].Payload != "echo: hello postgres runtime" {
+		t.Fatalf("expected postgres smoke path reply, got %+v", payload.Replies)
+	}
+
+	countsReq := httptest.NewRequest(http.MethodGet, "/demo/state/counts", nil)
+	countsResp := httptest.NewRecorder()
+	app.ServeHTTP(countsResp, countsReq)
+	if countsResp.Code != http.StatusOK {
+		t.Fatalf("expected counts 200, got %d: %s", countsResp.Code, countsResp.Body.String())
+	}
+	afterCounts, err := app.runtimeStateCounts(t.Context())
+	if err != nil {
+		t.Fatalf("runtime state counts after request: %v", err)
+	}
+	if afterCounts["event_journal"] != beforeCounts["event_journal"]+1 {
+		t.Fatalf("expected postgres-backed event_journal count to increase by one, before=%+v after=%+v raw=%s", beforeCounts, afterCounts, countsResp.Body.String())
+	}
+	if afterCounts["idempotency_keys"] != beforeCounts["idempotency_keys"]+1 {
+		t.Fatalf("expected postgres-backed idempotency count to increase by one, before=%+v after=%+v raw=%s", beforeCounts, afterCounts, countsResp.Body.String())
+	}
+	if !strings.Contains(countsResp.Body.String(), `"jobs":0`) && !strings.Contains(countsResp.Body.String(), `"jobs": 0`) {
+		t.Fatalf("expected sqlite jobs counter to remain present, got %s", countsResp.Body.String())
+	}
+
+	dupReq := httptest.NewRequest(http.MethodPost, "/demo/onebot/message", strings.NewReader(messageBody))
+	dupReq.Header.Set("Content-Type", "application/json")
+	dupResp := httptest.NewRecorder()
+	app.ServeHTTP(dupResp, dupReq)
+	if dupResp.Code != http.StatusOK {
+		t.Fatalf("expected duplicate request 200, got %d: %s", dupResp.Code, dupResp.Body.String())
+	}
+	if !strings.Contains(dupResp.Body.String(), `"duplicate":true`) && !strings.Contains(dupResp.Body.String(), `"duplicate": true`) {
+		t.Fatalf("expected duplicate response from postgres idempotency store, got %s", dupResp.Body.String())
+	}
+
+	sqliteCounts, err := app.state.Counts(t.Context())
+	if err != nil {
+		t.Fatalf("sqlite counts: %v", err)
+	}
+	if sqliteCounts["event_journal"] != 0 || sqliteCounts["idempotency_keys"] != 0 {
+		t.Fatalf("expected sqlite to remain out of smoke persistence path when postgres selected, got %+v", sqliteCounts)
 	}
 }
 
@@ -491,9 +603,9 @@ func TestRuntimeAppSkipsDuplicateIdempotencyKey(t *testing.T) {
 		}
 	}
 
-	counts, err := app.state.Counts(t.Context())
+	counts, err := app.runtimeStateCounts(t.Context())
 	if err != nil {
-		t.Fatalf("sqlite counts: %v", err)
+		t.Fatalf("runtime state counts: %v", err)
 	}
 	if counts["event_journal"] != 1 || counts["idempotency_keys"] != 1 {
 		t.Fatalf("expected one persisted event and one idempotency key, got %+v", counts)

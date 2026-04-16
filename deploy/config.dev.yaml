@@ -3,6 +3,8 @@ runtime:
   log_level: debug
   http_port: 8080
   sqlite_path: data/dev/runtime.sqlite
+  smoke_store_backend: sqlite # set to postgres for v0 smoke-path event/idempotency verification only
+  postgres_dsn: ""
   scheduler_interval_ms: 100
 
 secrets:

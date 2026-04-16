@@ -47,6 +47,8 @@ func TestLoadConfigReadsYAMLAndAppliesEnvOverride(t *testing.T) {
 	t.Setenv("BOT_PLATFORM_RUNTIME_ENVIRONMENT", "production")
 	t.Setenv("BOT_PLATFORM_RUNTIME_LOG_LEVEL", "warn")
 	t.Setenv("BOT_PLATFORM_RUNTIME_HTTP_PORT", "9090")
+	t.Setenv("BOT_PLATFORM_RUNTIME_SMOKE_STORE_BACKEND", "postgres")
+	t.Setenv("BOT_PLATFORM_RUNTIME_POSTGRES_DSN", "postgres://runtime:test@localhost/runtime_test?sslmode=disable")
 
 	configPath := filepath.Join("..", "..", "deploy", "config.dev.yaml")
 	cfg, err := LoadConfig(configPath)
@@ -57,6 +59,9 @@ func TestLoadConfigReadsYAMLAndAppliesEnvOverride(t *testing.T) {
 
 	if cfg.Runtime.Environment != "production" || cfg.Runtime.LogLevel != "warn" || cfg.Runtime.HTTPPort != 9090 {
 		t.Fatalf("expected env override to win, got %+v", cfg.Runtime)
+	}
+	if cfg.Runtime.SmokeStoreBackend != "postgres" || cfg.Runtime.PostgresDSN != "postgres://runtime:test@localhost/runtime_test?sslmode=disable" {
+		t.Fatalf("expected smoke store env override to win, got %+v", cfg.Runtime)
 	}
 	if cfg.Secrets.WebhookTokenRef != contract.DefaultDevRef {
 		t.Fatalf("expected secret ref to load from yaml, got %+v", cfg.Secrets)
