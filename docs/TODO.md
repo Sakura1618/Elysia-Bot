@@ -11,23 +11,7 @@
 
 ## Active
 
-### B9. replay / retry / dead-letter operator workflow
-- 目标：把失败后的人工处理路径做成平台能力。
-- 直接子步骤：
-  - 先固定 operator 视角下的最小工作流，明确“查看失败 -> 判断原因 -> retry 或 replay -> 查看结果”的顺序。
-  - 为 failed job 提供明确的 retry 入口，并限制只对允许重试的对象开放。
-  - 在读面中补齐 failure reason、失败阶段、最近失败时间，保证 operator 能先看明白再操作。
-  - 为 selected event / request 提供 replay 入口，并明确 replay 的目标对象、触发条件和结果记录。
-  - 为 dead-letter 补最小可见性，至少能列出对象、原因、进入 dead-letter 的时间。
-  - 区分 retry 与 replay 的审计记录，避免事后无法判断是重试原任务还是重放原请求。
-  - 给 operator action 定义最小幂等保护，避免重复点击造成多次无意执行。
-  - 为这条 workflow 增加最小端到端验证，确保从查看失败到重新触发确实能闭环。
-
----
-
-## Backlog
-
-### B10. fault injection 继续贴近真实外部依赖
+### B10. fault injection 更贴近真实外部依赖
 - 目标：把 fault injection 从当前最小边界继续推进。
 - 直接子步骤：
   - 先按现有 backlog 范围补四类故障注入，不扩展成通用 chaos 系统。
@@ -38,6 +22,10 @@
   - 每类故障都要对应到当前平台已有的可观测出口，至少能在日志、状态或读面里看到影响。
   - 把 fault injection 的开关边界控制清楚，避免默认运行路径误带注入逻辑。
   - 为关键注入场景补测试，确保注入确实命中，而不是只有伪开关。
+
+---
+
+## Backlog
 
 ### B11. Postgres 可信度增强
 - 目标：保持 Postgres 作为 v0 边界，但增强真实可用性。
