@@ -11,21 +11,7 @@
 
 ## Active
 
-### B5. 插件兼容性 / 版本管理增强
-- 目标：把现在的 compatibility 边界推进到生态可用级别。
-- 直接子步骤：
-  - 固定 runtime version 与 plugin version 的比较规则，明确哪些范围表达式被支持。
-  - 固定 adapter capability 与 plugin requirement 的对齐方式，避免 capability 名称随处散落。
-  - 把 manifest compatibility reject 的 caller-facing 错误格式收口，保证能稳定告诉调用方“缺什么、冲突什么、在哪失败”。
-  - 为常见不兼容场景补齐覆盖，例如 runtime 版本过低、adapter 能力缺失、缺少必填配置。
-  - 区分“无法加载”“可以加载但降级”“仅告警不阻断”三类兼容性结果，避免全部落成同一类失败。
-  - 把兼容性结论暴露到状态页或读面里，让 operator 能直接看到插件为什么不能启用。
-
----
-
-## Backlog
-
-### B6. RBAC 从局部边界推进到 operator action
+### B6. RBAC / operator action 统一
 - 目标：把“谁能执行什么动作”收口到统一权限模型。
 - 直接子步骤：
   - 列出当前已经存在的 operator action，并先收口到一份最小动作清单。
@@ -35,6 +21,10 @@
   - 保持 deny audit 结构一致，至少能看到操作者、动作、目标、拒绝原因、发生时间。
   - 为最小角色或权限样例补测试，覆盖 allow、deny、缺失权限三类场景。
   - 确保新增 action 不绕过统一检查入口，避免局部 if 判断继续扩散。
+
+---
+
+## Backlog
 
 ### B7. secrets 进入主路径
 - 目标：让 secret 不只是局部配置，而是正式成为 plugin / provider / adapter 配置来源。
