@@ -18,13 +18,23 @@ type Config struct {
 }
 
 type RuntimeConfig struct {
-	Environment         string `yaml:"environment"`
-	LogLevel            string `yaml:"log_level"`
-	HTTPPort            int    `yaml:"http_port"`
-	SQLitePath          string `yaml:"sqlite_path,omitempty"`
-	SmokeStoreBackend   string `yaml:"smoke_store_backend,omitempty"`
-	PostgresDSN         string `yaml:"postgres_dsn,omitempty"`
-	SchedulerIntervalMs int    `yaml:"scheduler_interval_ms,omitempty"`
+	Environment         string               `yaml:"environment"`
+	LogLevel            string               `yaml:"log_level"`
+	HTTPPort            int                  `yaml:"http_port"`
+	SQLitePath          string               `yaml:"sqlite_path,omitempty"`
+	SmokeStoreBackend   string               `yaml:"smoke_store_backend,omitempty"`
+	PostgresDSN         string               `yaml:"postgres_dsn,omitempty"`
+	SchedulerIntervalMs int                  `yaml:"scheduler_interval_ms,omitempty"`
+	BotInstances        []RuntimeBotInstance `yaml:"bot_instances,omitempty"`
+}
+
+type RuntimeBotInstance struct {
+	ID       string `yaml:"id,omitempty"`
+	Adapter  string `yaml:"adapter,omitempty"`
+	Source   string `yaml:"source,omitempty"`
+	Platform string `yaml:"platform,omitempty"`
+	DemoPath string `yaml:"demo_path,omitempty"`
+	SelfID   int64  `yaml:"self_id,omitempty"`
 }
 
 type SecretsConfig struct {
@@ -95,6 +105,9 @@ func LoadConfig(path string) (Config, error) {
 
 	applyEnvOverride(&cfg)
 	applyRuntimeDefaults(&cfg)
+	if err := validateRuntimeBotInstances(cfg.Runtime.BotInstances); err != nil {
+		return Config{}, err
+	}
 	return cfg, nil
 }
 
@@ -138,4 +151,40 @@ func applyRuntimeDefaults(cfg *Config) {
 	if cfg.Runtime.SchedulerIntervalMs <= 0 {
 		cfg.Runtime.SchedulerIntervalMs = 100
 	}
+	for index := range cfg.Runtime.BotInstances {
+		cfg.Runtime.BotInstances[index].ID = strings.TrimSpace(cfg.Runtime.BotInstances[index].ID)
+		cfg.Runtime.BotInstances[index].Adapter = strings.ToLower(strings.TrimSpace(cfg.Runtime.BotInstances[index].Adapter))
+		if cfg.Runtime.BotInstances[index].Adapter == "" {
+			cfg.Runtime.BotInstances[index].Adapter = "onebot"
+		}
+		cfg.Runtime.BotInstances[index].Source = strings.TrimSpace(cfg.Runtime.BotInstances[index].Source)
+		if cfg.Runtime.BotInstances[index].Source == "" {
+			cfg.Runtime.BotInstances[index].Source = "onebot"
+		}
+		cfg.Runtime.BotInstances[index].Platform = strings.TrimSpace(cfg.Runtime.BotInstances[index].Platform)
+		if cfg.Runtime.BotInstances[index].Platform == "" {
+			cfg.Runtime.BotInstances[index].Platform = "onebot/v11"
+		}
+		cfg.Runtime.BotInstances[index].DemoPath = strings.TrimSpace(cfg.Runtime.BotInstances[index].DemoPath)
+		if cfg.Runtime.BotInstances[index].DemoPath == "" {
+			cfg.Runtime.BotInstances[index].DemoPath = "/demo/onebot/message"
+		}
+	}
+}
+
+func validateRuntimeBotInstances(instances []RuntimeBotInstance) error {
+	seen := make(map[string]struct{}, len(instances))
+	for index, instance := range instances {
+		if instance.ID == "" {
+			return fmt.Errorf("runtime.bot_instances[%d].id is required", index)
+		}
+		if instance.Adapter != "onebot" {
+			return fmt.Errorf("runtime.bot_instances[%d].adapter %q is unsupported; only \"onebot\" is currently supported", index, instance.Adapter)
+		}
+		if _, exists := seen[instance.ID]; exists {
+			return fmt.Errorf("runtime.bot_instances[%d].id %q must be unique", index, instance.ID)
+		}
+		seen[instance.ID] = struct{}{}
+	}
+	return nil
 }

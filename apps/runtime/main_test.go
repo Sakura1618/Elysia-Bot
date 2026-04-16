@@ -43,6 +43,33 @@ func writeTestConfigWithPostgresSmokeStoreAt(t *testing.T, dir string, dsn strin
 	return path
 }
 
+func writeTestConfigWithBotInstancesAt(t *testing.T, dir string) string {
+	t.Helper()
+	path := filepath.Join(dir, "config.yaml")
+	content := "runtime:\n" +
+		"  environment: test\n" +
+		"  log_level: debug\n" +
+		"  http_port: 18080\n" +
+		"  sqlite_path: " + filepath.ToSlash(filepath.Join(dir, "runtime.sqlite")) + "\n" +
+		"  scheduler_interval_ms: 20\n" +
+		"  bot_instances:\n" +
+		"    - id: adapter-onebot-alpha\n" +
+		"      adapter: onebot\n" +
+		"      source: onebot-alpha\n" +
+		"      platform: onebot/v11\n" +
+		"      demo_path: /demo/onebot/message\n" +
+		"      self_id: 10001\n" +
+		"    - id: adapter-onebot-beta\n" +
+		"      adapter: onebot\n" +
+		"      source: onebot-beta\n" +
+		"      platform: onebot/v11\n" +
+		"      demo_path: /demo/onebot/message-beta\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	return path
+}
+
 type runtimeConsoleResponse struct {
 	Plugins []struct {
 		ID      string `json:"id"`
@@ -61,13 +88,16 @@ type runtimeConsoleResponse struct {
 		StatusPersisted       bool   `json:"statusPersisted"`
 	} `json:"plugins"`
 	Adapters []struct {
-		ID             string `json:"id"`
-		Adapter        string `json:"adapter"`
-		Source         string `json:"source"`
-		Status         string `json:"status"`
-		Health         string `json:"health"`
-		Online         bool   `json:"online"`
-		StatePersisted bool   `json:"statePersisted"`
+		ID             string         `json:"id"`
+		Adapter        string         `json:"adapter"`
+		Source         string         `json:"source"`
+		Config         map[string]any `json:"config"`
+		StatusSource   string         `json:"statusSource"`
+		ConfigSource   string         `json:"configSource"`
+		Status         string         `json:"status"`
+		Health         string         `json:"health"`
+		Online         bool           `json:"online"`
+		StatePersisted bool           `json:"statePersisted"`
 	} `json:"adapters"`
 	Schedules []struct {
 		ID string `json:"id"`
@@ -158,6 +188,39 @@ func hasConsoleAdapter(payload runtimeConsoleResponse, adapterID string) bool {
 		}
 	}
 	return false
+}
+
+func consoleAdapterByID(t *testing.T, payload runtimeConsoleResponse, adapterID string) struct {
+	ID             string         `json:"id"`
+	Adapter        string         `json:"adapter"`
+	Source         string         `json:"source"`
+	Config         map[string]any `json:"config"`
+	StatusSource   string         `json:"statusSource"`
+	ConfigSource   string         `json:"configSource"`
+	Status         string         `json:"status"`
+	Health         string         `json:"health"`
+	Online         bool           `json:"online"`
+	StatePersisted bool           `json:"statePersisted"`
+} {
+	t.Helper()
+	for _, adapter := range payload.Adapters {
+		if adapter.ID == adapterID {
+			return adapter
+		}
+	}
+	t.Fatalf("adapter %q not found in console payload %+v", adapterID, payload.Adapters)
+	return struct {
+		ID             string         `json:"id"`
+		Adapter        string         `json:"adapter"`
+		Source         string         `json:"source"`
+		Config         map[string]any `json:"config"`
+		StatusSource   string         `json:"statusSource"`
+		ConfigSource   string         `json:"configSource"`
+		Status         string         `json:"status"`
+		Health         string         `json:"health"`
+		Online         bool           `json:"online"`
+		StatePersisted bool           `json:"statePersisted"`
+	}{}
 }
 
 func writeConsoleRBACConfig(t *testing.T) string {
@@ -1698,6 +1761,90 @@ func TestRuntimeAppConsoleReadsPersistedAdapterInstanceAfterRestart(t *testing.T
 		if !strings.Contains(consoleResp.Body.String(), expected) {
 			t.Fatalf("expected restarted console payload to include %q, got %s", expected, consoleResp.Body.String())
 		}
+	}
+}
+
+func TestRuntimeAppLoadsConfiguredBotInstancesAndExposesThemAfterRestart(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	configPath := writeTestConfigWithBotInstancesAt(t, dir)
+
+	app, err := newRuntimeApp(configPath)
+	if err != nil {
+		t.Fatalf("new runtime app: %v", err)
+	}
+	counts, err := app.state.Counts(t.Context())
+	if err != nil {
+		t.Fatalf("sqlite counts: %v", err)
+	}
+	if counts["adapter_instances"] != 2 {
+		t.Fatalf("expected two persisted adapter instances before restart, got %+v", counts)
+	}
+	alphaState, err := app.state.LoadAdapterInstance(t.Context(), "adapter-onebot-alpha")
+	if err != nil {
+		t.Fatalf("load alpha adapter instance: %v", err)
+	}
+	if alphaState.Adapter != "onebot" || alphaState.Source != "onebot-alpha" || alphaState.Status != "registered" || alphaState.Health != "ready" || !alphaState.Online {
+		t.Fatalf("expected persisted alpha adapter facts before restart, got %+v", alphaState)
+	}
+	betaState, err := app.state.LoadAdapterInstance(t.Context(), "adapter-onebot-beta")
+	if err != nil {
+		t.Fatalf("load beta adapter instance: %v", err)
+	}
+	if betaState.Adapter != "onebot" || betaState.Source != "onebot-beta" || betaState.Status != "registered" || betaState.Health != "ready" || !betaState.Online {
+		t.Fatalf("expected persisted beta adapter facts before restart, got %+v", betaState)
+	}
+	if err := app.Close(); err != nil {
+		t.Fatalf("close first app: %v", err)
+	}
+
+	restarted, err := newRuntimeApp(configPath)
+	if err != nil {
+		t.Fatalf("restart runtime app: %v", err)
+	}
+	defer func() { _ = restarted.Close() }()
+
+	console := readRuntimeConsoleResponse(t, restarted)
+	if console.Status.Adapters != 2 || !hasConsoleAdapter(console, "adapter-onebot-alpha") || !hasConsoleAdapter(console, "adapter-onebot-beta") {
+		t.Fatalf("expected restarted console to expose both configured adapter instances, got %+v", console)
+	}
+	alpha := consoleAdapterByID(t, console, "adapter-onebot-alpha")
+	if alpha.Adapter != "onebot" || alpha.Source != "onebot-alpha" || alpha.Status != "registered" || alpha.Health != "ready" || !alpha.Online || !alpha.StatePersisted {
+		t.Fatalf("expected alpha console adapter facts, got %+v", alpha)
+	}
+	if alpha.StatusSource != "sqlite-adapter-instances" || alpha.ConfigSource != "sqlite-adapter-instances" {
+		t.Fatalf("expected alpha adapter read-model sources, got %+v", alpha)
+	}
+	if alpha.Config["demo_path"] != "/demo/onebot/message" || alpha.Config["platform"] != "onebot/v11" || alpha.Config["source"] != "onebot-alpha" {
+		t.Fatalf("expected alpha adapter config metadata, got %+v", alpha.Config)
+	}
+	if selfID, ok := alpha.Config["self_id"].(float64); !ok || selfID != 10001 {
+		t.Fatalf("expected alpha self_id 10001, got %+v", alpha.Config)
+	}
+	beta := consoleAdapterByID(t, console, "adapter-onebot-beta")
+	if beta.Adapter != "onebot" || beta.Source != "onebot-beta" || beta.Status != "registered" || beta.Health != "ready" || !beta.Online || !beta.StatePersisted {
+		t.Fatalf("expected beta console adapter facts, got %+v", beta)
+	}
+	if beta.StatusSource != "sqlite-adapter-instances" || beta.ConfigSource != "sqlite-adapter-instances" {
+		t.Fatalf("expected beta adapter read-model sources, got %+v", beta)
+	}
+	if beta.Config["demo_path"] != "/demo/onebot/message-beta" || beta.Config["platform"] != "onebot/v11" || beta.Config["source"] != "onebot-beta" {
+		t.Fatalf("expected beta adapter config metadata, got %+v", beta.Config)
+	}
+	if _, exists := beta.Config["self_id"]; exists {
+		t.Fatalf("expected beta config to omit optional self_id, got %+v", beta.Config)
+	}
+	consoleReq := httptest.NewRequest(http.MethodGet, "/api/console", nil)
+	consoleResp := httptest.NewRecorder()
+	restarted.ServeHTTP(consoleResp, consoleReq)
+	for _, expected := range []string{`"id": "adapter-onebot-alpha"`, `"id": "adapter-onebot-beta"`, `"source": "onebot-alpha"`, `"source": "onebot-beta"`, `"demo_path": "/demo/onebot/message"`, `"demo_path": "/demo/onebot/message-beta"`, `"self_id": 10001`, `"adapter_read_model": "sqlite-adapter-instances"`} {
+		if !strings.Contains(consoleResp.Body.String(), expected) {
+			t.Fatalf("expected restarted console payload to include %q, got %s", expected, consoleResp.Body.String())
+		}
+	}
+	if got := len(restarted.runtime.RegisteredAdapters()); got != 2 {
+		t.Fatalf("expected two registered adapters after restart, got %d", got)
 	}
 }
 

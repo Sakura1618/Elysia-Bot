@@ -168,6 +168,32 @@ func TestLoadConfigReadsConsoleReadPermission(t *testing.T) {
 	}
 }
 
+func TestLoadConfigReadsRuntimeBotInstances(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	raw := []byte("runtime:\n  environment: development\n  log_level: debug\n  http_port: 8080\n  bot_instances:\n    - id: adapter-onebot-alpha\n      adapter: onebot\n      source: onebot-alpha\n      platform: onebot/v11\n      demo_path: /demo/onebot/message\n      self_id: 10001\n    - id: adapter-onebot-beta\n      adapter: onebot\n      source: onebot-beta\n      demo_path: /demo/onebot/message-beta\n")
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if len(cfg.Runtime.BotInstances) != 2 {
+		t.Fatalf("expected two bot instances, got %+v", cfg.Runtime.BotInstances)
+	}
+	alpha := cfg.Runtime.BotInstances[0]
+	if alpha.ID != "adapter-onebot-alpha" || alpha.Adapter != "onebot" || alpha.Source != "onebot-alpha" || alpha.Platform != "onebot/v11" || alpha.DemoPath != "/demo/onebot/message" || alpha.SelfID != 10001 {
+		t.Fatalf("unexpected alpha bot instance %+v", alpha)
+	}
+	beta := cfg.Runtime.BotInstances[1]
+	if beta.ID != "adapter-onebot-beta" || beta.Adapter != "onebot" || beta.Source != "onebot-beta" || beta.Platform != "onebot/v11" || beta.DemoPath != "/demo/onebot/message-beta" || beta.SelfID != 0 {
+		t.Fatalf("unexpected beta bot instance %+v", beta)
+	}
+}
+
 func TestLoadConfigTreatsExplicitEmptyRBACAsPresent(t *testing.T) {
 	t.Parallel()
 

@@ -22,7 +22,6 @@ import (
 	pluginadmin "github.com/ohmyopencode/bot-platform/plugins/plugin-admin"
 	pluginaichat "github.com/ohmyopencode/bot-platform/plugins/plugin-ai-chat"
 	pluginecho "github.com/ohmyopencode/bot-platform/plugins/plugin-echo"
-	"gopkg.in/yaml.v3"
 )
 
 type runtimeApp struct {
@@ -52,6 +51,7 @@ type appRuntimeSettings struct {
 	SmokeStoreBackend   string
 	PostgresDSN         string
 	SchedulerIntervalMs int
+	BotInstances        []runtimecore.RuntimeBotInstance
 }
 
 type runtimeSmokeStore interface {
@@ -302,20 +302,42 @@ type registeredAdapter struct {
 func (a registeredAdapter) ID() string     { return a.id }
 func (a registeredAdapter) Source() string { return a.source }
 
-func demoOneBotAdapterInstanceState(settings appRuntimeSettings) (runtimecore.AdapterInstanceState, error) {
-	configPayload, err := json.Marshal(map[string]any{
+func demoOneBotAdapterInstance() runtimecore.RuntimeBotInstance {
+	return runtimecore.RuntimeBotInstance{
+		ID:       "adapter-onebot-demo",
+		Adapter:  "onebot",
+		Source:   "onebot",
+		Platform: "onebot/v11",
+		DemoPath: "/demo/onebot/message",
+	}
+}
+
+func configuredBotInstances(settings appRuntimeSettings) []runtimecore.RuntimeBotInstance {
+	if len(settings.BotInstances) > 0 {
+		return append([]runtimecore.RuntimeBotInstance(nil), settings.BotInstances...)
+	}
+	return []runtimecore.RuntimeBotInstance{demoOneBotAdapterInstance()}
+}
+
+func oneBotAdapterInstanceState(settings appRuntimeSettings, instance runtimecore.RuntimeBotInstance) (runtimecore.AdapterInstanceState, error) {
+	config := map[string]any{
 		"mode":        "demo-ingress",
 		"sqlite_path": settings.SQLitePath,
-		"demo_path":   "/demo/onebot/message",
-		"platform":    "onebot/v11",
-	})
+		"demo_path":   instance.DemoPath,
+		"platform":    instance.Platform,
+		"source":      instance.Source,
+	}
+	if instance.SelfID != 0 {
+		config["self_id"] = instance.SelfID
+	}
+	configPayload, err := json.Marshal(config)
 	if err != nil {
-		return runtimecore.AdapterInstanceState{}, fmt.Errorf("marshal onebot demo adapter config: %w", err)
+		return runtimecore.AdapterInstanceState{}, fmt.Errorf("marshal onebot adapter config for %q: %w", instance.ID, err)
 	}
 	return runtimecore.AdapterInstanceState{
-		InstanceID: "adapter-onebot-demo",
-		Adapter:    "onebot",
-		Source:     "onebot",
+		InstanceID: instance.ID,
+		Adapter:    instance.Adapter,
+		Source:     instance.Source,
 		RawConfig:  configPayload,
 		Status:     "registered",
 		Health:     "ready",
@@ -335,10 +357,7 @@ func newRuntimeAppWithOutput(configPath string, output io.Writer) (*runtimeApp, 
 	if err != nil {
 		return nil, err
 	}
-	settings, err := loadAppRuntimeSettings(configPath)
-	if err != nil {
-		return nil, err
-	}
+	settings := loadAppRuntimeSettings(config)
 
 	logs := &logBuffer{}
 	logger := runtimecore.NewLogger(io.MultiWriter(output, logs))
@@ -422,25 +441,28 @@ func newRuntimeAppWithOutput(configPath string, output io.Writer) (*runtimeApp, 
 		_ = state.Close()
 		return nil, fmt.Errorf("save admin plugin manifest: %w", err)
 	}
-	if err := runtime.RegisterAdapter(runtimecore.AdapterRegistration{
-		ID:      "adapter-onebot-demo",
-		Source:  "onebot",
-		Adapter: registeredAdapter{id: "adapter-onebot-demo", source: "onebot"},
-	}); err != nil {
-		_ = smokeStore.Close()
-		_ = state.Close()
-		return nil, fmt.Errorf("register onebot demo adapter: %w", err)
-	}
-	onebotAdapterInstance, err := demoOneBotAdapterInstanceState(settings)
-	if err != nil {
-		_ = smokeStore.Close()
-		_ = state.Close()
-		return nil, err
-	}
-	if err := state.SaveAdapterInstance(context.Background(), onebotAdapterInstance); err != nil {
-		_ = smokeStore.Close()
-		_ = state.Close()
-		return nil, fmt.Errorf("save onebot demo adapter instance: %w", err)
+	botInstances := configuredBotInstances(settings)
+	for _, instance := range botInstances {
+		if err := runtime.RegisterAdapter(runtimecore.AdapterRegistration{
+			ID:      instance.ID,
+			Source:  instance.Source,
+			Adapter: registeredAdapter{id: instance.ID, source: instance.Source},
+		}); err != nil {
+			_ = smokeStore.Close()
+			_ = state.Close()
+			return nil, fmt.Errorf("register %s adapter %q: %w", instance.Adapter, instance.ID, err)
+		}
+		adapterInstanceState, err := oneBotAdapterInstanceState(settings, instance)
+		if err != nil {
+			_ = smokeStore.Close()
+			_ = state.Close()
+			return nil, err
+		}
+		if err := state.SaveAdapterInstance(context.Background(), adapterInstanceState); err != nil {
+			_ = smokeStore.Close()
+			_ = state.Close()
+			return nil, fmt.Errorf("save %s adapter instance %q: %w", instance.Adapter, instance.ID, err)
+		}
 	}
 
 	ingressLogs := io.MultiWriter(output, logs)
@@ -1586,29 +1608,13 @@ func main() {
 	os.Exit(runRuntimeCLI(os.Args[1:], os.Stdout, os.Stderr, nil))
 }
 
-func loadAppRuntimeSettings(path string) (appRuntimeSettings, error) {
-	type rawConfig struct {
-		Runtime struct {
-			SQLitePath          string `yaml:"sqlite_path"`
-			SmokeStoreBackend   string `yaml:"smoke_store_backend"`
-			PostgresDSN         string `yaml:"postgres_dsn"`
-			SchedulerIntervalMs int    `yaml:"scheduler_interval_ms"`
-		} `yaml:"runtime"`
-	}
-
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return appRuntimeSettings{}, fmt.Errorf("read app runtime config: %w", err)
-	}
-	var cfg rawConfig
-	if err := yaml.Unmarshal(raw, &cfg); err != nil {
-		return appRuntimeSettings{}, fmt.Errorf("unmarshal app runtime config: %w", err)
-	}
+func loadAppRuntimeSettings(cfg runtimecore.Config) appRuntimeSettings {
 	settings := appRuntimeSettings{
 		SQLitePath:          strings.TrimSpace(cfg.Runtime.SQLitePath),
 		SmokeStoreBackend:   strings.ToLower(strings.TrimSpace(cfg.Runtime.SmokeStoreBackend)),
 		PostgresDSN:         strings.TrimSpace(cfg.Runtime.PostgresDSN),
 		SchedulerIntervalMs: cfg.Runtime.SchedulerIntervalMs,
+		BotInstances:        append([]runtimecore.RuntimeBotInstance(nil), cfg.Runtime.BotInstances...),
 	}
 	if value := strings.TrimSpace(os.Getenv("BOT_PLATFORM_RUNTIME_SQLITE_PATH")); value != "" {
 		settings.SQLitePath = value
@@ -1633,7 +1639,7 @@ func loadAppRuntimeSettings(path string) (appRuntimeSettings, error) {
 	if settings.SchedulerIntervalMs <= 0 {
 		settings.SchedulerIntervalMs = 100
 	}
-	return settings, nil
+	return settings
 }
 
 func openRuntimeSmokeStore(settings appRuntimeSettings, sqliteState *runtimecore.SQLiteStateStore) (runtimeSmokeStore, error) {

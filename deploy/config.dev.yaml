@@ -6,6 +6,12 @@ runtime:
   smoke_store_backend: sqlite # set to postgres for v0 smoke-path event/idempotency verification only
   postgres_dsn: ""
   scheduler_interval_ms: 100
+  bot_instances:
+    - id: adapter-onebot-demo
+      adapter: onebot
+      source: onebot
+      platform: onebot/v11
+      demo_path: /demo/onebot/message
 
 secrets:
   webhook_token_ref: BOT_PLATFORM_WEBHOOK_TOKEN
