@@ -92,6 +92,17 @@ func writeConsoleRBACConfig(t *testing.T) string {
 	return path
 }
 
+func writeScheduleCancelRBACConfig(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := "runtime:\n  environment: test\n  log_level: debug\n  http_port: 18080\n  sqlite_path: " + filepath.ToSlash(filepath.Join(dir, "runtime.sqlite")) + "\n  scheduler_interval_ms: 20\nrbac:\n  actor_roles:\n    schedule-admin: [schedule-operator]\n    viewer-user: [schedule-viewer]\n  policies:\n    schedule-operator:\n      permissions: [schedule:cancel]\n      plugin_scope: ['*']\n    schedule-viewer:\n      permissions: [schedule:view]\n      plugin_scope: ['*']\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	return path
+}
+
 func TestRuntimeAppDemoOneBotMessage(t *testing.T) {
 	t.Parallel()
 
@@ -196,12 +207,12 @@ func TestRuntimeAppConsoleReflectsRuntimeState(t *testing.T) {
 	if !strings.Contains(resp.Body.String(), `"plugin_dispatch_source": "sqlite-plugin-status-snapshot+runtime-dispatch-results"`) {
 		t.Fatalf("expected console payload to include plugin_dispatch_source=sqlite-plugin-status-snapshot+runtime-dispatch-results, got %s", resp.Body.String())
 	}
-	for _, expected := range []string{`"plugin_status_source": "runtime-registry+sqlite-plugin-status-snapshot+runtime-dispatch-results"`, `"plugin_status_evidence_model": "manifest-static-or-last-persisted-plugin-snapshot-with-live-overlay"`, `"plugin_dispatch_kind_visibility": "last-persisted-or-live-dispatch-kind"`, `"plugin_recovery_visibility": "last-dispatch-failed|last-dispatch-succeeded|recovered-after-failure|no-runtime-evidence"`, `"plugin_status_staleness": "static-registration|persisted-snapshot|persisted-snapshot+live-overlay|process-local-volatile"`, `"plugin_status_staleness_reason": "persisted plugin snapshots survive restart while current-process live overlay remains explicitly distinguished from the stored snapshot"`, `"plugin_runtime_state_live": true`, `"rbac_capability_surface": "read-only declaration of current authorization and adjacent dispatch-boundary facts"`, `"rbac_read_model_scope": "current runtime authorizer entrypoints, adjacent dispatch contract/filter boundaries, deny audit taxonomy, and known system gaps"`, `"rbac_current_state": "partial-runtime-local-read-model"`, `"rbac_system_model_state": "not-complete-global-rbac-authn-or-audit-system"`, `"rbac_current_authorization_paths_count": 5`, `"rbac_deny_audit_scope": "authorizer deny paths only"`, `"rbac_manifest_permission_gate_audited": false`, `"rbac_manifest_permission_gate_boundary": "independent dispatch contract check; not part of deny audit taxonomy"`, `"rbac_job_target_plugin_filter_boundary": "dispatch filter only; not an authorizer entrypoint or deny audit taxonomy item"`, `"rbac_console_read_permission": false`, `"rbac_console_read_actor_header": "X-Bot-Platform-Actor"`, `"secrets_provider": "env"`, `"secrets_runtime_owned_ref_prefix": "BOT_PLATFORM_"`, `"rollout_record_store": "in-memory-per-runtime-process"`} {
+	for _, expected := range []string{`"plugin_status_source": "runtime-registry+sqlite-plugin-status-snapshot+runtime-dispatch-results"`, `"plugin_status_evidence_model": "manifest-static-or-last-persisted-plugin-snapshot-with-live-overlay"`, `"plugin_dispatch_kind_visibility": "last-persisted-or-live-dispatch-kind"`, `"plugin_recovery_visibility": "last-dispatch-failed|last-dispatch-succeeded|recovered-after-failure|no-runtime-evidence"`, `"plugin_status_staleness": "static-registration|persisted-snapshot|persisted-snapshot+live-overlay|process-local-volatile"`, `"plugin_status_staleness_reason": "persisted plugin snapshots survive restart while current-process live overlay remains explicitly distinguished from the stored snapshot"`, `"plugin_runtime_state_live": true`, `"rbac_capability_surface": "read-only declaration of current authorization and adjacent dispatch-boundary facts"`, `"rbac_read_model_scope": "current runtime authorizer entrypoints, adjacent dispatch contract/filter boundaries, deny audit taxonomy, and known system gaps"`, `"rbac_current_state": "partial-runtime-local-read-model"`, `"rbac_system_model_state": "not-complete-global-rbac-authn-or-audit-system"`, `"rbac_current_authorization_paths_count": 6`, `"rbac_deny_audit_scope": "authorizer deny paths only"`, `"rbac_manifest_permission_gate_audited": false`, `"rbac_manifest_permission_gate_boundary": "independent dispatch contract check; not part of deny audit taxonomy"`, `"rbac_job_target_plugin_filter_boundary": "dispatch filter only; not an authorizer entrypoint or deny audit taxonomy item"`, `"rbac_console_read_permission": false`, `"rbac_console_read_actor_header": "X-Bot-Platform-Actor"`, `"secrets_provider": "env"`, `"secrets_runtime_owned_ref_prefix": "BOT_PLATFORM_"`, `"rollout_record_store": "in-memory-per-runtime-process"`} {
 		if !strings.Contains(resp.Body.String(), expected) {
 			t.Fatalf("expected console payload to include %s, got %s", expected, resp.Body.String())
 		}
 	}
-	for _, expected := range []string{`"admin-command-runtime-authorizer"`, `"event-metadata-runtime-authorizer"`, `"job-metadata-runtime-authorizer"`, `"schedule-metadata-runtime-authorizer"`, `"dispatch-manifest-permission-gate"`, `"job-target-plugin-filter"`, `"console-read-authorizer"`, `"permission_denied"`, `"plugin_scope_denied"`, `"persistent-policy-store"`, `"policy-hot-reload"`, `"unified-authentication"`, `"unified-resource-model"`, `"independent-authorization-read-model"`, `"actor"`, `"permission"`, `"target_plugin_id"`, `"console read authorization is optional and only enforced when rbac.console_read_permission is configured"`, `"console read authorization currently reads actor only from the X-Bot-Platform-Actor header"`, `"manifest permission gate remains a separate dispatch contract check and does not emit deny audit entries"`, `"target_plugin_id remains a dispatch filter, not a global RBAC resource kind"`, `"Q8 currently remains a partial runtime-local closure rather than a complete global RBAC, authn, or audit system"`} {
+	for _, expected := range []string{`"admin-command-runtime-authorizer"`, `"event-metadata-runtime-authorizer"`, `"job-metadata-runtime-authorizer"`, `"schedule-metadata-runtime-authorizer"`, `"schedule-operator-runtime-authorizer"`, `"dispatch-manifest-permission-gate"`, `"job-target-plugin-filter"`, `"console-read-authorizer"`, `"permission_denied"`, `"plugin_scope_denied"`, `"persistent-policy-store"`, `"policy-hot-reload"`, `"unified-authentication"`, `"unified-resource-model"`, `"independent-authorization-read-model"`, `"actor"`, `"permission"`, `"target_plugin_id"`, `"console read authorization is optional and only enforced when rbac.console_read_permission is configured"`, `"console read authorization currently reads actor only from the X-Bot-Platform-Actor header"`, `"manifest permission gate remains a separate dispatch contract check and does not emit deny audit entries"`, `"target_plugin_id remains a dispatch filter, not a global RBAC resource kind"`, `"Q8 currently remains a partial runtime-local closure rather than a complete global RBAC, authn, or audit system"`} {
 		if !strings.Contains(resp.Body.String(), expected) {
 			t.Fatalf("expected console payload to include RBAC declaration detail %s, got %s", expected, resp.Body.String())
 		}
@@ -624,7 +635,7 @@ func TestRuntimeAppPersistsDelaySchedulePlan(t *testing.T) {
 func TestRuntimeAppCancelScheduleOperatorRemovesPersistedPlanFromConsoleAndRecordsEvidence(t *testing.T) {
 	t.Parallel()
 
-	app, err := newRuntimeApp(writeTestConfig(t))
+	app, err := newRuntimeApp(writeScheduleCancelRBACConfig(t))
 	if err != nil {
 		t.Fatalf("new runtime app: %v", err)
 	}
@@ -644,6 +655,7 @@ func TestRuntimeAppCancelScheduleOperatorRemovesPersistedPlanFromConsoleAndRecor
 	}
 
 	cancelReq := httptest.NewRequest(http.MethodPost, "/demo/schedules/schedule-cancel-1/cancel", nil)
+	cancelReq.Header.Set(runtimecore.ConsoleReadActorHeader, "schedule-admin")
 	cancelResp := httptest.NewRecorder()
 	app.ServeHTTP(cancelResp, cancelReq)
 	if cancelResp.Code != http.StatusOK {
@@ -676,13 +688,13 @@ func TestRuntimeAppCancelScheduleOperatorRemovesPersistedPlanFromConsoleAndRecor
 		t.Fatal("expected cancel operator to record audit evidence")
 	}
 	lastEntry := entries[len(entries)-1]
-	if lastEntry.Action != "cancel" || lastEntry.Target != "schedule-cancel-1" || !lastEntry.Allowed || lastEntry.Actor != "admin-user" || lastEntry.Permission != "schedule:cancel" || lastEntry.Reason != "schedule_cancelled" {
+	if lastEntry.Action != "cancel" || lastEntry.Target != "schedule-cancel-1" || !lastEntry.Allowed || lastEntry.Actor != "schedule-admin" || lastEntry.Permission != "schedule:cancel" || lastEntry.Reason != "schedule_cancelled" {
 		t.Fatalf("expected cancel audit entry, got %+v", lastEntry)
 	}
 	logs := app.logs.Lines()
 	matchedLog := false
 	for _, line := range logs {
-		if strings.Contains(line, "runtime schedule cancelled") && strings.Contains(line, "schedule-cancel-1") && strings.Contains(line, "admin-user") {
+		if strings.Contains(line, "runtime schedule cancelled") && strings.Contains(line, "schedule-cancel-1") && strings.Contains(line, "schedule-admin") {
 			matchedLog = true
 			break
 		}
@@ -692,6 +704,7 @@ func TestRuntimeAppCancelScheduleOperatorRemovesPersistedPlanFromConsoleAndRecor
 	}
 
 	notFoundReq := httptest.NewRequest(http.MethodPost, "/demo/schedules/schedule-cancel-1/cancel", nil)
+	notFoundReq.Header.Set(runtimecore.ConsoleReadActorHeader, "schedule-admin")
 	notFoundResp := httptest.NewRecorder()
 	app.ServeHTTP(notFoundResp, notFoundReq)
 	if notFoundResp.Code != http.StatusNotFound {
@@ -699,6 +712,56 @@ func TestRuntimeAppCancelScheduleOperatorRemovesPersistedPlanFromConsoleAndRecor
 	}
 	if !strings.Contains(notFoundResp.Body.String(), "schedule not found") {
 		t.Fatalf("expected 404 response to mention schedule not found, got %s", notFoundResp.Body.String())
+	}
+}
+
+func TestRuntimeAppCancelScheduleOperatorReturnsForbiddenAndRecordsDeniedAudit(t *testing.T) {
+	t.Parallel()
+
+	app, err := newRuntimeApp(writeScheduleCancelRBACConfig(t))
+	if err != nil {
+		t.Fatalf("new runtime app: %v", err)
+	}
+	defer func() { _ = app.Close() }()
+
+	createReq := httptest.NewRequest(http.MethodPost, "/demo/schedules/echo-delay", strings.NewReader(`{"id":"schedule-cancel-denied","delay_ms":500,"message":"deny me"}`))
+	createReq.Header.Set("Content-Type", "application/json")
+	createResp := httptest.NewRecorder()
+	app.ServeHTTP(createResp, createReq)
+	if createResp.Code != http.StatusOK {
+		t.Fatalf("expected create schedule 200, got %d: %s", createResp.Code, createResp.Body.String())
+	}
+
+	cancelReq := httptest.NewRequest(http.MethodPost, "/demo/schedules/schedule-cancel-denied/cancel", nil)
+	cancelReq.Header.Set(runtimecore.ConsoleReadActorHeader, "viewer-user")
+	cancelResp := httptest.NewRecorder()
+	app.ServeHTTP(cancelResp, cancelReq)
+	if cancelResp.Code != http.StatusForbidden {
+		t.Fatalf("expected cancel operator 403, got %d: %s", cancelResp.Code, cancelResp.Body.String())
+	}
+	if !strings.Contains(cancelResp.Body.String(), "permission denied") {
+		t.Fatalf("expected forbidden cancel response to mention permission denied, got %s", cancelResp.Body.String())
+	}
+
+	if _, err := app.state.LoadSchedulePlan(t.Context(), "schedule-cancel-denied"); err != nil {
+		t.Fatalf("expected denied cancel to preserve persisted schedule, got %v", err)
+	}
+	console := readRuntimeConsoleResponse(t, app)
+	if console.Status.Schedules != 1 || !hasConsoleSchedule(console, "schedule-cancel-denied") {
+		t.Fatalf("expected denied cancel to preserve console schedule read model, got %+v", console)
+	}
+
+	entries := app.audits.AuditEntries()
+	if len(entries) != 1 {
+		t.Fatalf("expected one denied cancel audit entry, got %+v", entries)
+	}
+	if entries[0].Actor != "viewer-user" || entries[0].Action != "schedule.cancel" || entries[0].Permission != "schedule:cancel" || entries[0].Target != "schedule-cancel-denied" || entries[0].Allowed || entries[0].Reason != "permission_denied" {
+		t.Fatalf("expected denied cancel audit entry, got %+v", entries[0])
+	}
+	for _, line := range app.logs.Lines() {
+		if strings.Contains(line, "runtime schedule cancelled") && strings.Contains(line, "schedule-cancel-denied") {
+			t.Fatalf("expected denied cancel not to emit success log, got %+v", app.logs.Lines())
+		}
 	}
 }
 

@@ -305,7 +305,18 @@ func (r *InMemoryRuntime) DispatchCommand(ctx context.Context, command eventmode
 	)
 }
 
+func RecordAuthorizationDeniedAudit(recorder AuditRecorder, actor, permission, target string, err error) {
+	if err == nil {
+		return
+	}
+	recordAuthorizationDeniedAuditWithReason(recorder, actor, permission, target, authorizationDeniedAuditReason(err))
+}
+
 func (r *InMemoryRuntime) recordAuthorizationDeniedAudit(recorder AuditRecorder, actor, permission, target, reason string) {
+	recordAuthorizationDeniedAuditWithReason(recorder, actor, permission, target, reason)
+}
+
+func recordAuthorizationDeniedAuditWithReason(recorder AuditRecorder, actor, permission, target, reason string) {
 	if recorder == nil || permission == "" || target == "" {
 		return
 	}
@@ -320,7 +331,6 @@ func (r *InMemoryRuntime) recordAuthorizationDeniedAudit(recorder AuditRecorder,
 	setAuditEntryReason(&entry, reason)
 	_ = recorder.RecordAudit(entry)
 }
-
 func authorizationDeniedAuditReason(err error) string {
 	switch strings.TrimSpace(strings.ToLower(err.Error())) {
 	case "plugin scope denied":

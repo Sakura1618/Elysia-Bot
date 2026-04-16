@@ -52,6 +52,8 @@ type appRuntimeSettings struct {
 	SchedulerIntervalMs int
 }
 
+const scheduleCancelPermission = "schedule:cancel"
+
 type aiProviderMock struct{}
 
 func (aiProviderMock) Generate(_ context.Context, prompt string) (string, error) {
@@ -452,12 +454,12 @@ func (a *runtimeApp) handleConsole(w http.ResponseWriter, r *http.Request) {
 	meta["rbac_read_model_scope"] = "current runtime authorizer entrypoints, adjacent dispatch contract/filter boundaries, deny audit taxonomy, and known system gaps"
 	meta["rbac_current_state"] = "partial-runtime-local-read-model"
 	meta["rbac_system_model_state"] = "not-complete-global-rbac-authn-or-audit-system"
-	meta["rbac_current_authorization_paths"] = []string{"admin-command-runtime-authorizer", "event-metadata-runtime-authorizer", "job-metadata-runtime-authorizer", "schedule-metadata-runtime-authorizer", "console-read-authorizer"}
-	meta["rbac_current_authorization_paths_count"] = 5
-	meta["rbac_authorization_boundaries"] = []string{"admin-command-runtime-authorizer", "event-metadata-runtime-authorizer", "job-metadata-runtime-authorizer", "schedule-metadata-runtime-authorizer", "console-read-authorizer"}
-	meta["rbac_authorizer_entrypoints"] = []string{"admin-command-runtime-authorizer", "event-metadata-runtime-authorizer", "job-metadata-runtime-authorizer", "schedule-metadata-runtime-authorizer", "console-read-authorizer"}
+	meta["rbac_current_authorization_paths"] = []string{"admin-command-runtime-authorizer", "event-metadata-runtime-authorizer", "job-metadata-runtime-authorizer", "schedule-metadata-runtime-authorizer", "console-read-authorizer", "schedule-operator-runtime-authorizer"}
+	meta["rbac_current_authorization_paths_count"] = 6
+	meta["rbac_authorization_boundaries"] = []string{"admin-command-runtime-authorizer", "event-metadata-runtime-authorizer", "job-metadata-runtime-authorizer", "schedule-metadata-runtime-authorizer", "console-read-authorizer", "schedule-operator-runtime-authorizer"}
+	meta["rbac_authorizer_entrypoints"] = []string{"admin-command-runtime-authorizer", "event-metadata-runtime-authorizer", "job-metadata-runtime-authorizer", "schedule-metadata-runtime-authorizer", "console-read-authorizer", "schedule-operator-runtime-authorizer"}
 	meta["rbac_non_authorizer_runtime_boundaries"] = []string{"dispatch-manifest-permission-gate", "job-target-plugin-filter"}
-	meta["rbac_deny_audit_covered_paths"] = []string{"admin-command-runtime-authorizer", "event-metadata-runtime-authorizer", "job-metadata-runtime-authorizer", "schedule-metadata-runtime-authorizer", "console-read-authorizer"}
+	meta["rbac_deny_audit_covered_paths"] = []string{"admin-command-runtime-authorizer", "event-metadata-runtime-authorizer", "job-metadata-runtime-authorizer", "schedule-metadata-runtime-authorizer", "console-read-authorizer", "schedule-operator-runtime-authorizer"}
 	meta["rbac_deny_audit_taxonomy"] = []string{"permission_denied", "plugin_scope_denied"}
 	meta["rbac_deny_audit_scope"] = "authorizer deny paths only"
 	meta["rbac_contract_checks"] = []string{"dispatch-manifest-permission-gate"}
@@ -760,6 +762,12 @@ func (a *runtimeApp) handleScheduleOperator(w http.ResponseWriter, r *http.Reque
 	if actor == "" {
 		actor = "admin-user"
 	}
+	permission := scheduleOperatorPermission(action)
+	if err := runtimecore.AuthorizeRBACAction(a.config.RBAC, actor, permission, scheduleID); err != nil {
+		runtimecore.RecordAuthorizationDeniedAudit(a.audits, actor, permission, scheduleID, err)
+		http.Error(w, err.Error(), http.StatusForbidden)
+		return
+	}
 	if err := a.scheduler.Cancel(scheduleID); err != nil {
 		status := http.StatusInternalServerError
 		logMessage := "runtime schedule cancel failed"
@@ -785,7 +793,7 @@ func (a *runtimeApp) handleScheduleOperator(w http.ResponseWriter, r *http.Reque
 	if a.audits != nil {
 		_ = a.audits.RecordAudit(pluginsdk.AuditEntry{
 			Actor:      actor,
-			Permission: "schedule:cancel",
+			Permission: permission,
 			Action:     action,
 			Target:     scheduleID,
 			Allowed:    true,
@@ -947,6 +955,15 @@ func parseScheduleOperatorPath(path string) (scheduleID string, action string, o
 		return "", "", false
 	}
 	return scheduleID, action, true
+}
+
+func scheduleOperatorPermission(action string) string {
+	switch action {
+	case "cancel":
+		return scheduleCancelPermission
+	default:
+		return ""
+	}
 }
 
 func parsePluginConfigPath(path string) (pluginID string, ok bool) {

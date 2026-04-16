@@ -90,6 +90,23 @@ func NewConsoleReadAuthorizer(cfg *RBACConfig) *ConsoleReadAuthorizer {
 	return &ConsoleReadAuthorizer{authorizer: pluginsdk.NewAuthorizer(cfg.ActorRoles, cfg.Policies), permission: cfg.ConsoleReadPermission}
 }
 
+func AuthorizeRBACAction(cfg *RBACConfig, actor, permission, target string) error {
+	if cfg == nil {
+		return nil
+	}
+	if strings.TrimSpace(permission) == "" || strings.TrimSpace(target) == "" {
+		return nil
+	}
+	decision := pluginsdk.NewAuthorizer(cfg.ActorRoles, cfg.Policies).Authorize(actor, permission, target)
+	if decision.Allowed {
+		return nil
+	}
+	if decision.Reason == "" {
+		return errors.New("permission denied")
+	}
+	return errors.New(decision.Reason)
+}
+
 func (a *AdminCommandAuthorizer) AuthorizeCommand(_ context.Context, command eventmodel.CommandInvocation, _ eventmodel.ExecutionContext) error {
 	if a == nil || a.authorizer == nil {
 		return nil
