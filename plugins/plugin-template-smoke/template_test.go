@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 
 	pluginsdk "github.com/ohmyopencode/bot-platform/packages/plugin-sdk"
@@ -36,6 +37,10 @@ func TestTemplateManifestConstantsStayInSync(t *testing.T) {
 	}
 	if manifest.ConfigSchema["type"] != "object" {
 		t.Fatalf("unexpected config schema %+v", manifest.ConfigSchema)
+	}
+	goModulePath := readGoModulePath(t)
+	if !strings.HasSuffix(goModulePath, "/"+manifest.Entry.Module) {
+		t.Fatalf("go.mod module = %q, want suffix %q so it stays aligned with TemplatePluginModule/manifest entry.module %q", goModulePath, "/"+manifest.Entry.Module, manifest.Entry.Module)
 	}
 
 	manifestPayload := readManifestPayload(t, plugin.Definition().Manifest)
@@ -111,4 +116,23 @@ func readManifestPayload(t *testing.T, manifest any) map[string]any {
 	}
 
 	return payload
+}
+
+func readGoModulePath(t *testing.T) string {
+	t.Helper()
+
+	rawGoMod, err := os.ReadFile("go.mod")
+	if err != nil {
+		t.Fatalf("read go.mod: %v", err)
+	}
+
+	for _, line := range strings.Split(string(rawGoMod), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && fields[0] == "module" {
+			return fields[1]
+		}
+	}
+
+	t.Fatal("go.mod missing module declaration")
+	return ""
 }

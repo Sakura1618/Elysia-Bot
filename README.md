@@ -52,6 +52,7 @@ npm run dev:runtime
 
 - `npm run dev`：代理到 `apps/console-web`
 - `npm run dev:runtime`：启动默认 runtime 开发入口，读取 `deploy/config.dev.yaml`
+- `npm run test:plugin-template:smoke`：运行模板复制 / 改名 / 注册 smoke 路径的聚焦验证
 - `npm run test`：运行当前 `go.work` 已接入模块的 Go 测试
 - `npm run lint`：执行当前仓库 Go 源码的 `gofmt -l` 检查
 - `npm run format`：执行当前仓库 Go 源码的 `gofmt -w`
@@ -157,7 +158,7 @@ Q6-1 ~ Q6-73-3 之后，插件运行面已继续沿最小边界推进 subprocess
 
 ```bash
 go test ./packages/runtime-core -run "Test(BuildSubprocessHostRequestPreservesBeyondSupportedDeeperNested(TypeMismatch|ArrayValueMismatch|ObjectValueMismatch|ObjectNodeMismatch|RequiredMissing|EnumOutOfSet|RequiredDefaultBoundary|RequiredEnumBoundary|EnumDefaultBoundary|RequiredEnumDefaultBoundary|RequiredEnumDefaultExplicitBadValue|RequiredEnumDefaultExplicitArrayValuedBadValue|RequiredEnumDefaultExplicitWrongTypeBadValue|RequiredEnumDefaultExplicitObjectValuedBadValue|RequiredEnumDefaultExplicitObjectNodeBadValue|RequiredEnumDefaultExplicitArrayValuedObjectNodeBadValue)|BuildSubprocessHostRequestDoesNotInjectBeyondSupportedDeeperNestedManifestDefaultIntoInstanceConfig|BuiltSubprocessFixture(ReceivesBeyondSupportedDeeperNested(TypeMismatch|ArrayValueMismatch|ObjectValueMismatch|ObjectNodeMismatch|RequiredMissing|EnumOutOfSet|RequiredDefaultBoundary|RequiredEnumBoundary|EnumDefaultBoundary|RequiredEnumDefaultBoundary|RequiredEnumDefaultExplicitBadValue|RequiredEnumDefaultExplicitArrayValuedBadValue|RequiredEnumDefaultExplicitWrongTypeBadValue|RequiredEnumDefaultExplicitObjectValuedBadValue|RequiredEnumDefaultExplicitObjectNodeBadValue|RequiredEnumDefaultExplicitArrayValuedObjectNodeBadValue)|DoesNotReceiveInjectedBeyondSupportedDeeperNestedManifestDefault)|RuntimeDispatch(PassesBeyondSupportedDeeperNested(TypeMismatchIntoSubprocessHostRequest|ArrayValueMismatchIntoSubprocessHostRequest|ObjectValueMismatchIntoSubprocessHostRequest|ObjectNodeMismatchIntoSubprocessHostRequest|RequiredMissingIntoSubprocessHostRequest|EnumOutOfSetIntoSubprocessHostRequest|RequiredDefaultBoundaryIntoSubprocessHostRequest|RequiredEnumBoundaryIntoSubprocessHostRequest|EnumDefaultBoundaryIntoSubprocessHostRequest|RequiredEnumDefaultBoundaryIntoSubprocessHostRequest|RequiredEnumDefaultExplicitBadValueIntoSubprocessHostRequest|RequiredEnumDefaultExplicitArrayValuedBadValueIntoSubprocessHostRequest|RequiredEnumDefaultExplicitWrongTypeBadValueIntoSubprocessHostRequest|RequiredEnumDefaultExplicitObjectValuedBadValueIntoSubprocessHostRequest|RequiredEnumDefaultExplicitObjectNodeBadValueIntoSubprocessHostRequest|RequiredEnumDefaultExplicitArrayValuedObjectNodeBadValueIntoSubprocessHostRequest)|DoesNotInjectBeyondSupportedDeeperNestedManifestDefaultIntoSubprocessHostRequest))$" -count=1
-go test ./plugins/plugin-template-smoke ./tests/e2e -run "TestPluginTemplateSmoke|TestTemplateManifestConstantsStayInSync"
+npm run test:plugin-template:smoke
 ```
 
 ## 插件开发最小入口
@@ -177,7 +178,7 @@ go test ./plugins/plugin-template-smoke ./tests/e2e -run "TestPluginTemplateSmok
 针对这条模板开发入口，当前推荐的聚焦验证命令是：
 
 ```bash
-go test ./plugins/plugin-template-smoke ./tests/e2e -run "TestPluginTemplateSmoke|TestTemplateManifestConstantsStayInSync"
+npm run test:plugin-template:smoke
 ```
 
 ## 当前已知限制

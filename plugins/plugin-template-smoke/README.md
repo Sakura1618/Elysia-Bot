@@ -44,7 +44,7 @@
 开发模板入口时，优先跑这一条：
 
 ```bash
-go test ./plugins/plugin-template-smoke ./tests/e2e -run "TestPluginTemplateSmoke|TestTemplateManifestConstantsStayInSync"
+npm run test:plugin-template:smoke
 ```
 
 这条命令覆盖：
