@@ -245,6 +245,54 @@ func TestConsoleAPIPluginStatusFallsBackToManifestOnlyEvidence(t *testing.T) {
 	}
 }
 
+func TestConsoleAPIExposesPersistedPluginEnabledOverlay(t *testing.T) {
+	t.Parallel()
+
+	runtime := NewInMemoryRuntime(NoopSupervisor{}, DirectPluginHost{})
+	store := openTempSQLiteStore(t)
+	defer func() { _ = store.Close() }()
+	manifest := pluginsdk.PluginManifest{
+		ID:         "plugin-echo",
+		Name:       "Echo Plugin",
+		Version:    "0.1.0",
+		APIVersion: "v0",
+		Mode:       pluginsdk.ModeSubprocess,
+		Entry:      pluginsdk.PluginEntry{Module: "plugins/plugin-echo", Symbol: "Plugin"},
+	}
+	if err := runtime.RegisterPlugin(pluginsdk.Plugin{Manifest: manifest, Handlers: pluginsdk.Handlers{Event: noopConsoleHandler{}}}); err != nil {
+		t.Fatalf("register plugin: %v", err)
+	}
+	if err := store.SavePluginManifest(context.Background(), manifest); err != nil {
+		t.Fatalf("save plugin manifest: %v", err)
+	}
+	if err := store.SavePluginEnabledState(context.Background(), manifest.ID, false); err != nil {
+		t.Fatalf("save plugin enabled state: %v", err)
+	}
+
+	api := NewConsoleAPI(runtime, nil, Config{}, nil, nil)
+	api.SetPluginEnabledStateReader(NewSQLiteConsolePluginEnabledStateReader(store))
+	plugins := api.Plugins()
+	if len(plugins) != 1 {
+		t.Fatalf("expected one plugin, got %+v", plugins)
+	}
+	plugin := plugins[0]
+	if plugin.Enabled || !plugin.EnabledStatePersisted || plugin.EnabledStateSource != "sqlite-plugin-enabled-overlay" {
+		t.Fatalf("expected persisted disabled overlay in console plugin payload, got %+v", plugin)
+	}
+	if plugin.EnabledStateUpdatedAt == nil {
+		t.Fatalf("expected enabled state timestamp to be present, got %+v", plugin)
+	}
+	rendered, err := api.RenderJSON()
+	if err != nil {
+		t.Fatalf("render json: %v", err)
+	}
+	for _, expected := range []string{`"enabled": false`, `"enabledStateSource": "sqlite-plugin-enabled-overlay"`, `"enabledStatePersisted": true`, `"enabledStateUpdatedAt":`} {
+		if !strings.Contains(rendered, expected) {
+			t.Fatalf("expected rendered console payload to contain %q, got %s", expected, rendered)
+		}
+	}
+}
+
 func TestConsoleAPIPluginStatusClassifiesInstanceConfigRejectBeforeLaunch(t *testing.T) {
 	t.Parallel()
 

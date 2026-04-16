@@ -34,6 +34,12 @@ CREATE TABLE IF NOT EXISTS plugin_registry (
   updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS plugin_enabled_overlays (
+  plugin_id TEXT PRIMARY KEY,
+  enabled INTEGER NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS plugin_status_snapshots (
   plugin_id TEXT PRIMARY KEY,
   last_dispatch_kind TEXT NOT NULL,
@@ -119,6 +125,12 @@ type PluginStatusSnapshot struct {
 	LastRecoveryFailureCount int
 	CurrentFailureStreak     int
 	UpdatedAt                time.Time
+}
+
+type PluginEnabledState struct {
+	PluginID  string
+	Enabled   bool
+	UpdatedAt time.Time
 }
 
 type storedSchedulePlan struct {
@@ -220,6 +232,73 @@ ON CONFLICT(plugin_id) DO UPDATE SET
 		return fmt.Errorf("upsert plugin registry: %w", err)
 	}
 	return nil
+}
+
+func (s *SQLiteStateStore) LoadPluginManifest(ctx context.Context, pluginID string) (pluginsdk.PluginManifest, error) {
+	var payload string
+	err := s.db.QueryRowContext(ctx, `SELECT manifest_json FROM plugin_registry WHERE plugin_id = ?`, pluginID).Scan(&payload)
+	if err == sql.ErrNoRows {
+		return pluginsdk.PluginManifest{}, sql.ErrNoRows
+	}
+	if err != nil {
+		return pluginsdk.PluginManifest{}, fmt.Errorf("load plugin manifest: %w", err)
+	}
+	var manifest pluginsdk.PluginManifest
+	if err := json.Unmarshal([]byte(payload), &manifest); err != nil {
+		return pluginsdk.PluginManifest{}, fmt.Errorf("unmarshal plugin manifest: %w", err)
+	}
+	return manifest, nil
+}
+
+func (s *SQLiteStateStore) SavePluginEnabledState(ctx context.Context, pluginID string, enabled bool) error {
+	pluginID = strings.TrimSpace(pluginID)
+	if pluginID == "" {
+		return fmt.Errorf("save plugin enabled state: plugin id is required")
+	}
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO plugin_enabled_overlays (plugin_id, enabled, updated_at)
+VALUES (?, ?, ?)
+ON CONFLICT(plugin_id) DO UPDATE SET
+  enabled=excluded.enabled,
+  updated_at=excluded.updated_at
+`, pluginID, boolToSQLiteInt(enabled), time.Now().UTC().Format(time.RFC3339))
+	if err != nil {
+		return fmt.Errorf("upsert plugin enabled state: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLiteStateStore) LoadPluginEnabledState(ctx context.Context, pluginID string) (PluginEnabledState, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT plugin_id, enabled, updated_at
+FROM plugin_enabled_overlays
+WHERE plugin_id = ?
+`, pluginID)
+	if err != nil {
+		return PluginEnabledState{}, fmt.Errorf("load plugin enabled state: %w", err)
+	}
+	defer rows.Close()
+	states, err := scanPluginEnabledStates(rows)
+	if err != nil {
+		return PluginEnabledState{}, err
+	}
+	if len(states) == 0 {
+		return PluginEnabledState{}, sql.ErrNoRows
+	}
+	return states[0], nil
+}
+
+func (s *SQLiteStateStore) ListPluginEnabledStates(ctx context.Context) ([]PluginEnabledState, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT plugin_id, enabled, updated_at
+FROM plugin_enabled_overlays
+ORDER BY plugin_id ASC
+`)
+	if err != nil {
+		return nil, fmt.Errorf("list plugin enabled states: %w", err)
+	}
+	defer rows.Close()
+	return scanPluginEnabledStates(rows)
 }
 
 func (s *SQLiteStateStore) RecordDispatchResult(result DispatchResult) error {
@@ -524,6 +603,7 @@ func (s *SQLiteStateStore) Counts(ctx context.Context) (map[string]int, error) {
 	tables := map[string]string{
 		"event_journal":           `SELECT COUNT(*) FROM event_journal`,
 		"plugin_registry":         `SELECT COUNT(*) FROM plugin_registry`,
+		"plugin_enabled_overlays": `SELECT COUNT(*) FROM plugin_enabled_overlays`,
 		"plugin_status_snapshots": `SELECT COUNT(*) FROM plugin_status_snapshots`,
 		"sessions":                `SELECT COUNT(*) FROM sessions`,
 		"idempotency_keys":        `SELECT COUNT(*) FROM idempotency_keys`,
@@ -619,6 +699,31 @@ func scanPluginStatusSnapshots(rows *sql.Rows) ([]PluginStatusSnapshot, error) {
 		return nil, fmt.Errorf("iterate plugin status snapshots: %w", err)
 	}
 	return snapshots, nil
+}
+
+func scanPluginEnabledStates(rows *sql.Rows) ([]PluginEnabledState, error) {
+	states := make([]PluginEnabledState, 0)
+	for rows.Next() {
+		var (
+			state        PluginEnabledState
+			enabled      int
+			updatedAtRaw string
+		)
+		if err := rows.Scan(&state.PluginID, &enabled, &updatedAtRaw); err != nil {
+			return nil, fmt.Errorf("scan plugin enabled state: %w", err)
+		}
+		state.Enabled = enabled == 1
+		updatedAt, err := parseSQLiteTimestamp(updatedAtRaw)
+		if err != nil {
+			return nil, fmt.Errorf("parse plugin enabled state updated_at: %w", err)
+		}
+		state.UpdatedAt = updatedAt
+		states = append(states, state)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate plugin enabled states: %w", err)
+	}
+	return states, nil
 }
 
 func scanStoredSchedulePlans(rows *sql.Rows) ([]storedSchedulePlan, error) {

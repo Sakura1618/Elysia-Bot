@@ -78,6 +78,10 @@ type DispatchResultRecorder interface {
 	RecordDispatchResult(DispatchResult) error
 }
 
+type PluginEnabledStateSource interface {
+	PluginEnabled(string) bool
+}
+
 type InMemoryRuntime struct {
 	mu               sync.RWMutex
 	adapters         map[string]AdapterRegistration
@@ -93,6 +97,7 @@ type InMemoryRuntime struct {
 	logger           *Logger
 	tracer           *TraceRecorder
 	metrics          *MetricsRegistry
+	pluginStates     PluginEnabledStateSource
 	jobQueue         []pluginsdk.JobInvocation
 	schedules        []pluginsdk.ScheduleTrigger
 	records          []Record
@@ -134,6 +139,12 @@ func (r *InMemoryRuntime) SetDispatchRecorder(recorder DispatchResultRecorder) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.dispatchRecorder = recorder
+}
+
+func (r *InMemoryRuntime) SetPluginEnabledStateSource(source PluginEnabledStateSource) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.pluginStates = source
 }
 
 func NewInMemoryRuntime(supervisor Supervisor, host PluginHost) *InMemoryRuntime {
@@ -782,6 +793,9 @@ func (r *InMemoryRuntime) dispatchToPluginsWithFilter(
 		if err != nil {
 			return err
 		}
+		if !r.pluginEnabled(manifest.ID) {
+			continue
+		}
 
 		executionContext := baseContext
 		executionContext.PluginID = manifest.ID
@@ -832,6 +846,16 @@ func (r *InMemoryRuntime) dispatchToPluginsWithFilter(
 	r.log("info", "runtime dispatch completed", logContextFromExecutionContext(baseContext), mergeFields(fields, map[string]any{"dispatch_kind": dispatchKind}))
 
 	return nil
+}
+
+func (r *InMemoryRuntime) pluginEnabled(pluginID string) bool {
+	r.mu.RLock()
+	source := r.pluginStates
+	r.mu.RUnlock()
+	if source == nil {
+		return true
+	}
+	return source.PluginEnabled(pluginID)
 }
 
 func (r *InMemoryRuntime) EnqueueJob(_ context.Context, job pluginsdk.JobInvocation) error {

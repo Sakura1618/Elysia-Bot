@@ -113,6 +113,9 @@ func TestRuntimeAppConsoleReflectsRuntimeState(t *testing.T) {
 	if !strings.Contains(resp.Body.String(), `"adapters": 1`) {
 		t.Fatalf("expected console payload to report one adapter, got %s", resp.Body.String())
 	}
+	if !strings.Contains(resp.Body.String(), `"plugins": 3`) {
+		t.Fatalf("expected console payload to report three registered plugins, got %s", resp.Body.String())
+	}
 	if !strings.Contains(resp.Body.String(), `"runtime_entry": "apps/runtime"`) {
 		t.Fatalf("expected console payload to include runtime meta, got %s", resp.Body.String())
 	}
@@ -127,6 +130,11 @@ func TestRuntimeAppConsoleReflectsRuntimeState(t *testing.T) {
 	}
 	if !strings.Contains(resp.Body.String(), `"plugin_read_model": "runtime-registry+sqlite-plugin-status-snapshot"`) {
 		t.Fatalf("expected console payload to include plugin_read_model=runtime-registry+sqlite-plugin-status-snapshot, got %s", resp.Body.String())
+	}
+	for _, expected := range []string{`"plugin_enabled_state_read_model": "runtime-registry+sqlite-plugin-enabled-overlay"`, `"plugin_enabled_state_persisted": true`, `"plugin_operator_scope": "already-registered plugins only"`, `"/demo/plugins/{plugin-id}/enable"`, `"/demo/plugins/{plugin-id}/disable"`, `"console_mode": "read+operator-plugin-enable-disable"`, `"enabled": true`, `"enabledStateSource": "runtime-default-enabled"`, `"enabledStatePersisted": false`} {
+		if !strings.Contains(resp.Body.String(), expected) {
+			t.Fatalf("expected console payload to include %s, got %s", expected, resp.Body.String())
+		}
 	}
 	if !strings.Contains(resp.Body.String(), `"plugin_dispatch_source": "sqlite-plugin-status-snapshot+runtime-dispatch-results"`) {
 		t.Fatalf("expected console payload to include plugin_dispatch_source=sqlite-plugin-status-snapshot+runtime-dispatch-results, got %s", resp.Body.String())
@@ -159,6 +167,102 @@ func TestRuntimeAppConsoleReflectsRuntimeState(t *testing.T) {
 	}
 	if !strings.Contains(resp.Body.String(), `"generated_at":`) {
 		t.Fatalf("expected console payload to include generated_at timestamp, got %s", resp.Body.String())
+	}
+}
+
+func TestRuntimeAppOperatorDisablePersistsOverlaySkipsDispatchAndReEnables(t *testing.T) {
+	t.Parallel()
+
+	app, err := newRuntimeApp(writeTestConfig(t))
+	if err != nil {
+		t.Fatalf("new runtime app: %v", err)
+	}
+	defer func() { _ = app.Close() }()
+
+	disableReq := httptest.NewRequest(http.MethodPost, "/demo/plugins/plugin-echo/disable", nil)
+	disableResp := httptest.NewRecorder()
+	app.ServeHTTP(disableResp, disableReq)
+	if disableResp.Code != http.StatusOK {
+		t.Fatalf("expected disable operator 200, got %d: %s", disableResp.Code, disableResp.Body.String())
+	}
+	if !strings.Contains(disableResp.Body.String(), `"plugin_id":"plugin-echo"`) && !strings.Contains(disableResp.Body.String(), `"plugin_id": "plugin-echo"`) {
+		t.Fatalf("expected disable response to include plugin id, got %s", disableResp.Body.String())
+	}
+	if !strings.Contains(disableResp.Body.String(), `"enabled":false`) && !strings.Contains(disableResp.Body.String(), `"enabled": false`) {
+		t.Fatalf("expected disable response to confirm disabled state, got %s", disableResp.Body.String())
+	}
+
+	state, err := app.state.LoadPluginEnabledState(t.Context(), "plugin-echo")
+	if err != nil {
+		t.Fatalf("load disabled plugin state: %v", err)
+	}
+	if state.Enabled {
+		t.Fatalf("expected persisted plugin state disabled, got %+v", state)
+	}
+	counts, err := app.state.Counts(t.Context())
+	if err != nil {
+		t.Fatalf("sqlite counts: %v", err)
+	}
+	if counts["plugin_enabled_overlays"] != 1 {
+		t.Fatalf("expected one persisted plugin enabled overlay, got %+v", counts)
+	}
+
+	messageReq := httptest.NewRequest(http.MethodPost, "/demo/onebot/message", strings.NewReader(`{"post_type":"message","message_type":"group","time":1712034000,"user_id":10001,"group_id":42,"message_id":9101,"raw_message":"disabled plugin should skip","sender":{"nickname":"alice"}}`))
+	messageReq.Header.Set("Content-Type", "application/json")
+	messageResp := httptest.NewRecorder()
+	app.ServeHTTP(messageResp, messageReq)
+	if messageResp.Code != http.StatusOK {
+		t.Fatalf("expected disabled plugin event dispatch to keep app response successful, got %d: %s", messageResp.Code, messageResp.Body.String())
+	}
+	if strings.Contains(messageResp.Body.String(), "echo: disabled plugin should skip") {
+		t.Fatalf("expected disabled plugin not to emit echo reply, got %s", messageResp.Body.String())
+	}
+	if app.replies.Count() != 0 {
+		t.Fatalf("expected disabled plugin to suppress replies, got %+v", app.replies.Since(0))
+	}
+	if strings.Contains(messageResp.Body.String(), `"PluginID":"plugin-echo"`) || strings.Contains(messageResp.Body.String(), `"PluginID": "plugin-echo"`) {
+		t.Fatalf("expected disabled plugin to be absent from dispatch results, got %s", messageResp.Body.String())
+	}
+
+	consoleReq := httptest.NewRequest(http.MethodGet, "/api/console?plugin_id=plugin-echo", nil)
+	consoleResp := httptest.NewRecorder()
+	app.ServeHTTP(consoleResp, consoleReq)
+	for _, expected := range []string{`"id": "plugin-echo"`, `"enabled": false`, `"enabledStateSource": "sqlite-plugin-enabled-overlay"`, `"enabledStatePersisted": true`, `"enabledStateUpdatedAt":`} {
+		if !strings.Contains(consoleResp.Body.String(), expected) {
+			t.Fatalf("expected disabled plugin console payload to include %q, got %s", expected, consoleResp.Body.String())
+		}
+	}
+
+	enableReq := httptest.NewRequest(http.MethodPost, "/demo/plugins/plugin-echo/enable", nil)
+	enableResp := httptest.NewRecorder()
+	app.ServeHTTP(enableResp, enableReq)
+	if enableResp.Code != http.StatusOK {
+		t.Fatalf("expected enable operator 200, got %d: %s", enableResp.Code, enableResp.Body.String())
+	}
+	if !strings.Contains(enableResp.Body.String(), `"enabled":true`) && !strings.Contains(enableResp.Body.String(), `"enabled": true`) {
+		t.Fatalf("expected enable response to confirm enabled state, got %s", enableResp.Body.String())
+	}
+
+	messageReq2 := httptest.NewRequest(http.MethodPost, "/demo/onebot/message", strings.NewReader(`{"post_type":"message","message_type":"group","time":1712034001,"user_id":10001,"group_id":42,"message_id":9102,"raw_message":"re-enabled plugin runs","sender":{"nickname":"alice"}}`))
+	messageReq2.Header.Set("Content-Type", "application/json")
+	messageResp2 := httptest.NewRecorder()
+	app.ServeHTTP(messageResp2, messageReq2)
+	if messageResp2.Code != http.StatusOK {
+		t.Fatalf("expected re-enabled dispatch 200, got %d: %s", messageResp2.Code, messageResp2.Body.String())
+	}
+	if !strings.Contains(messageResp2.Body.String(), "echo: re-enabled plugin runs") {
+		t.Fatalf("expected re-enabled plugin to reply again, got %s", messageResp2.Body.String())
+	}
+
+	entries := app.audits.AuditEntries()
+	if len(entries) < 2 {
+		t.Fatalf("expected admin operator audits for disable/enable, got %+v", entries)
+	}
+	if entries[0].Action != "disable" || entries[0].Target != "plugin-echo" || !entries[0].Allowed {
+		t.Fatalf("expected first audit entry for disable, got %+v", entries[0])
+	}
+	if entries[1].Action != "enable" || entries[1].Target != "plugin-echo" || !entries[1].Allowed {
+		t.Fatalf("expected second audit entry for enable, got %+v", entries[1])
 	}
 }
 

@@ -3323,6 +3323,54 @@ func TestRuntimeDispatchesCommandViaHost(t *testing.T) {
 	}
 }
 
+func TestRuntimeSkipsDisabledPluginFromEnabledOverlay(t *testing.T) {
+	t.Parallel()
+
+	allowed := &recordingEventHandler{}
+	blocked := &recordingEventHandler{}
+	runtime := NewInMemoryRuntime(NoopSupervisor{}, DirectPluginHost{})
+	store := openTempSQLiteStore(t)
+	defer func() { _ = store.Close() }()
+	lifecycle := NewPluginLifecycleService(store)
+	runtime.SetPluginEnabledStateSource(lifecycle)
+
+	for _, plugin := range []pluginsdk.Plugin{
+		{
+			Manifest: pluginsdk.PluginManifest{ID: "plugin-allowed", Name: "Allowed Plugin", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, Entry: pluginsdk.PluginEntry{Module: "plugins/allowed", Symbol: "Plugin"}},
+			Handlers: pluginsdk.Handlers{Event: allowed},
+		},
+		{
+			Manifest: pluginsdk.PluginManifest{ID: "plugin-disabled", Name: "Disabled Plugin", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, Entry: pluginsdk.PluginEntry{Module: "plugins/disabled", Symbol: "Plugin"}},
+			Handlers: pluginsdk.Handlers{Event: blocked},
+		},
+	} {
+		if err := runtime.RegisterPlugin(plugin); err != nil {
+			t.Fatalf("register plugin %s: %v", plugin.Manifest.ID, err)
+		}
+		if err := store.SavePluginManifest(context.Background(), plugin.Manifest); err != nil {
+			t.Fatalf("save plugin manifest %s: %v", plugin.Manifest.ID, err)
+		}
+	}
+	if err := lifecycle.Disable("plugin-disabled"); err != nil {
+		t.Fatalf("disable plugin via lifecycle: %v", err)
+	}
+
+	event := eventmodel.Event{EventID: "evt-disabled", TraceID: "trace-disabled", Source: "onebot", Type: "message.received", Timestamp: time.Now().UTC(), IdempotencyKey: "onebot:disabled:1"}
+	if err := runtime.DispatchEvent(context.Background(), event); err != nil {
+		t.Fatalf("dispatch event: %v", err)
+	}
+	if !allowed.called {
+		t.Fatal("expected enabled plugin to receive dispatch")
+	}
+	if blocked.called {
+		t.Fatal("expected disabled plugin to be skipped")
+	}
+	results := runtime.DispatchResults()
+	if len(results) != 1 || results[0].PluginID != "plugin-allowed" || !results[0].Success {
+		t.Fatalf("expected dispatch results only for enabled plugin, got %+v", results)
+	}
+}
+
 func TestRuntimeDispatchCommandWithoutAuthorizerPreservesExistingBehavior(t *testing.T) {
 	t.Parallel()
 

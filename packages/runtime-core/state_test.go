@@ -80,7 +80,7 @@ func TestSQLiteStateStorePersistsCoreMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatalf("counts: %v", err)
 	}
-	if counts["event_journal"] != 1 || counts["plugin_registry"] != 1 || counts["plugin_status_snapshots"] != 0 || counts["sessions"] != 1 || counts["idempotency_keys"] != 1 || counts["jobs"] != 1 || counts["schedule_plans"] != 1 {
+	if counts["event_journal"] != 1 || counts["plugin_registry"] != 1 || counts["plugin_enabled_overlays"] != 0 || counts["plugin_status_snapshots"] != 0 || counts["sessions"] != 1 || counts["idempotency_keys"] != 1 || counts["jobs"] != 1 || counts["schedule_plans"] != 1 {
 		t.Fatalf("unexpected counts: %+v", counts)
 	}
 }
@@ -140,8 +140,75 @@ func TestSQLiteStateStoreRetainsMetadataAcrossReopen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("counts after reopen: %v", err)
 	}
-	if counts["plugin_registry"] != 1 || counts["plugin_status_snapshots"] != 0 || counts["idempotency_keys"] != 1 || counts["jobs"] != 1 || counts["schedule_plans"] != 1 {
+	if counts["plugin_registry"] != 1 || counts["plugin_enabled_overlays"] != 0 || counts["plugin_status_snapshots"] != 0 || counts["idempotency_keys"] != 1 || counts["jobs"] != 1 || counts["schedule_plans"] != 1 {
 		t.Fatalf("expected persisted metadata after reopen, got %+v", counts)
+	}
+}
+
+func TestSQLiteStateStorePersistsPluginEnabledOverlayAcrossReopen(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "state.db")
+	ctx := context.Background()
+
+	store, err := OpenSQLiteStateStore(path)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	if err := store.SavePluginManifest(ctx, pluginsdk.PluginManifest{
+		ID:         "plugin-echo",
+		Name:       "Echo Plugin",
+		Version:    "0.1.0",
+		APIVersion: "v0",
+		Mode:       pluginsdk.ModeSubprocess,
+		Entry:      pluginsdk.PluginEntry{Module: "plugins/plugin-echo", Symbol: "Plugin"},
+	}); err != nil {
+		t.Fatalf("save plugin manifest: %v", err)
+	}
+	if err := store.SavePluginEnabledState(ctx, "plugin-echo", false); err != nil {
+		t.Fatalf("save plugin enabled state: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	reopened, err := OpenSQLiteStateStore(path)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer func() { _ = reopened.Close() }()
+
+	state, err := reopened.LoadPluginEnabledState(ctx, "plugin-echo")
+	if err != nil {
+		t.Fatalf("load plugin enabled state: %v", err)
+	}
+	if state.PluginID != "plugin-echo" || state.Enabled {
+		t.Fatalf("expected persisted disabled overlay after reopen, got %+v", state)
+	}
+	states, err := reopened.ListPluginEnabledStates(ctx)
+	if err != nil {
+		t.Fatalf("list plugin enabled states: %v", err)
+	}
+	if len(states) != 1 || states[0].PluginID != "plugin-echo" || states[0].Enabled {
+		t.Fatalf("expected one persisted disabled plugin overlay, got %+v", states)
+	}
+	counts, err := reopened.Counts(ctx)
+	if err != nil {
+		t.Fatalf("counts after reopen: %v", err)
+	}
+	if counts["plugin_enabled_overlays"] != 1 {
+		t.Fatalf("expected one persisted plugin enabled overlay, got %+v", counts)
+	}
+}
+
+func TestSQLiteStateStoreReturnsNoRowsForMissingPluginEnabledState(t *testing.T) {
+	t.Parallel()
+
+	store := openTempSQLiteStore(t)
+	defer func() { _ = store.Close() }()
+
+	if _, err := store.LoadPluginEnabledState(context.Background(), "plugin-missing"); err != sql.ErrNoRows {
+		t.Fatalf("expected sql.ErrNoRows for missing plugin enabled state, got %v", err)
 	}
 }
 

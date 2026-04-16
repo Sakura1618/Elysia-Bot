@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -17,6 +18,7 @@ import (
 	adapteronebot "github.com/ohmyopencode/bot-platform/adapters/adapter-onebot"
 	eventmodel "github.com/ohmyopencode/bot-platform/packages/event-model"
 	runtimecore "github.com/ohmyopencode/bot-platform/packages/runtime-core"
+	pluginadmin "github.com/ohmyopencode/bot-platform/plugins/plugin-admin"
 	pluginaichat "github.com/ohmyopencode/bot-platform/plugins/plugin-ai-chat"
 	pluginecho "github.com/ohmyopencode/bot-platform/plugins/plugin-echo"
 	"gopkg.in/yaml.v3"
@@ -35,6 +37,7 @@ type runtimeApp struct {
 	onebotIngress   *adapteronebot.IngressConverter
 	audits          *runtimecore.InMemoryAuditLog
 	state           *runtimecore.SQLiteStateStore
+	lifecycle       *runtimecore.PluginLifecycleService
 	queue           *runtimecore.JobQueue
 	scheduler       *runtimecore.Scheduler
 	schedulerCancel context.CancelFunc
@@ -227,7 +230,13 @@ func newRuntimeApp(configPath string) (*runtimeApp, error) {
 
 	runtime := runtimecore.NewInMemoryRuntime(runtimecore.NoopSupervisor{}, runtimecore.DirectPluginHost{})
 	runtime.SetObservability(logger, tracer, metrics)
+	runtime.SetAuditRecorder(audits)
 	runtime.SetDispatchRecorder(state)
+	lifecycle := runtimecore.NewPluginLifecycleService(state)
+	runtime.SetPluginEnabledStateSource(lifecycle)
+	if config.RBAC != nil {
+		runtime.SetCommandAuthorizer(runtimecore.NewAdminCommandAuthorizer(config.RBAC))
+	}
 
 	echoPlugin := pluginecho.New(replies, pluginecho.Config{Prefix: "echo: "})
 	echoDefinition := echoPlugin.Definition()
@@ -250,6 +259,16 @@ func newRuntimeApp(configPath string) (*runtimeApp, error) {
 	if err := state.SavePluginManifest(context.Background(), aiDefinition.Manifest); err != nil {
 		_ = state.Close()
 		return nil, fmt.Errorf("save ai plugin manifest: %w", err)
+	}
+	adminPlugin := pluginadmin.New(lifecycle, nil, nil, actorRoles(config.RBAC), policies(config.RBAC), audits)
+	adminDefinition := adminPlugin.Definition()
+	if err := runtime.RegisterPlugin(adminDefinition); err != nil {
+		_ = state.Close()
+		return nil, fmt.Errorf("register admin plugin: %w", err)
+	}
+	if err := state.SavePluginManifest(context.Background(), adminDefinition.Manifest); err != nil {
+		_ = state.Close()
+		return nil, fmt.Errorf("save admin plugin manifest: %w", err)
 	}
 	if err := runtime.RegisterAdapter(runtimecore.AdapterRegistration{
 		ID:      "adapter-onebot-demo",
@@ -277,6 +296,7 @@ func newRuntimeApp(configPath string) (*runtimeApp, error) {
 		onebotIngress: onebotIngress,
 		audits:        audits,
 		state:         state,
+		lifecycle:     lifecycle,
 		queue:         queue,
 		scheduler:     scheduler,
 		consoleMeta: map[string]any{
@@ -287,13 +307,15 @@ func newRuntimeApp(configPath string) (*runtimeApp, error) {
 				"/demo/jobs/enqueue",
 				"/demo/jobs/timeout",
 				"/demo/schedules/echo-delay",
+				"/demo/plugins/{plugin-id}/disable",
+				"/demo/plugins/{plugin-id}/enable",
 				"/demo/replies",
 				"/demo/state/counts",
 			},
 			"sqlite_path":           settings.SQLitePath,
 			"scheduler_interval_ms": settings.SchedulerIntervalMs,
 			"ai_job_dispatcher":     "runtime-job-queue",
-			"console_mode":          "read-only",
+			"console_mode":          "read+operator-plugin-enable-disable",
 		},
 		mux: http.NewServeMux(),
 	}
@@ -330,6 +352,7 @@ func (a *runtimeApp) routes() {
 	a.mux.HandleFunc("/demo/jobs/enqueue", a.handleJobEnqueue)
 	a.mux.HandleFunc("/demo/jobs/timeout", a.handleJobTimeout)
 	a.mux.HandleFunc("/demo/schedules/echo-delay", a.handleScheduleEchoDelay)
+	a.mux.HandleFunc("/demo/plugins/", a.handlePluginOperator)
 	a.mux.HandleFunc("/demo/replies", a.handleReplies)
 	a.mux.HandleFunc("/demo/state/counts", a.handleStateCounts)
 	a.mux.Handle("/api/console", http.HandlerFunc(a.handleConsole))
@@ -356,6 +379,7 @@ func (a *runtimeApp) handleConsole(w http.ResponseWriter, r *http.Request) {
 	console.SetJobReader(runtimecore.NewSQLiteConsoleJobReader(a.state))
 	console.SetScheduleReader(runtimecore.NewSQLiteConsoleScheduleReader(a.state))
 	console.SetPluginSnapshotReader(runtimecore.NewSQLiteConsolePluginSnapshotReader(a.state))
+	console.SetPluginEnabledStateReader(runtimecore.NewSQLiteConsolePluginEnabledStateReader(a.state))
 	console.SetRecoverySource(newRuntimeRecoverySource(a.queue, a.scheduler))
 	recovery := a.queue.LastRecoverySnapshot()
 	scheduleRecovery := a.scheduler.LastRecoverySnapshot()
@@ -366,6 +390,10 @@ func (a *runtimeApp) handleConsole(w http.ResponseWriter, r *http.Request) {
 	meta["scheduler_running"] = a.scheduler != nil && a.scheduler.Running()
 	meta["ai_job_dispatcher_registered"] = true
 	meta["plugin_read_model"] = "runtime-registry+sqlite-plugin-status-snapshot"
+	meta["plugin_enabled_state_read_model"] = "runtime-registry+sqlite-plugin-enabled-overlay"
+	meta["plugin_enabled_state_persisted"] = true
+	meta["plugin_operator_actions"] = []string{"/demo/plugins/{plugin-id}/enable", "/demo/plugins/{plugin-id}/disable"}
+	meta["plugin_operator_scope"] = "already-registered plugins only"
 	meta["plugin_dispatch_source"] = "sqlite-plugin-status-snapshot+runtime-dispatch-results"
 	meta["plugin_status_persisted"] = true
 	meta["plugin_status_source"] = "runtime-registry+sqlite-plugin-status-snapshot+runtime-dispatch-results"
@@ -684,6 +712,94 @@ func (a *runtimeApp) handleStateCounts(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(counts)
+}
+
+func (a *runtimeApp) handlePluginOperator(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	pluginID, action, ok := parsePluginOperatorPath(r.URL.Path)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	actor := strings.TrimSpace(r.Header.Get(runtimecore.ConsoleReadActorHeader))
+	if actor == "" {
+		actor = "admin-user"
+	}
+	command := eventmodel.CommandInvocation{
+		Name:      "admin",
+		Arguments: []string{action, pluginID},
+		Metadata:  map[string]any{"actor": actor},
+	}
+	executionContext := eventmodel.ExecutionContext{
+		TraceID: fmt.Sprintf("trace-admin-%d", time.Now().UTC().UnixNano()),
+		EventID: fmt.Sprintf("evt-admin-%d", time.Now().UTC().UnixNano()),
+	}
+	if err := a.runtime.DispatchCommand(r.Context(), command, executionContext); err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, context.Canceled) {
+			status = http.StatusRequestTimeout
+		} else if strings.Contains(err.Error(), "permission denied") || strings.Contains(err.Error(), "plugin scope denied") {
+			status = http.StatusForbidden
+		}
+		http.Error(w, err.Error(), status)
+		return
+	}
+	state, err := a.state.LoadPluginEnabledState(r.Context(), pluginID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"status":     "ok",
+		"plugin_id":  pluginID,
+		"action":     action,
+		"enabled":    state.Enabled,
+		"updated_at": state.UpdatedAt.UTC().Format(time.RFC3339),
+	})
+}
+
+func parsePluginOperatorPath(path string) (pluginID string, action string, ok bool) {
+	trimmed := strings.Trim(strings.TrimSpace(path), "/")
+	parts := strings.Split(trimmed, "/")
+	if len(parts) != 4 || parts[0] != "demo" || parts[1] != "plugins" {
+		return "", "", false
+	}
+	pluginID = strings.TrimSpace(parts[2])
+	action = strings.TrimSpace(parts[3])
+	if pluginID == "" {
+		return "", "", false
+	}
+	if action != "enable" && action != "disable" {
+		return "", "", false
+	}
+	return pluginID, action, true
+}
+
+func actorRoles(cfg *runtimecore.RBACConfig) map[string][]string {
+	if cfg == nil {
+		return map[string][]string{"admin-user": {"admin"}}
+	}
+	return cfg.ActorRoles
+}
+
+func policies(cfg *runtimecore.RBACConfig) map[string]pluginadmin.RolePolicy {
+	if cfg == nil {
+		return map[string]pluginadmin.RolePolicy{
+			"admin": {
+				Permissions: []string{"plugin:enable", "plugin:disable"},
+				PluginScope: []string{"*"},
+			},
+		}
+	}
+	result := make(map[string]pluginadmin.RolePolicy, len(cfg.Policies))
+	for role, policy := range cfg.Policies {
+		result[role] = pluginadmin.RolePolicy(policy)
+	}
+	return result
 }
 
 func (a *runtimeApp) persistAndDispatchEvent(ctx context.Context, event eventmodel.Event) (bool, error) {
