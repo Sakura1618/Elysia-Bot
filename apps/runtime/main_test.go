@@ -30,10 +30,20 @@ func writeTestConfigAt(t *testing.T, dir string) string {
 }
 
 type runtimeConsoleResponse struct {
+	Adapters []struct {
+		ID             string `json:"id"`
+		Adapter        string `json:"adapter"`
+		Source         string `json:"source"`
+		Status         string `json:"status"`
+		Health         string `json:"health"`
+		Online         bool   `json:"online"`
+		StatePersisted bool   `json:"statePersisted"`
+	} `json:"adapters"`
 	Schedules []struct {
 		ID string `json:"id"`
 	} `json:"schedules"`
 	Status struct {
+		Adapters  int `json:"adapters"`
 		Schedules int `json:"schedules"`
 	} `json:"status"`
 }
@@ -56,6 +66,15 @@ func readRuntimeConsoleResponse(t *testing.T, app *runtimeApp) runtimeConsoleRes
 func hasConsoleSchedule(payload runtimeConsoleResponse, scheduleID string) bool {
 	for _, schedule := range payload.Schedules {
 		if schedule.ID == scheduleID {
+			return true
+		}
+	}
+	return false
+}
+
+func hasConsoleAdapter(payload runtimeConsoleResponse, adapterID string) bool {
+	for _, adapter := range payload.Adapters {
+		if adapter.ID == adapterID {
 			return true
 		}
 	}
@@ -145,6 +164,11 @@ func TestRuntimeAppConsoleReflectsRuntimeState(t *testing.T) {
 	}
 	if !strings.Contains(resp.Body.String(), `"adapters": 1`) {
 		t.Fatalf("expected console payload to report one adapter, got %s", resp.Body.String())
+	}
+	for _, expected := range []string{`"id": "adapter-onebot-demo"`, `"adapter": "onebot"`, `"source": "onebot"`, `"status": "registered"`, `"health": "ready"`, `"online": true`, `"statePersisted": true`, `"adapter_read_model": "sqlite-adapter-instances"`, `"adapter_state_persisted": true`, `"adapter_operator_scope": "already-registered adapters only"`, `"adapter_status_model": "persisted-registered-instance-status"`} {
+		if !strings.Contains(resp.Body.String(), expected) {
+			t.Fatalf("expected console payload to include %s, got %s", expected, resp.Body.String())
+		}
 	}
 	if !strings.Contains(resp.Body.String(), `"plugins": 3`) {
 		t.Fatalf("expected console payload to report three registered plugins, got %s", resp.Body.String())
@@ -815,6 +839,58 @@ func TestRuntimeAppConsoleReadsPersistedPluginSnapshotAfterRestart(t *testing.T)
 	} {
 		if !strings.Contains(consoleResp.Body.String(), expected) {
 			t.Fatalf("expected persisted plugin snapshot in console payload %q, got %s", expected, consoleResp.Body.String())
+		}
+	}
+}
+
+func TestRuntimeAppConsoleReadsPersistedAdapterInstanceAfterRestart(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	configPath := writeTestConfigAt(t, dir)
+
+	app, err := newRuntimeApp(configPath)
+	if err != nil {
+		t.Fatalf("new runtime app: %v", err)
+	}
+	counts, err := app.state.Counts(t.Context())
+	if err != nil {
+		t.Fatalf("sqlite counts: %v", err)
+	}
+	if counts["adapter_instances"] != 1 {
+		t.Fatalf("expected one persisted adapter instance before restart, got %+v", counts)
+	}
+	state, err := app.state.LoadAdapterInstance(t.Context(), "adapter-onebot-demo")
+	if err != nil {
+		t.Fatalf("load persisted adapter instance: %v", err)
+	}
+	if state.Adapter != "onebot" || state.Source != "onebot" || state.Status != "registered" || state.Health != "ready" || !state.Online {
+		t.Fatalf("expected persisted onebot adapter facts before restart, got %+v", state)
+	}
+	if err := app.Close(); err != nil {
+		t.Fatalf("close first app: %v", err)
+	}
+
+	restarted, err := newRuntimeApp(configPath)
+	if err != nil {
+		t.Fatalf("restart runtime app: %v", err)
+	}
+	defer func() { _ = restarted.Close() }()
+
+	console := readRuntimeConsoleResponse(t, restarted)
+	if console.Status.Adapters != 1 || !hasConsoleAdapter(console, "adapter-onebot-demo") {
+		t.Fatalf("expected restarted console to expose persisted adapter instance, got %+v", console)
+	}
+	adapter := console.Adapters[0]
+	if adapter.Adapter != "onebot" || adapter.Source != "onebot" || adapter.Status != "registered" || adapter.Health != "ready" || !adapter.Online || !adapter.StatePersisted {
+		t.Fatalf("expected restarted console adapter facts, got %+v", adapter)
+	}
+	consoleReq := httptest.NewRequest(http.MethodGet, "/api/console", nil)
+	consoleResp := httptest.NewRecorder()
+	restarted.ServeHTTP(consoleResp, consoleReq)
+	for _, expected := range []string{`"id": "adapter-onebot-demo"`, `"adapter": "onebot"`, `"status": "registered"`, `"health": "ready"`, `"online": true`, `"statePersisted": true`, `"adapter_read_model": "sqlite-adapter-instances"`} {
+		if !strings.Contains(consoleResp.Body.String(), expected) {
+			t.Fatalf("expected restarted console payload to include %q, got %s", expected, consoleResp.Body.String())
 		}
 	}
 }

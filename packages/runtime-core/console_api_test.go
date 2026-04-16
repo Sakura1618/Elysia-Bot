@@ -438,6 +438,59 @@ func TestConsoleAPIPluginStatusUsesPersistedSnapshotWhenNoLiveDispatchExists(t *
 	}
 }
 
+func TestConsoleAPIExposesPersistedAdapterInstances(t *testing.T) {
+	t.Parallel()
+
+	store := openTempSQLiteStore(t)
+	defer func() { _ = store.Close() }()
+	if err := store.SaveAdapterInstance(context.Background(), AdapterInstanceState{
+		InstanceID: "adapter-onebot-demo",
+		Adapter:    "onebot",
+		Source:     "onebot",
+		RawConfig:  json.RawMessage(`{"mode":"demo-ingress","demo_path":"/demo/onebot/message","platform":"onebot/v11"}`),
+		Status:     "registered",
+		Health:     "ready",
+		Online:     true,
+	}); err != nil {
+		t.Fatalf("save adapter instance: %v", err)
+	}
+
+	api := NewConsoleAPI(nil, nil, Config{}, nil, nil)
+	api.SetAdapterInstanceReader(NewSQLiteConsoleAdapterInstanceReader(store))
+	instances, err := api.AdapterInstances()
+	if err != nil {
+		t.Fatalf("adapter instances: %v", err)
+	}
+	if len(instances) != 1 {
+		t.Fatalf("expected one adapter instance, got %+v", instances)
+	}
+	instance := instances[0]
+	if instance.ID != "adapter-onebot-demo" || instance.Adapter != "onebot" || instance.Source != "onebot" {
+		t.Fatalf("expected adapter instance identity fields, got %+v", instance)
+	}
+	if instance.StatusSource != "sqlite-adapter-instances" || instance.ConfigSource != "sqlite-adapter-instances" || !instance.StatePersisted {
+		t.Fatalf("expected persisted adapter read model sources, got %+v", instance)
+	}
+	if instance.Status != "registered" || instance.Health != "ready" || !instance.Online {
+		t.Fatalf("expected adapter status facts, got %+v", instance)
+	}
+	if instance.Config["platform"] != "onebot/v11" || instance.Config["demo_path"] != "/demo/onebot/message" {
+		t.Fatalf("expected adapter config payload, got %+v", instance.Config)
+	}
+	if !strings.Contains(instance.Summary, "persisted state survives restart") {
+		t.Fatalf("expected adapter summary to mention restart persistence, got %q", instance.Summary)
+	}
+	rendered, err := api.RenderJSON()
+	if err != nil {
+		t.Fatalf("render json: %v", err)
+	}
+	for _, expected := range []string{`"adapters": [`, `"id": "adapter-onebot-demo"`, `"adapter": "onebot"`, `"status": "registered"`, `"health": "ready"`, `"online": true`, `"statusSource": "sqlite-adapter-instances"`, `"configSource": "sqlite-adapter-instances"`, `"statePersisted": true`, `"demo_path": "/demo/onebot/message"`, `"platform": "onebot/v11"`} {
+		if !strings.Contains(rendered, expected) {
+			t.Fatalf("expected rendered console payload to contain %q, got %s", expected, rendered)
+		}
+	}
+}
+
 func TestConsoleAPIPluginStatusLiveOverlayWinsOverPersistedSnapshot(t *testing.T) {
 	t.Parallel()
 

@@ -58,6 +58,17 @@ CREATE TABLE IF NOT EXISTS plugin_status_snapshots (
   updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS adapter_instances (
+  instance_id TEXT PRIMARY KEY,
+  adapter TEXT NOT NULL,
+  source TEXT NOT NULL,
+  config_json TEXT NOT NULL,
+  status TEXT NOT NULL,
+  health TEXT NOT NULL,
+  online INTEGER NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS sessions (
   session_id TEXT PRIMARY KEY,
   plugin_id TEXT NOT NULL,
@@ -143,6 +154,17 @@ type PluginConfigState struct {
 	PluginID  string
 	RawConfig json.RawMessage
 	UpdatedAt time.Time
+}
+
+type AdapterInstanceState struct {
+	InstanceID string
+	Adapter    string
+	Source     string
+	RawConfig  json.RawMessage
+	Status     string
+	Health     string
+	Online     bool
+	UpdatedAt  time.Time
 }
 
 type storedSchedulePlan struct {
@@ -358,6 +380,92 @@ WHERE plugin_id = ?
 	state.RawConfig = append(json.RawMessage(nil), rawConfig...)
 	state.UpdatedAt = updatedAt
 	return state, nil
+}
+
+func (s *SQLiteStateStore) SaveAdapterInstance(ctx context.Context, state AdapterInstanceState) error {
+	state.InstanceID = strings.TrimSpace(state.InstanceID)
+	if state.InstanceID == "" {
+		return fmt.Errorf("save adapter instance: instance id is required")
+	}
+	state.Adapter = strings.TrimSpace(state.Adapter)
+	if state.Adapter == "" {
+		return fmt.Errorf("save adapter instance: adapter is required")
+	}
+	state.Source = strings.TrimSpace(state.Source)
+	if state.Source == "" {
+		return fmt.Errorf("save adapter instance: source is required")
+	}
+	if len(state.RawConfig) == 0 {
+		state.RawConfig = json.RawMessage(`{}`)
+	}
+	var rawConfigValue any
+	if err := json.Unmarshal(state.RawConfig, &rawConfigValue); err != nil {
+		return fmt.Errorf("save adapter instance: unmarshal config: %w", err)
+	}
+	normalizedRawConfig, err := json.Marshal(rawConfigValue)
+	if err != nil {
+		return fmt.Errorf("save adapter instance: marshal config: %w", err)
+	}
+	state.Status = strings.TrimSpace(state.Status)
+	if state.Status == "" {
+		state.Status = "registered"
+	}
+	state.Health = strings.TrimSpace(state.Health)
+	if state.Health == "" {
+		state.Health = "unknown"
+	}
+	if state.UpdatedAt.IsZero() {
+		state.UpdatedAt = time.Now().UTC()
+	}
+	_, err = s.db.ExecContext(ctx, `
+INSERT INTO adapter_instances (instance_id, adapter, source, config_json, status, health, online, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(instance_id) DO UPDATE SET
+  adapter=excluded.adapter,
+  source=excluded.source,
+  config_json=excluded.config_json,
+  status=excluded.status,
+  health=excluded.health,
+  online=excluded.online,
+  updated_at=excluded.updated_at
+`, state.InstanceID, state.Adapter, state.Source, string(normalizedRawConfig), state.Status, state.Health, boolToSQLiteInt(state.Online), formatSQLiteTimestamp(state.UpdatedAt))
+	if err != nil {
+		return fmt.Errorf("upsert adapter instance: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLiteStateStore) LoadAdapterInstance(ctx context.Context, instanceID string) (AdapterInstanceState, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT instance_id, adapter, source, config_json, status, health, online, updated_at
+FROM adapter_instances
+WHERE instance_id = ?
+`, instanceID)
+	if err != nil {
+		return AdapterInstanceState{}, fmt.Errorf("load adapter instance: %w", err)
+	}
+	defer rows.Close()
+	states, err := scanAdapterInstances(rows)
+	if err != nil {
+		return AdapterInstanceState{}, err
+	}
+	if len(states) == 0 {
+		return AdapterInstanceState{}, sql.ErrNoRows
+	}
+	return states[0], nil
+}
+
+func (s *SQLiteStateStore) ListAdapterInstances(ctx context.Context) ([]AdapterInstanceState, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT instance_id, adapter, source, config_json, status, health, online, updated_at
+FROM adapter_instances
+ORDER BY instance_id ASC
+`)
+	if err != nil {
+		return nil, fmt.Errorf("list adapter instances: %w", err)
+	}
+	defer rows.Close()
+	return scanAdapterInstances(rows)
 }
 
 func (s *SQLiteStateStore) RecordDispatchResult(result DispatchResult) error {
@@ -665,6 +773,7 @@ func (s *SQLiteStateStore) Counts(ctx context.Context) (map[string]int, error) {
 		"plugin_enabled_overlays": `SELECT COUNT(*) FROM plugin_enabled_overlays`,
 		"plugin_configs":          `SELECT COUNT(*) FROM plugin_configs`,
 		"plugin_status_snapshots": `SELECT COUNT(*) FROM plugin_status_snapshots`,
+		"adapter_instances":       `SELECT COUNT(*) FROM adapter_instances`,
 		"sessions":                `SELECT COUNT(*) FROM sessions`,
 		"idempotency_keys":        `SELECT COUNT(*) FROM idempotency_keys`,
 		"jobs":                    `SELECT COUNT(*) FROM jobs`,
@@ -782,6 +891,33 @@ func scanPluginEnabledStates(rows *sql.Rows) ([]PluginEnabledState, error) {
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate plugin enabled states: %w", err)
+	}
+	return states, nil
+}
+
+func scanAdapterInstances(rows *sql.Rows) ([]AdapterInstanceState, error) {
+	states := make([]AdapterInstanceState, 0)
+	for rows.Next() {
+		var (
+			state        AdapterInstanceState
+			rawConfig    string
+			online       int
+			updatedAtRaw string
+		)
+		if err := rows.Scan(&state.InstanceID, &state.Adapter, &state.Source, &rawConfig, &state.Status, &state.Health, &online, &updatedAtRaw); err != nil {
+			return nil, fmt.Errorf("scan adapter instance: %w", err)
+		}
+		state.RawConfig = append(json.RawMessage(nil), rawConfig...)
+		state.Online = online == 1
+		updatedAt, err := parseSQLiteTimestamp(updatedAtRaw)
+		if err != nil {
+			return nil, fmt.Errorf("parse adapter instance updated_at: %w", err)
+		}
+		state.UpdatedAt = updatedAt
+		states = append(states, state)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate adapter instances: %w", err)
 	}
 	return states, nil
 }

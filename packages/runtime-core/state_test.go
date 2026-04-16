@@ -3,6 +3,7 @@ package runtimecore
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"path/filepath"
 	"testing"
 	"time"
@@ -82,6 +83,71 @@ func TestSQLiteStateStorePersistsCoreMetadata(t *testing.T) {
 	}
 	if counts["event_journal"] != 1 || counts["plugin_registry"] != 1 || counts["plugin_enabled_overlays"] != 0 || counts["plugin_configs"] != 0 || counts["plugin_status_snapshots"] != 0 || counts["sessions"] != 1 || counts["idempotency_keys"] != 1 || counts["jobs"] != 1 || counts["schedule_plans"] != 1 {
 		t.Fatalf("unexpected counts: %+v", counts)
+	}
+}
+
+func TestSQLiteStateStorePersistsAdapterInstancesAcrossReopen(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "state.db")
+	ctx := context.Background()
+	rawConfig := []byte(`{"mode":"demo-ingress","demo_path":"/demo/onebot/message","platform":"onebot/v11"}`)
+
+	store, err := OpenSQLiteStateStore(path)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	if err := store.SaveAdapterInstance(ctx, AdapterInstanceState{
+		InstanceID: "adapter-onebot-demo",
+		Adapter:    "onebot",
+		Source:     "onebot",
+		RawConfig:  rawConfig,
+		Status:     "registered",
+		Health:     "ready",
+		Online:     true,
+	}); err != nil {
+		t.Fatalf("save adapter instance: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	reopened, err := OpenSQLiteStateStore(path)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer func() { _ = reopened.Close() }()
+
+	state, err := reopened.LoadAdapterInstance(ctx, "adapter-onebot-demo")
+	if err != nil {
+		t.Fatalf("load adapter instance: %v", err)
+	}
+	if state.InstanceID != "adapter-onebot-demo" || state.Adapter != "onebot" || state.Source != "onebot" {
+		t.Fatalf("expected persisted adapter identity after reopen, got %+v", state)
+	}
+	var config map[string]any
+	if err := json.Unmarshal(state.RawConfig, &config); err != nil {
+		t.Fatalf("unmarshal raw adapter config: %v", err)
+	}
+	if config["mode"] != "demo-ingress" || config["demo_path"] != "/demo/onebot/message" || config["platform"] != "onebot/v11" {
+		t.Fatalf("expected persisted adapter config fields after reopen, got %+v", config)
+	}
+	if state.Status != "registered" || state.Health != "ready" || !state.Online {
+		t.Fatalf("expected persisted adapter status facts after reopen, got %+v", state)
+	}
+	states, err := reopened.ListAdapterInstances(ctx)
+	if err != nil {
+		t.Fatalf("list adapter instances: %v", err)
+	}
+	if len(states) != 1 || states[0].InstanceID != "adapter-onebot-demo" {
+		t.Fatalf("expected one persisted adapter instance, got %+v", states)
+	}
+	counts, err := reopened.Counts(ctx)
+	if err != nil {
+		t.Fatalf("counts after reopen: %v", err)
+	}
+	if counts["adapter_instances"] != 1 {
+		t.Fatalf("expected one persisted adapter instance row, got %+v", counts)
 	}
 }
 

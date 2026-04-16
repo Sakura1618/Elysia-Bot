@@ -199,6 +199,27 @@ type registeredAdapter struct {
 func (a registeredAdapter) ID() string     { return a.id }
 func (a registeredAdapter) Source() string { return a.source }
 
+func demoOneBotAdapterInstanceState(settings appRuntimeSettings) (runtimecore.AdapterInstanceState, error) {
+	configPayload, err := json.Marshal(map[string]any{
+		"mode":        "demo-ingress",
+		"sqlite_path": settings.SQLitePath,
+		"demo_path":   "/demo/onebot/message",
+		"platform":    "onebot/v11",
+	})
+	if err != nil {
+		return runtimecore.AdapterInstanceState{}, fmt.Errorf("marshal onebot demo adapter config: %w", err)
+	}
+	return runtimecore.AdapterInstanceState{
+		InstanceID: "adapter-onebot-demo",
+		Adapter:    "onebot",
+		Source:     "onebot",
+		RawConfig:  configPayload,
+		Status:     "registered",
+		Health:     "ready",
+		Online:     true,
+	}, nil
+}
+
 func newRuntimeApp(configPath string) (*runtimeApp, error) {
 	config, err := runtimecore.LoadConfig(configPath)
 	if err != nil {
@@ -285,6 +306,15 @@ func newRuntimeApp(configPath string) (*runtimeApp, error) {
 	}); err != nil {
 		_ = state.Close()
 		return nil, fmt.Errorf("register onebot demo adapter: %w", err)
+	}
+	onebotAdapterInstance, err := demoOneBotAdapterInstanceState(settings)
+	if err != nil {
+		_ = state.Close()
+		return nil, err
+	}
+	if err := state.SaveAdapterInstance(context.Background(), onebotAdapterInstance); err != nil {
+		_ = state.Close()
+		return nil, fmt.Errorf("save onebot demo adapter instance: %w", err)
 	}
 
 	ingressLogs := io.MultiWriter(os.Stdout, logs)
@@ -388,6 +418,7 @@ func (a *runtimeApp) handleConsole(w http.ResponseWriter, r *http.Request) {
 	console := runtimecore.NewConsoleAPI(a.runtimeRaw, a.queue, a.config, a.logs.Lines(), a.audits)
 	console.SetJobReader(runtimecore.NewSQLiteConsoleJobReader(a.state))
 	console.SetScheduleReader(runtimecore.NewSQLiteConsoleScheduleReader(a.state))
+	console.SetAdapterInstanceReader(runtimecore.NewSQLiteConsoleAdapterInstanceReader(a.state))
 	console.SetPluginSnapshotReader(runtimecore.NewSQLiteConsolePluginSnapshotReader(a.state))
 	console.SetPluginEnabledStateReader(runtimecore.NewSQLiteConsolePluginEnabledStateReader(a.state))
 	console.SetRecoverySource(newRuntimeRecoverySource(a.queue, a.scheduler))
@@ -399,6 +430,10 @@ func (a *runtimeApp) handleConsole(w http.ResponseWriter, r *http.Request) {
 	}
 	meta["scheduler_running"] = a.scheduler != nil && a.scheduler.Running()
 	meta["ai_job_dispatcher_registered"] = true
+	meta["adapter_read_model"] = "sqlite-adapter-instances"
+	meta["adapter_state_persisted"] = true
+	meta["adapter_operator_scope"] = "already-registered adapters only"
+	meta["adapter_status_model"] = "persisted-registered-instance-status"
 	meta["plugin_read_model"] = "runtime-registry+sqlite-plugin-status-snapshot"
 	meta["plugin_enabled_state_read_model"] = "runtime-registry+sqlite-plugin-enabled-overlay"
 	meta["plugin_enabled_state_persisted"] = true

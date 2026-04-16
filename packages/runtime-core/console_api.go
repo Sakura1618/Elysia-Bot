@@ -14,18 +14,19 @@ import (
 )
 
 type ConsoleAPI struct {
-	runtime         *InMemoryRuntime
-	queue           *JobQueue
-	jobs            consoleJobReader
-	schedules       consoleScheduleReader
-	pluginSnapshots consolePluginSnapshotReader
-	pluginEnabled   consolePluginEnabledStateReader
-	recovery        consoleRecoverySource
-	config          Config
-	logs            []string
-	audits          AuditLogReader
-	meta            map[string]any
-	readAuthorizer  ConsoleReadRequestAuthorizer
+	runtime          *InMemoryRuntime
+	queue            *JobQueue
+	jobs             consoleJobReader
+	schedules        consoleScheduleReader
+	adapterInstances consoleAdapterInstanceReader
+	pluginSnapshots  consolePluginSnapshotReader
+	pluginEnabled    consolePluginEnabledStateReader
+	recovery         consoleRecoverySource
+	config           Config
+	logs             []string
+	audits           AuditLogReader
+	meta             map[string]any
+	readAuthorizer   ConsoleReadRequestAuthorizer
 }
 
 type ConsolePlugin struct {
@@ -56,6 +57,21 @@ type ConsolePlugin struct {
 	StatusLevel              string                `json:"statusLevel,omitempty"`
 	StatusRecovery           string                `json:"statusRecovery,omitempty"`
 	StatusStaleness          string                `json:"statusStaleness,omitempty"`
+}
+
+type ConsoleAdapterInstance struct {
+	ID             string         `json:"id"`
+	Adapter        string         `json:"adapter"`
+	Source         string         `json:"source"`
+	Config         map[string]any `json:"config,omitempty"`
+	Status         string         `json:"status,omitempty"`
+	Health         string         `json:"health,omitempty"`
+	Online         bool           `json:"online"`
+	StatusSource   string         `json:"statusSource,omitempty"`
+	ConfigSource   string         `json:"configSource,omitempty"`
+	StatePersisted bool           `json:"statePersisted"`
+	UpdatedAt      *time.Time     `json:"updatedAt,omitempty"`
+	Summary        string         `json:"summary,omitempty"`
 }
 
 type consoleJobReader interface {
@@ -149,6 +165,10 @@ type consoleScheduleReader interface {
 	ListSchedulePlans() ([]ConsoleSchedule, error)
 }
 
+type consoleAdapterInstanceReader interface {
+	ListAdapterInstances() ([]AdapterInstanceState, error)
+}
+
 type consolePluginSnapshotReader interface {
 	ListPluginStatusSnapshots() ([]PluginStatusSnapshot, error)
 }
@@ -183,6 +203,10 @@ const (
 )
 
 type sqliteConsoleScheduleReader struct {
+	store *SQLiteStateStore
+}
+
+type sqliteConsoleAdapterInstanceReader struct {
 	store *SQLiteStateStore
 }
 
@@ -223,6 +247,13 @@ func NewSQLiteConsoleScheduleReader(store *SQLiteStateStore) consoleScheduleRead
 	return sqliteConsoleScheduleReader{store: store}
 }
 
+func NewSQLiteConsoleAdapterInstanceReader(store *SQLiteStateStore) consoleAdapterInstanceReader {
+	if store == nil {
+		return nil
+	}
+	return sqliteConsoleAdapterInstanceReader{store: store}
+}
+
 func NewSQLiteConsolePluginSnapshotReader(store *SQLiteStateStore) consolePluginSnapshotReader {
 	if store == nil {
 		return nil
@@ -239,6 +270,10 @@ func NewSQLiteConsolePluginEnabledStateReader(store *SQLiteStateStore) consolePl
 
 func (c *ConsoleAPI) SetScheduleReader(reader consoleScheduleReader) {
 	c.schedules = reader
+}
+
+func (c *ConsoleAPI) SetAdapterInstanceReader(reader consoleAdapterInstanceReader) {
+	c.adapterInstances = reader
 }
 
 func (c *ConsoleAPI) SetPluginSnapshotReader(reader consolePluginSnapshotReader) {
@@ -434,6 +469,59 @@ func (c *ConsoleAPI) FilteredPlugins(pluginID string) []ConsolePlugin {
 	return filtered
 }
 
+func (c *ConsoleAPI) AdapterInstances() ([]ConsoleAdapterInstance, error) {
+	if c.adapterInstances == nil {
+		return nil, nil
+	}
+	states, err := c.adapterInstances.ListAdapterInstances()
+	if err != nil {
+		return nil, fmt.Errorf("load console adapter instances: %w", err)
+	}
+	items := make([]ConsoleAdapterInstance, 0, len(states))
+	for _, state := range states {
+		items = append(items, toConsoleAdapterInstance(state))
+	}
+	return items, nil
+}
+
+func toConsoleAdapterInstance(state AdapterInstanceState) ConsoleAdapterInstance {
+	config := map[string]any{}
+	if len(state.RawConfig) > 0 && string(state.RawConfig) != "null" {
+		_ = json.Unmarshal(state.RawConfig, &config)
+	}
+	item := ConsoleAdapterInstance{
+		ID:             state.InstanceID,
+		Adapter:        state.Adapter,
+		Source:         state.Source,
+		Config:         config,
+		Status:         state.Status,
+		Health:         state.Health,
+		Online:         state.Online,
+		StatusSource:   "sqlite-adapter-instances",
+		ConfigSource:   "sqlite-adapter-instances",
+		StatePersisted: true,
+	}
+	if !state.UpdatedAt.IsZero() {
+		updatedAt := state.UpdatedAt.UTC()
+		item.UpdatedAt = &updatedAt
+	}
+	item.Summary = consoleAdapterInstanceSummary(item)
+	return item
+}
+
+func consoleAdapterInstanceSummary(item ConsoleAdapterInstance) string {
+	onlineState := "offline"
+	if item.Online {
+		onlineState = "online"
+	}
+	summary := fmt.Sprintf("adapter instance %s for %s/%s is %s with health=%s via %s", item.ID, item.Adapter, item.Source, item.Status, item.Health, item.StatusSource)
+	if item.StatePersisted {
+		summary += "; persisted state survives restart"
+	}
+	summary += "; online=" + onlineState
+	return summary
+}
+
 func consolePluginStatusLevel(plugin ConsolePlugin) string {
 	if plugin.LastDispatchSuccess == nil {
 		return "registered"
@@ -606,6 +694,13 @@ func (r sqliteConsolePluginSnapshotReader) ListPluginStatusSnapshots() ([]Plugin
 	return r.store.ListPluginStatusSnapshots(context.Background())
 }
 
+func (r sqliteConsoleAdapterInstanceReader) ListAdapterInstances() ([]AdapterInstanceState, error) {
+	if r.store == nil {
+		return nil, nil
+	}
+	return r.store.ListAdapterInstances(context.Background())
+}
+
 func (r sqliteConsolePluginEnabledStateReader) ListPluginEnabledStates() ([]PluginEnabledState, error) {
 	if r.store == nil {
 		return nil, nil
@@ -707,6 +802,10 @@ func (c *ConsoleAPI) RenderJSON() (string, error) {
 }
 
 func (c *ConsoleAPI) renderJSONWithFilters(logQuery, jobQuery, pluginID string) (string, error) {
+	adapterInstances, err := c.AdapterInstances()
+	if err != nil {
+		return "", err
+	}
 	jobs, err := c.FilteredJobs(jobQuery)
 	if err != nil {
 		return "", err
@@ -720,6 +819,7 @@ func (c *ConsoleAPI) renderJSONWithFilters(logQuery, jobQuery, pluginID string) 
 		return "", err
 	}
 	payload := map[string]any{
+		"adapters":      adapterInstances,
 		"plugins":       c.FilteredPlugins(pluginID),
 		"jobs":          jobs,
 		"schedules":     schedules,
