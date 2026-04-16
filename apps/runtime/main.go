@@ -347,6 +347,7 @@ func newRuntimeApp(configPath string) (*runtimeApp, error) {
 				"/demo/ai/message",
 				"/demo/jobs/enqueue",
 				"/demo/jobs/timeout",
+				"/demo/jobs/{job-id}/retry",
 				"/demo/schedules/echo-delay",
 				"/demo/schedules/{schedule-id}/cancel",
 				"/demo/plugins/{plugin-id}/disable",
@@ -393,6 +394,7 @@ func (a *runtimeApp) routes() {
 	a.mux.HandleFunc("/demo/ai/message", a.handleAIMessage)
 	a.mux.HandleFunc("/demo/jobs/enqueue", a.handleJobEnqueue)
 	a.mux.HandleFunc("/demo/jobs/timeout", a.handleJobTimeout)
+	a.mux.HandleFunc("/demo/jobs/", a.handleJobOperator)
 	a.mux.HandleFunc("/demo/schedules/echo-delay", a.handleScheduleEchoDelay)
 	a.mux.HandleFunc("/demo/schedules/", a.handleScheduleOperator)
 	a.mux.HandleFunc("/demo/plugins/", a.handlePluginOperator)
@@ -611,6 +613,8 @@ func (a *runtimeApp) handleJobEnqueue(w http.ResponseWriter, r *http.Request) {
 		Type          string `json:"type"`
 		CorrelationID string `json:"correlation_id"`
 		MaxRetries    *int   `json:"max_retries"`
+		Prompt        string `json:"prompt"`
+		UserID        string `json:"user_id"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&payload)
 	if strings.TrimSpace(payload.ID) == "" {
@@ -625,12 +629,72 @@ func (a *runtimeApp) handleJobEnqueue(w http.ResponseWriter, r *http.Request) {
 	}
 	job := runtimecore.NewJob(payload.ID, payload.Type, maxRetries, 30*time.Second)
 	job.Correlation = payload.CorrelationID
+	if strings.TrimSpace(job.Type) == "ai.chat" {
+		if err := applyDemoAIJobContract(&job, payload.Prompt, payload.UserID); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
 	if err := a.queue.Enqueue(r.Context(), job); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(job)
+}
+
+func (a *runtimeApp) handleJobOperator(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	jobID, action, ok := parseJobOperatorPath(r.URL.Path)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	if action != "retry" {
+		http.NotFound(w, r)
+		return
+	}
+	actor := strings.TrimSpace(r.Header.Get(runtimecore.ConsoleReadActorHeader))
+	if actor == "" {
+		actor = "admin-user"
+	}
+	retried, err := a.queue.RetryDeadLetter(r.Context(), jobID)
+	if err != nil {
+		status := http.StatusBadRequest
+		if strings.Contains(err.Error(), "job not found") {
+			status = http.StatusNotFound
+		}
+		http.Error(w, err.Error(), status)
+		return
+	}
+	if a.audits != nil {
+		_ = a.audits.RecordAudit(pluginsdk.AuditEntry{
+			Actor:      actor,
+			Action:     "retry",
+			Target:     jobID,
+			Allowed:    true,
+			Reason:     "job_dead_letter_retried",
+			OccurredAt: time.Now().UTC().Format(time.RFC3339),
+		})
+	}
+	a.queue.DispatchReady(r.Context(), time.Now().UTC())
+	current, err := a.queue.Inspect(r.Context(), jobID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"status":      "ok",
+		"job_id":      jobID,
+		"action":      action,
+		"accepted":    true,
+		"retried_job": retried,
+		"current_job": current,
+	})
 }
 
 func (a *runtimeApp) handleAIMessage(w http.ResponseWriter, r *http.Request) {
@@ -947,6 +1011,23 @@ func parsePluginOperatorPath(path string) (pluginID string, action string, ok bo
 	return pluginID, action, true
 }
 
+func parseJobOperatorPath(path string) (jobID string, action string, ok bool) {
+	trimmed := strings.Trim(strings.TrimSpace(path), "/")
+	parts := strings.Split(trimmed, "/")
+	if len(parts) != 4 || parts[0] != "demo" || parts[1] != "jobs" {
+		return "", "", false
+	}
+	jobID = strings.TrimSpace(parts[2])
+	action = strings.TrimSpace(parts[3])
+	if jobID == "" {
+		return "", "", false
+	}
+	if action != "retry" {
+		return "", "", false
+	}
+	return jobID, action, true
+}
+
 func parseScheduleOperatorPath(path string) (scheduleID string, action string, ok bool) {
 	trimmed := strings.Trim(strings.TrimSpace(path), "/")
 	parts := strings.Split(trimmed, "/")
@@ -962,6 +1043,50 @@ func parseScheduleOperatorPath(path string) (scheduleID string, action string, o
 		return "", "", false
 	}
 	return scheduleID, action, true
+}
+
+func applyDemoAIJobContract(job *runtimecore.Job, prompt string, userID string) error {
+	if job == nil {
+		return errors.New("job is required")
+	}
+	prompt = strings.TrimSpace(prompt)
+	if prompt == "" {
+		return errors.New("prompt is required for ai.chat demo jobs")
+	}
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		userID = "user-1"
+	}
+	if strings.TrimSpace(job.TraceID) == "" {
+		job.TraceID = fmt.Sprintf("trace-demo-job-%d", time.Now().UTC().UnixNano())
+	}
+	if strings.TrimSpace(job.EventID) == "" {
+		job.EventID = fmt.Sprintf("evt-demo-job-%d", time.Now().UTC().UnixNano())
+	}
+	if strings.TrimSpace(job.Correlation) == "" {
+		job.Correlation = fmt.Sprintf("runtime-ai:%s:%s", userID, prompt)
+	}
+	job.Payload = map[string]any{
+		"prompt": prompt,
+		"dispatch": map[string]any{
+			"actor":            "runtime-job-runner",
+			"permission":       "job:run",
+			"target_plugin_id": "plugin-ai-chat",
+		},
+		"reply_target": "group-42",
+		"reply_handle": map[string]any{
+			"capability": "onebot.reply",
+			"target_id":  "group-42",
+			"message_id": "msg-" + job.EventID,
+			"metadata": map[string]any{
+				"message_type": "group",
+				"group_id":     42,
+				"user_id":      10001,
+			},
+		},
+		"session_id": "session-" + userID,
+	}
+	return nil
 }
 
 func scheduleOperatorPermission(action string) string {

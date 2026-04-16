@@ -87,6 +87,14 @@ type deadLetterTransactionalAlertSink interface {
 	PersistJobDeadLetter(context.Context, Job, AlertRecord) error
 }
 
+type deadLetterRetryTransactionalAlertSink interface {
+	PersistJobDeadLetterRetry(context.Context, Job, string) error
+}
+
+type alertResolver interface {
+	DeleteAlert(context.Context, string) error
+}
+
 type JobDispatcher interface {
 	DispatchQueuedJob(context.Context, Job) error
 }
@@ -274,6 +282,32 @@ func (q *JobQueue) Retry(ctx context.Context, id string) (Job, error) {
 	return updated, nil
 }
 
+func (q *JobQueue) RetryDeadLetter(ctx context.Context, id string) (Job, error) {
+	q.mu.Lock()
+
+	job, exists := q.jobs[id]
+	if !exists {
+		q.mu.Unlock()
+		return Job{}, errors.New("job not found")
+	}
+	if job.Status != JobStatusDead || !job.DeadLetter {
+		q.mu.Unlock()
+		return Job{}, fmt.Errorf("job %q is not dead-lettered", id)
+	}
+
+	updated := reviveDeadLetterJob(job)
+	if err := q.persistDeadLetterRetry(ctx, updated); err != nil {
+		q.mu.Unlock()
+		return Job{}, err
+	}
+	q.jobs[id] = updated
+	q.removeDeadLetterJobLocked(id)
+	q.syncMetricsLocked()
+	q.mu.Unlock()
+	q.observeLifecycle("job.dead_letter_retried", updated)
+	return updated, nil
+}
+
 func (q *JobQueue) Cancel(ctx context.Context, id string) (Job, error) {
 	q.mu.Lock()
 
@@ -307,6 +341,16 @@ func (q *JobQueue) DeadLetter(_ context.Context) []Job {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
 	return append([]Job(nil), q.dead...)
+}
+
+func (q *JobQueue) removeDeadLetterJobLocked(id string) {
+	for index, job := range q.dead {
+		if job.ID != id {
+			continue
+		}
+		q.dead = append(q.dead[:index], q.dead[index+1:]...)
+		return
+	}
 }
 
 func (q *JobQueue) List() []Job {
@@ -508,6 +552,36 @@ func (q *JobQueue) persistDeadLetter(ctx context.Context, job Job) error {
 		return err
 	}
 	return nil
+}
+
+func (q *JobQueue) persistDeadLetterRetry(ctx context.Context, job Job) error {
+	alertID := deadLetterAlertID(job.ID)
+	if sink, ok := q.alerts.(deadLetterRetryTransactionalAlertSink); ok {
+		if err := sink.PersistJobDeadLetterRetry(ctx, job, alertID); err != nil {
+			return fmt.Errorf("persist retried dead-letter job %q with alert resolution: %w", job.ID, err)
+		}
+		return nil
+	}
+	if err := persistJob(ctx, q.store, job); err != nil {
+		return err
+	}
+	if resolver, ok := q.alerts.(alertResolver); ok {
+		if err := resolver.DeleteAlert(ctx, alertID); err != nil {
+			return fmt.Errorf("resolve alert %q: %w", alertID, err)
+		}
+	}
+	return nil
+}
+
+func reviveDeadLetterJob(job Job) Job {
+	updated := job
+	updated.Status = JobStatusPending
+	updated.LastError = ""
+	updated.StartedAt = nil
+	updated.FinishedAt = nil
+	updated.NextRunAt = nil
+	updated.DeadLetter = false
+	return updated
 }
 
 func (q *JobQueue) syncMetricsLocked() {

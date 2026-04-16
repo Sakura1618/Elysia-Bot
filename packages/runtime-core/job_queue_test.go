@@ -194,6 +194,91 @@ func TestJobQueueDuplicateDeadLetterTransitionDoesNotDuplicateAlert(t *testing.T
 	}
 }
 
+func TestJobQueueRetryDeadLetterRevivesJobAndClearsAlert(t *testing.T) {
+	t.Parallel()
+
+	store := openTempSQLiteStore(t)
+	defer func() { _ = store.Close() }()
+
+	queue := NewJobQueue()
+	queue.SetStore(store)
+	queue.SetAlertSink(store)
+	queue.now = func() time.Time { return time.Date(2026, 4, 8, 9, 0, 0, 0, time.UTC) }
+
+	job := NewJob("job-dead-retry", "ai.chat", 0, 30*time.Second)
+	job.Correlation = "corr-dead-retry"
+	if err := queue.Enqueue(context.Background(), job); err != nil {
+		t.Fatalf("enqueue job: %v", err)
+	}
+	if _, err := queue.MarkRunning(context.Background(), job.ID); err != nil {
+		t.Fatalf("mark running: %v", err)
+	}
+	if _, err := queue.Timeout(context.Background(), job.ID); err != nil {
+		t.Fatalf("timeout job: %v", err)
+	}
+
+	retried, err := queue.RetryDeadLetter(context.Background(), job.ID)
+	if err != nil {
+		t.Fatalf("retry dead-letter job: %v", err)
+	}
+	if retried.Status != JobStatusPending || retried.DeadLetter || retried.FinishedAt != nil || retried.NextRunAt != nil {
+		t.Fatalf("expected revived pending job without dead-letter markers, got %+v", retried)
+	}
+	if retried.RetryCount != 0 {
+		t.Fatalf("expected retry count to be preserved on manual dead-letter retry, got %+v", retried)
+	}
+	if got := len(queue.DeadLetter(context.Background())); got != 0 {
+		t.Fatalf("expected in-memory dead-letter list to clear after retry, got %d", got)
+	}
+
+	persisted, err := store.LoadJob(context.Background(), job.ID)
+	if err != nil {
+		t.Fatalf("load retried job: %v", err)
+	}
+	if persisted.Status != JobStatusPending || persisted.DeadLetter || persisted.FinishedAt != nil {
+		t.Fatalf("expected persisted revived pending job, got %+v", persisted)
+	}
+	alerts, err := store.ListAlerts(context.Background())
+	if err != nil {
+		t.Fatalf("list alerts: %v", err)
+	}
+	if len(alerts) != 0 {
+		t.Fatalf("expected dead-letter alert to be resolved after retry, got %+v", alerts)
+	}
+	counts, err := store.Counts(context.Background())
+	if err != nil {
+		t.Fatalf("counts: %v", err)
+	}
+	if counts["alerts"] != 0 {
+		t.Fatalf("expected persisted alert count to be cleared after retry, got %+v", counts)
+	}
+	metricsOutput := queue.metrics.RenderPrometheus()
+	if !strings.Contains(metricsOutput, `bot_platform_job_status_total{status="pending"} 1`) || !strings.Contains(metricsOutput, `bot_platform_job_status_total{status="dead"} 0`) {
+		t.Fatalf("expected metrics to reflect revived pending job, got %s", metricsOutput)
+	}
+}
+
+func TestJobQueueRetryDeadLetterRejectsNonDeadLetterJobs(t *testing.T) {
+	t.Parallel()
+
+	queue := NewJobQueue()
+	job := NewJob("job-not-dead", "ai.chat", 1, 30*time.Second)
+	if err := queue.Enqueue(context.Background(), job); err != nil {
+		t.Fatalf("enqueue job: %v", err)
+	}
+
+	if _, err := queue.RetryDeadLetter(context.Background(), job.ID); err == nil || !strings.Contains(err.Error(), "is not dead-lettered") {
+		t.Fatalf("expected non-dead-letter retry to be rejected safely, got %v", err)
+	}
+	stored, err := queue.Inspect(context.Background(), job.ID)
+	if err != nil {
+		t.Fatalf("inspect job: %v", err)
+	}
+	if stored.Status != JobStatusPending || stored.DeadLetter {
+		t.Fatalf("expected rejected retry not to mutate job, got %+v", stored)
+	}
+}
+
 func TestJobQueueRecordsObservabilityAcrossLifecycle(t *testing.T) {
 	t.Parallel()
 

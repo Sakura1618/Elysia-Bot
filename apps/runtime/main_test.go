@@ -634,6 +634,202 @@ func TestRuntimeAppDeadLetterAlertAppearsInConsole(t *testing.T) {
 	}
 }
 
+func TestRuntimeAppRetryDeadLetterOperatorRequeuesJobClearsConsoleAlertAndRecordsDistinctAudit(t *testing.T) {
+	t.Parallel()
+
+	app, err := newRuntimeApp(writeTestConfig(t))
+	if err != nil {
+		t.Fatalf("new runtime app: %v", err)
+	}
+	defer func() { _ = app.Close() }()
+
+	enqueueReq := httptest.NewRequest(http.MethodPost, "/demo/jobs/enqueue", strings.NewReader(`{"id":"job-dead-retry-console","type":"ai.chat","prompt":"hello retry","user_id":"user-retry","max_retries":0}`))
+	enqueueReq.Header.Set("Content-Type", "application/json")
+	enqueueResp := httptest.NewRecorder()
+	app.ServeHTTP(enqueueResp, enqueueReq)
+	if enqueueResp.Code != http.StatusOK {
+		t.Fatalf("expected enqueue 200, got %d: %s", enqueueResp.Code, enqueueResp.Body.String())
+	}
+
+	timeoutReq := httptest.NewRequest(http.MethodPost, "/demo/jobs/timeout?id=job-dead-retry-console", nil)
+	timeoutResp := httptest.NewRecorder()
+	app.ServeHTTP(timeoutResp, timeoutReq)
+	if timeoutResp.Code != http.StatusOK {
+		t.Fatalf("expected timeout 200, got %d: %s", timeoutResp.Code, timeoutResp.Body.String())
+	}
+	if !strings.Contains(timeoutResp.Body.String(), `"status":"dead"`) || !strings.Contains(timeoutResp.Body.String(), `"deadLetter":true`) {
+		t.Fatalf("expected dead-letter response before retry, got %s", timeoutResp.Body.String())
+	}
+
+	retryReq := httptest.NewRequest(http.MethodPost, "/demo/jobs/job-dead-retry-console/retry", nil)
+	retryReq.Header.Set(runtimecore.ConsoleReadActorHeader, "job-operator")
+	retryResp := httptest.NewRecorder()
+	app.ServeHTTP(retryResp, retryReq)
+	if retryResp.Code != http.StatusOK {
+		t.Fatalf("expected retry operator 200, got %d: %s", retryResp.Code, retryResp.Body.String())
+	}
+	for _, expected := range []string{`"status":"ok"`, `"job_id":"job-dead-retry-console"`, `"action":"retry"`, `"accepted":true`} {
+		if !strings.Contains(retryResp.Body.String(), expected) && !strings.Contains(retryResp.Body.String(), strings.ReplaceAll(expected, `:`, `: `)) {
+			t.Fatalf("expected retry response to include %s, got %s", expected, retryResp.Body.String())
+		}
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		stored, inspectErr := app.queue.Inspect(t.Context(), "job-dead-retry-console")
+		if inspectErr != nil {
+			t.Fatalf("inspect retried job: %v", inspectErr)
+		}
+		if stored.Status == runtimecore.JobStatusDone {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	stored, err := app.queue.Inspect(t.Context(), "job-dead-retry-console")
+	if err != nil {
+		t.Fatalf("inspect retried job after dispatch: %v", err)
+	}
+	if stored.Status != runtimecore.JobStatusDone || stored.DeadLetter {
+		t.Fatalf("expected retried job to leave dead-letter state and complete through runtime dispatch, got %+v", stored)
+	}
+	if len(app.replies.Since(0)) == 0 {
+		t.Fatal("expected retried ai job to record a reply through the existing runtime/plugin path")
+	}
+
+	consoleReq := httptest.NewRequest(http.MethodGet, "/api/console", nil)
+	consoleResp := httptest.NewRecorder()
+	app.ServeHTTP(consoleResp, consoleReq)
+	if consoleResp.Code != http.StatusOK {
+		t.Fatalf("expected console 200 after retry, got %d: %s", consoleResp.Code, consoleResp.Body.String())
+	}
+	var payload struct {
+		Jobs []struct {
+			ID         string `json:"id"`
+			Status     string `json:"status"`
+			DeadLetter bool   `json:"deadLetter"`
+		} `json:"jobs"`
+		Alerts []struct {
+			ObjectID string `json:"objectId"`
+		} `json:"alerts"`
+		Audits []struct {
+			Actor   string `json:"actor"`
+			Action  string `json:"action"`
+			Target  string `json:"target"`
+			Allowed bool   `json:"allowed"`
+			Reason  string `json:"reason"`
+		} `json:"audits"`
+	}
+	if err := json.Unmarshal(consoleResp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode console payload: %v", err)
+	}
+	jobVisible := false
+	for _, job := range payload.Jobs {
+		if job.ID == "job-dead-retry-console" && job.Status == "done" && !job.DeadLetter {
+			jobVisible = true
+			break
+		}
+	}
+	if !jobVisible {
+		t.Fatalf("expected console to show retried job as non-dead, got %+v", payload.Jobs)
+	}
+	for _, alert := range payload.Alerts {
+		if alert.ObjectID == "job-dead-retry-console" {
+			t.Fatalf("expected stale dead-letter alert to be removed from console, got %+v", payload.Alerts)
+		}
+	}
+	auditVisible := false
+	for _, entry := range payload.Audits {
+		if entry.Actor == "job-operator" && entry.Action == "retry" && entry.Target == "job-dead-retry-console" && entry.Allowed && entry.Reason == "job_dead_letter_retried" {
+			auditVisible = true
+			break
+		}
+	}
+	if !auditVisible {
+		t.Fatalf("expected distinct retry audit entry in console payload, got %+v", payload.Audits)
+	}
+	entries := app.audits.AuditEntries()
+	if len(entries) == 0 {
+		t.Fatal("expected retry operator to record audit evidence")
+	}
+	lastEntry := entries[len(entries)-1]
+	if lastEntry.Actor != "job-operator" || lastEntry.Action != "retry" || lastEntry.Target != "job-dead-retry-console" || !lastEntry.Allowed || lastEntry.Reason != "job_dead_letter_retried" {
+		t.Fatalf("expected distinct retry audit entry, got %+v", lastEntry)
+	}
+	if lastEntry.Action == "replay" || strings.Contains(lastEntry.Reason, "replay") {
+		t.Fatalf("expected retry audit to remain distinct from replay, got %+v", lastEntry)
+	}
+	counts, err := app.state.Counts(t.Context())
+	if err != nil {
+		t.Fatalf("sqlite counts after retry: %v", err)
+	}
+	if counts["alerts"] != 0 {
+		t.Fatalf("expected retry to resolve persisted dead-letter alert, got %+v", counts)
+	}
+}
+
+func TestRuntimeAppRetryDeadLetterOperatorRejectsDuplicateAndInvalidRequestsSafely(t *testing.T) {
+	t.Parallel()
+
+	app, err := newRuntimeApp(writeTestConfig(t))
+	if err != nil {
+		t.Fatalf("new runtime app: %v", err)
+	}
+	defer func() { _ = app.Close() }()
+
+	enqueueReq := httptest.NewRequest(http.MethodPost, "/demo/jobs/enqueue", strings.NewReader(`{"id":"job-dead-retry-once","type":"ai.chat","prompt":"retry once","user_id":"user-retry-once","max_retries":0}`))
+	enqueueReq.Header.Set("Content-Type", "application/json")
+	enqueueResp := httptest.NewRecorder()
+	app.ServeHTTP(enqueueResp, enqueueReq)
+	if enqueueResp.Code != http.StatusOK {
+		t.Fatalf("expected enqueue 200, got %d: %s", enqueueResp.Code, enqueueResp.Body.String())
+	}
+
+	timeoutReq := httptest.NewRequest(http.MethodPost, "/demo/jobs/timeout?id=job-dead-retry-once", nil)
+	timeoutResp := httptest.NewRecorder()
+	app.ServeHTTP(timeoutResp, timeoutReq)
+	if timeoutResp.Code != http.StatusOK {
+		t.Fatalf("expected timeout 200, got %d: %s", timeoutResp.Code, timeoutResp.Body.String())
+	}
+
+	firstRetryReq := httptest.NewRequest(http.MethodPost, "/demo/jobs/job-dead-retry-once/retry", nil)
+	firstRetryResp := httptest.NewRecorder()
+	app.ServeHTTP(firstRetryResp, firstRetryReq)
+	if firstRetryResp.Code != http.StatusOK {
+		t.Fatalf("expected first retry 200, got %d: %s", firstRetryResp.Code, firstRetryResp.Body.String())
+	}
+
+	secondRetryReq := httptest.NewRequest(http.MethodPost, "/demo/jobs/job-dead-retry-once/retry", nil)
+	secondRetryResp := httptest.NewRecorder()
+	app.ServeHTTP(secondRetryResp, secondRetryReq)
+	if secondRetryResp.Code != http.StatusBadRequest {
+		t.Fatalf("expected duplicate retry to be rejected with 400, got %d: %s", secondRetryResp.Code, secondRetryResp.Body.String())
+	}
+	if !strings.Contains(secondRetryResp.Body.String(), "is not dead-lettered") {
+		t.Fatalf("expected duplicate retry rejection to explain state, got %s", secondRetryResp.Body.String())
+	}
+
+	missingRetryReq := httptest.NewRequest(http.MethodPost, "/demo/jobs/job-missing-retry/retry", nil)
+	missingRetryResp := httptest.NewRecorder()
+	app.ServeHTTP(missingRetryResp, missingRetryReq)
+	if missingRetryResp.Code != http.StatusNotFound {
+		t.Fatalf("expected missing retry to return 404, got %d: %s", missingRetryResp.Code, missingRetryResp.Body.String())
+	}
+	if !strings.Contains(missingRetryResp.Body.String(), "job not found") {
+		t.Fatalf("expected missing retry response to mention job not found, got %s", missingRetryResp.Body.String())
+	}
+	entries := app.audits.AuditEntries()
+	allowedRetries := 0
+	for _, entry := range entries {
+		if entry.Action == "retry" && entry.Target == "job-dead-retry-once" && entry.Allowed {
+			allowedRetries++
+		}
+	}
+	if allowedRetries != 1 {
+		t.Fatalf("expected exactly one accepted retry audit entry, got %+v", entries)
+	}
+}
+
 func TestRuntimeAppDelayScheduleTriggersEchoReply(t *testing.T) {
 	t.Parallel()
 

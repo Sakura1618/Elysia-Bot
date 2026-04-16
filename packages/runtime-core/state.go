@@ -675,6 +675,25 @@ func (s *SQLiteStateStore) PersistJobDeadLetter(ctx context.Context, job Job, al
 	return nil
 }
 
+func (s *SQLiteStateStore) PersistJobDeadLetterRetry(ctx context.Context, job Job, alertID string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin dead-letter retry persistence transaction: %w", err)
+	}
+	if err := saveJobWithExecutor(ctx, tx, job); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if err := deleteAlertWithExecutor(ctx, tx, alertID); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit dead-letter retry persistence transaction: %w", err)
+	}
+	return nil
+}
+
 func saveAlertWithExecutor(ctx context.Context, executor sqliteExecContexter, alert AlertRecord) error {
 	normalized, err := normalizeAlertRecord(alert)
 	if err != nil {
@@ -691,6 +710,21 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		normalized.TraceID, normalized.EventID, normalized.RunID, normalized.Correlation, formatSQLiteTimestamp(normalized.CreatedAt))
 	if err != nil {
 		return fmt.Errorf("insert alert: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLiteStateStore) DeleteAlert(ctx context.Context, id string) error {
+	return deleteAlertWithExecutor(ctx, s.db, id)
+}
+
+func deleteAlertWithExecutor(ctx context.Context, executor sqliteExecContexter, id string) error {
+	trimmed := strings.TrimSpace(id)
+	if trimmed == "" {
+		return fmt.Errorf("delete alert: alert id is required")
+	}
+	if _, err := executor.ExecContext(ctx, `DELETE FROM alerts WHERE alert_id = ?`, trimmed); err != nil {
+		return fmt.Errorf("delete alert: %w", err)
 	}
 	return nil
 }
