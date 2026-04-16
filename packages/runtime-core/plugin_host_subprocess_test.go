@@ -180,6 +180,16 @@ func TestSubprocessPluginHostRejectsIncompatibleManifestBeforeProcessLaunch(t *t
 			expectedModulePresent:   true,
 		},
 		{
+			plugin:                  subprocessPluginWithRuntimeVersionRange("plugin-runtime", ">=0.2.0 <1.0.0"),
+			expectedReason:          "manifest_unsupported_runtime_version",
+			expectedRule:            "runtime_version",
+			expectedManifestMode:    pluginsdk.ModeSubprocess,
+			expectedManifestVersion: "v0",
+			expectedBinaryPresent:   false,
+			expectedModulePresent:   true,
+			expectedErrorContains:   `current runtime version "0.1.0" does not satisfy required runtimeVersionRange ">=0.2.0 <1.0.0"`,
+		},
+		{
 			plugin:                  pluginsdk.Plugin{Manifest: pluginsdk.PluginManifest{ID: "plugin-entry", Name: "Entry", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, Entry: pluginsdk.PluginEntry{Symbol: "Plugin"}}},
 			expectedReason:          "manifest_missing_entry_target",
 			expectedRule:            "entry_target",
@@ -780,11 +790,18 @@ func TestSubprocessPluginHostRejectsIncompatibleManifestBeforeProcessLaunch(t *t
 				t.Fatalf("expected compatibility enum value log %q, got %s", expectedEnumValueLog, logs.String())
 			}
 		}
+		if tc.plugin.Manifest.ID == "plugin-runtime" {
+			for _, expected := range []string{`"current_runtime_version":"0.1.0"`, `"required_runtime_version_range":"\u003e=0.2.0 \u003c1.0.0"`} {
+				if !strings.Contains(logs.String(), expected) {
+					t.Fatalf("expected runtime version compatibility metadata %q, got %s", expected, logs.String())
+				}
+			}
+		}
 	}
 	if launches.Load() != 0 {
 		t.Fatalf("expected incompatible plugin rejection before process launch, got %d launches", launches.Load())
 	}
-	for _, expected := range []string{"subprocess host compatibility check failed", "plugin-inproc", "plugin-api", "plugin-entry", "plugin-config", "plugin-required", "plugin-required-invalid-container", "plugin-required-invalid-entry", "plugin-properties-invalid-container", "plugin-typed-config", "plugin-typed-config-default", "plugin-typed-config-enum-value", "plugin-typed-config-shape", "plugin-typed-config-shape-missing-object-type", "plugin-typed-config-shape-invalid-properties-container", "plugin-typed-config-enum-default", "plugin-typed-config-nested-default", "plugin-typed-config-nested-enum-value", "plugin-typed-config-nested-enum-default", "plugin-typed-config-nested", "plugin-typed-config-nested-deep", "plugin-typed-config-nested-required", "plugin-typed-config-nested-shape", "plugin-typed-config-nested-shape-deep", "plugin-typed-config-nested-shape-missing-object-type", "plugin-typed-config-nested-shape-invalid-properties-container", "plugin-typed-config-nested-required-invalid-container", "plugin-typed-config-nested-required-invalid-entry"} {
+	for _, expected := range []string{"subprocess host compatibility check failed", "plugin-inproc", "plugin-api", "plugin-runtime", "plugin-entry", "plugin-config", "plugin-required", "plugin-required-invalid-container", "plugin-required-invalid-entry", "plugin-properties-invalid-container", "plugin-typed-config", "plugin-typed-config-default", "plugin-typed-config-enum-value", "plugin-typed-config-shape", "plugin-typed-config-shape-missing-object-type", "plugin-typed-config-shape-invalid-properties-container", "plugin-typed-config-enum-default", "plugin-typed-config-nested-default", "plugin-typed-config-nested-enum-value", "plugin-typed-config-nested-enum-default", "plugin-typed-config-nested", "plugin-typed-config-nested-deep", "plugin-typed-config-nested-required", "plugin-typed-config-nested-shape", "plugin-typed-config-nested-shape-deep", "plugin-typed-config-nested-shape-missing-object-type", "plugin-typed-config-nested-shape-invalid-properties-container", "plugin-typed-config-nested-required-invalid-container", "plugin-typed-config-nested-required-invalid-entry"} {
 		if !strings.Contains(logs.String(), expected) {
 			t.Fatalf("expected compatibility observability log %q, got %s", expected, logs.String())
 		}
@@ -794,9 +811,10 @@ func TestSubprocessPluginHostRejectsIncompatibleManifestBeforeProcessLaunch(t *t
 		t.Fatalf("expected compatibility trace span, got %s", renderedTrace)
 	}
 	spans := tracer.SpansByTrace(event.TraceID)
-	if len(spans) != 27 {
-		t.Fatalf("expected twenty-seven compatibility spans, got %d", len(spans))
+	if len(spans) != 28 {
+		t.Fatalf("expected twenty-eight compatibility spans, got %d", len(spans))
 	}
+	runtimeVersionTraceMatched := false
 	topLevelRequiredInvalidContainerTraceMatched := false
 	topLevelRequiredInvalidEntryTraceMatched := false
 	topLevelPropertiesInvalidContainerTraceMatched := false
@@ -810,6 +828,9 @@ func TestSubprocessPluginHostRejectsIncompatibleManifestBeforeProcessLaunch(t *t
 	topLevelEnumValueTraceMatched := false
 	nestedEnumValueTraceMatched := false
 	for _, span := range spans {
+		if span.PluginID == "plugin-runtime" && span.Metadata["compatibility_rule"] == "runtime_version" && span.Metadata["failure_reason"] == "manifest_unsupported_runtime_version" && span.Metadata["error"] == `plugin "plugin-runtime" is not compatible with subprocess host: current runtime version "0.1.0" does not satisfy required runtimeVersionRange ">=0.2.0 <1.0.0"` && span.Metadata["current_runtime_version"] == "0.1.0" && span.Metadata["required_runtime_version_range"] == ">=0.2.0 <1.0.0" {
+			runtimeVersionTraceMatched = true
+		}
 		if span.PluginID == "plugin-required-invalid-container" && span.Metadata["compatibility_rule"] == "config_schema" && span.Metadata["failure_reason"] == "manifest_invalid_config_schema" && span.Metadata["error"] == `plugin "plugin-required-invalid-container" is not compatible with subprocess host: config schema required must be an array of property names` {
 			topLevelRequiredInvalidContainerTraceMatched = true
 		}
@@ -856,6 +877,9 @@ func TestSubprocessPluginHostRejectsIncompatibleManifestBeforeProcessLaunch(t *t
 	}
 	if !strings.Contains(logs.String(), `"enum_value":"true"`) {
 		t.Fatalf("expected nested enum value compatibility log metadata, got %s", logs.String())
+	}
+	if !runtimeVersionTraceMatched {
+		t.Fatalf("expected runtime version compatibility trace metadata, got %+v", spans)
 	}
 	if !topLevelRequiredInvalidContainerTraceMatched {
 		t.Fatalf("expected top-level required invalid container compatibility trace metadata, got %+v", spans)
@@ -904,6 +928,7 @@ func TestSubprocessPluginHostRejectsIncompatibleManifestBeforeProcessLaunch(t *t
 	}{
 		{pluginID: "plugin-inproc", expectedReason: "manifest_mode_mismatch", expectedRule: "mode", expectedManifestMode: pluginsdk.ModeInProc, expectedManifestAPI: "v0", expectedBinaryPresent: false, expectedModulePresent: true},
 		{pluginID: "plugin-api", expectedReason: "manifest_unsupported_api_version", expectedRule: "api_version", expectedManifestMode: pluginsdk.ModeSubprocess, expectedManifestAPI: "v9", expectedBinaryPresent: false, expectedModulePresent: true},
+		{pluginID: "plugin-runtime", expectedReason: "manifest_unsupported_runtime_version", expectedRule: "runtime_version", expectedManifestMode: pluginsdk.ModeSubprocess, expectedManifestAPI: "v0", expectedBinaryPresent: false, expectedModulePresent: true},
 		{pluginID: "plugin-entry", expectedReason: "manifest_missing_entry_target", expectedRule: "entry_target", expectedManifestMode: pluginsdk.ModeSubprocess, expectedManifestAPI: "v0", expectedBinaryPresent: false, expectedModulePresent: false},
 		{pluginID: "plugin-config", expectedReason: "manifest_invalid_config_schema", expectedRule: "config_schema", expectedManifestMode: pluginsdk.ModeSubprocess, expectedManifestAPI: "v0", expectedBinaryPresent: false, expectedModulePresent: true},
 		{pluginID: "plugin-required", expectedReason: "manifest_missing_required_config", expectedRule: "config_required", expectedManifestMode: pluginsdk.ModeSubprocess, expectedManifestAPI: "v0", expectedBinaryPresent: false, expectedModulePresent: true},
@@ -948,6 +973,7 @@ func TestSubprocessPluginHostRejectsIncompatibleManifestBeforeProcessLaunch(t *t
 	for _, expected := range []string{
 		`bot_platform_plugin_errors_total{plugin_id="plugin-inproc"} 1`,
 		`bot_platform_plugin_errors_total{plugin_id="plugin-api"} 1`,
+		`bot_platform_plugin_errors_total{plugin_id="plugin-runtime"} 1`,
 		`bot_platform_plugin_errors_total{plugin_id="plugin-entry"} 1`,
 		`bot_platform_plugin_errors_total{plugin_id="plugin-config"} 1`,
 		`bot_platform_plugin_errors_total{plugin_id="plugin-required"} 1`,
@@ -989,6 +1015,41 @@ func TestSubprocessPluginHostAcceptsSupportedSubprocessManifest(t *testing.T) {
 	if err := host.DispatchEvent(context.Background(), plugin, testPluginEvent(), eventmodel.ExecutionContext{TraceID: "trace-ok", EventID: "evt-ok"}); err != nil {
 		t.Fatalf("expected compatible subprocess plugin to dispatch, got %v", err)
 	}
+}
+
+func TestSubprocessPluginHostAcceptsSupportedRuntimeVersionRange(t *testing.T) {
+	t.Parallel()
+
+	host := NewSubprocessPluginHost(testPluginProcessFactory(t, "echo"))
+	plugin := subprocessPluginWithRuntimeVersionRange("plugin-runtime-ok", ">=0.1.0 <1.0.0")
+
+	if err := host.DispatchEvent(context.Background(), plugin, testPluginEvent(), eventmodel.ExecutionContext{TraceID: "trace-runtime-ok", EventID: "evt-runtime-ok"}); err != nil {
+		t.Fatalf("expected compatible runtimeVersionRange to dispatch, got %v", err)
+	}
+}
+
+func subprocessPluginWithRuntimeVersionRange(pluginID, runtimeVersionRange string) pluginsdk.Plugin {
+	manifestJSON := fmt.Sprintf(`{
+		"id":%q,
+		"name":"Runtime Range",
+		"version":"0.1.0",
+		"apiVersion":"v0",
+		"mode":"subprocess",
+		"publish":{
+			"sourceType":"git",
+			"sourceUri":"https://example.com/plugins/%s",
+			"runtimeVersionRange":%q
+		},
+		"entry":{
+			"module":"plugins/%s",
+			"symbol":"Plugin"
+		}
+	}`, pluginID, pluginID, runtimeVersionRange, pluginID)
+	var manifest pluginsdk.PluginManifest
+	if err := json.Unmarshal([]byte(manifestJSON), &manifest); err != nil {
+		panic(fmt.Sprintf("unmarshal subprocess runtime version range manifest: %v", err))
+	}
+	return pluginsdk.Plugin{Manifest: manifest}
 }
 
 func TestSubprocessPluginHostSendsInstanceConfigWhenConfigured(t *testing.T) {

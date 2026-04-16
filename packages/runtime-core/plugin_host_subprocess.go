@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -19,7 +20,10 @@ import (
 	pluginsdk "github.com/ohmyopencode/bot-platform/packages/plugin-sdk"
 )
 
-const supportedSubprocessPluginAPIVersion = "v0"
+const (
+	supportedSubprocessPluginAPIVersion = "v0"
+	currentRuntimeVersion               = "0.1.0"
+)
 
 const (
 	defaultHandshakeTimeout = 2 * time.Second
@@ -77,6 +81,7 @@ type subprocessFailureReason string
 const (
 	subprocessFailureReasonManifestModeMismatch            subprocessFailureReason = "manifest_mode_mismatch"
 	subprocessFailureReasonManifestUnsupportedAPI          subprocessFailureReason = "manifest_unsupported_api_version"
+	subprocessFailureReasonManifestUnsupportedRuntime      subprocessFailureReason = "manifest_unsupported_runtime_version"
 	subprocessFailureReasonManifestMissingEntry            subprocessFailureReason = "manifest_missing_entry_target"
 	subprocessFailureReasonManifestInvalidConfigSchema     subprocessFailureReason = "manifest_invalid_config_schema"
 	subprocessFailureReasonManifestMissingRequiredConfig   subprocessFailureReason = "manifest_missing_required_config"
@@ -93,6 +98,12 @@ type subprocessCompatibilityFailure struct {
 	compatibilityRule string
 	metadata          map[string]any
 	detail            string
+}
+
+type subprocessRuntimeVersion struct {
+	major int
+	minor int
+	patch int
 }
 
 func (e *subprocessCompatibilityFailure) Error() string {
@@ -847,6 +858,9 @@ func validateSubprocessPlugin(manifest pluginsdk.PluginManifest) error {
 			detail:   fmt.Sprintf("plugin %q is not compatible with subprocess host: unsupported apiVersion %q", manifest.ID, manifest.APIVersion),
 		}
 	}
+	if err := validateSubprocessRuntimeVersion(manifest); err != nil {
+		return err
+	}
 	if strings.TrimSpace(manifest.Entry.Binary) == "" && strings.TrimSpace(manifest.Entry.Module) == "" {
 		return &subprocessCompatibilityFailure{
 			manifest: manifest,
@@ -858,6 +872,181 @@ func validateSubprocessPlugin(manifest pluginsdk.PluginManifest) error {
 		return err
 	}
 	return nil
+}
+
+func validateSubprocessRuntimeVersion(manifest pluginsdk.PluginManifest) error {
+	requiredRange, ok := subprocessManifestRuntimeVersionRange(manifest)
+	if !ok {
+		return nil
+	}
+	requiredRange = strings.TrimSpace(requiredRange)
+	if requiredRange == "" {
+		return nil
+	}
+	compatible, err := subprocessRuntimeVersionSatisfiesRange(currentRuntimeVersion, requiredRange)
+	if err == nil && compatible {
+		return nil
+	}
+	detail := fmt.Sprintf("plugin %q is not compatible with subprocess host: current runtime version %q does not satisfy required runtimeVersionRange %q", manifest.ID, currentRuntimeVersion, requiredRange)
+	if err != nil {
+		detail = fmt.Sprintf("plugin %q is not compatible with subprocess host: current runtime version %q cannot be evaluated against required runtimeVersionRange %q", manifest.ID, currentRuntimeVersion, requiredRange)
+	}
+	return &subprocessCompatibilityFailure{
+		manifest:          manifest,
+		reason:            subprocessFailureReasonManifestUnsupportedRuntime,
+		compatibilityRule: "runtime_version",
+		metadata: map[string]any{
+			"current_runtime_version":        currentRuntimeVersion,
+			"required_runtime_version_range": requiredRange,
+		},
+		detail: detail,
+	}
+}
+
+func subprocessManifestRuntimeVersionRange(manifest pluginsdk.PluginManifest) (string, bool) {
+	encodedManifest, err := json.Marshal(manifest)
+	if err != nil {
+		return "", false
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(encodedManifest, &decoded); err != nil {
+		return "", false
+	}
+	rawPublish, ok := decoded["publish"].(map[string]any)
+	if !ok {
+		return "", false
+	}
+	runtimeVersionRange, ok := rawPublish["runtimeVersionRange"].(string)
+	if !ok {
+		return "", false
+	}
+	return runtimeVersionRange, true
+}
+
+func subprocessRuntimeVersionSatisfiesRange(currentVersion, requiredRange string) (bool, error) {
+	current, err := parseSubprocessRuntimeVersion(currentVersion)
+	if err != nil {
+		return false, err
+	}
+	clauses, err := parseSubprocessRuntimeVersionRangeClauses(requiredRange)
+	if err != nil {
+		return false, err
+	}
+	if len(clauses) == 0 || len(clauses) > 2 {
+		return false, fmt.Errorf("runtimeVersionRange %q must use one or two comparator clauses", requiredRange)
+	}
+	for _, clause := range clauses {
+		required, err := parseSubprocessRuntimeVersion(clause.version)
+		if err != nil {
+			return false, err
+		}
+		if !subprocessRuntimeVersionMatchesComparator(current, clause.comparator, required) {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+type subprocessRuntimeVersionRangeClause struct {
+	comparator string
+	version    string
+}
+
+func parseSubprocessRuntimeVersionRangeClauses(requiredRange string) ([]subprocessRuntimeVersionRangeClause, error) {
+	trimmed := strings.TrimSpace(requiredRange)
+	if trimmed == "" {
+		return nil, fmt.Errorf("runtimeVersionRange %q must use one or two comparator clauses", requiredRange)
+	}
+	clauses := make([]subprocessRuntimeVersionRangeClause, 0, 2)
+	for len(trimmed) > 0 {
+		comparator, remainder, ok := trimSubprocessRuntimeVersionComparator(trimmed)
+		if !ok {
+			return nil, fmt.Errorf("runtimeVersionRange %q must use one or two comparator clauses", requiredRange)
+		}
+		version, rest, ok := trimSubprocessRuntimeVersionToken(remainder)
+		if !ok {
+			return nil, fmt.Errorf("runtimeVersionRange %q must use one or two comparator clauses", requiredRange)
+		}
+		clauses = append(clauses, subprocessRuntimeVersionRangeClause{comparator: comparator, version: version})
+		trimmed = strings.TrimSpace(rest)
+	}
+	return clauses, nil
+}
+
+func trimSubprocessRuntimeVersionComparator(raw string) (string, string, bool) {
+	trimmed := strings.TrimLeft(raw, " \t\r\n")
+	for _, comparator := range []string{">=", "<=", ">", "<", "="} {
+		if strings.HasPrefix(trimmed, comparator) {
+			return comparator, strings.TrimLeft(trimmed[len(comparator):], " \t\r\n"), true
+		}
+	}
+	return "", raw, false
+}
+
+func trimSubprocessRuntimeVersionToken(raw string) (string, string, bool) {
+	trimmed := strings.TrimLeft(raw, " \t\r\n")
+	if trimmed == "" {
+		return "", raw, false
+	}
+	end := 0
+	for end < len(trimmed) {
+		switch trimmed[end] {
+		case ' ', '\t', '\r', '\n':
+			return trimmed[:end], trimmed[end:], true
+		default:
+			end++
+		}
+	}
+	return trimmed, "", true
+}
+
+func parseSubprocessRuntimeVersion(raw string) (subprocessRuntimeVersion, error) {
+	trimmed := strings.TrimSpace(strings.TrimPrefix(raw, "v"))
+	parts := strings.Split(trimmed, ".")
+	if len(parts) != 3 {
+		return subprocessRuntimeVersion{}, fmt.Errorf("runtime version %q must use major.minor.patch", raw)
+	}
+	major, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return subprocessRuntimeVersion{}, fmt.Errorf("runtime version %q has invalid major component", raw)
+	}
+	minor, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return subprocessRuntimeVersion{}, fmt.Errorf("runtime version %q has invalid minor component", raw)
+	}
+	patch, err := strconv.Atoi(parts[2])
+	if err != nil {
+		return subprocessRuntimeVersion{}, fmt.Errorf("runtime version %q has invalid patch component", raw)
+	}
+	return subprocessRuntimeVersion{major: major, minor: minor, patch: patch}, nil
+}
+
+func subprocessRuntimeVersionMatchesComparator(current subprocessRuntimeVersion, comparator string, required subprocessRuntimeVersion) bool {
+	comparison := compareSubprocessRuntimeVersions(current, required)
+	switch comparator {
+	case ">":
+		return comparison > 0
+	case ">=":
+		return comparison >= 0
+	case "=":
+		return comparison == 0
+	case "<=":
+		return comparison <= 0
+	case "<":
+		return comparison < 0
+	default:
+		return false
+	}
+}
+
+func compareSubprocessRuntimeVersions(left, right subprocessRuntimeVersion) int {
+	if left.major != right.major {
+		return left.major - right.major
+	}
+	if left.minor != right.minor {
+		return left.minor - right.minor
+	}
+	return left.patch - right.patch
 }
 
 func validateSubprocessConfigSchema(manifest pluginsdk.PluginManifest) error {
@@ -1539,6 +1728,8 @@ func (h *SubprocessPluginHost) observeCompatibilityFailure(pluginID string, exec
 				compatibilityRule = "mode"
 			case subprocessFailureReasonManifestUnsupportedAPI:
 				compatibilityRule = "api_version"
+			case subprocessFailureReasonManifestUnsupportedRuntime:
+				compatibilityRule = "runtime_version"
 			case subprocessFailureReasonManifestMissingEntry:
 				compatibilityRule = "entry_target"
 			case subprocessFailureReasonManifestInvalidConfigSchema:
