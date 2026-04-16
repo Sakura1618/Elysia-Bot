@@ -44,6 +44,17 @@ func writeTestConfigWithPostgresSmokeStoreAt(t *testing.T, dir string, dsn strin
 }
 
 type runtimeConsoleResponse struct {
+	Plugins []struct {
+		ID                    string `json:"id"`
+		ConfigStateKind       string `json:"configStateKind"`
+		ConfigSource          string `json:"configSource"`
+		ConfigPersisted       bool   `json:"configPersisted"`
+		ConfigUpdatedAt       string `json:"configUpdatedAt"`
+		EnabledStateSource    string `json:"enabledStateSource"`
+		EnabledStatePersisted bool   `json:"enabledStatePersisted"`
+		StatusSource          string `json:"statusSource"`
+		StatusPersisted       bool   `json:"statusPersisted"`
+	} `json:"plugins"`
 	Adapters []struct {
 		ID             string `json:"id"`
 		Adapter        string `json:"adapter"`
@@ -584,7 +595,7 @@ func TestRuntimeAppConsoleReflectsRuntimeState(t *testing.T) {
 	if !strings.Contains(resp.Body.String(), `"plugin_read_model": "runtime-registry+sqlite-plugin-status-snapshot"`) {
 		t.Fatalf("expected console payload to include plugin_read_model=runtime-registry+sqlite-plugin-status-snapshot, got %s", resp.Body.String())
 	}
-	for _, expected := range []string{`"plugin_enabled_state_read_model": "runtime-registry+sqlite-plugin-enabled-overlay"`, `"plugin_enabled_state_persisted": true`, `"plugin_operator_scope": "already-registered plugins only"`, `"/demo/plugins/{plugin-id}/enable"`, `"/demo/plugins/{plugin-id}/disable"`, `"/demo/schedules/{schedule-id}/cancel"`, `"console_mode": "read+operator-plugin-enable-disable"`, `"enabled": true`, `"enabledStateSource": "runtime-default-enabled"`, `"enabledStatePersisted": false`} {
+	for _, expected := range []string{`"plugin_config_state_read_model": "runtime-registry+sqlite-plugin-config"`, `"plugin_config_state_kind": "plugin-owned-persisted-input"`, `"plugin_config_state_persisted": true`, `"plugin_enabled_state_read_model": "runtime-registry+sqlite-plugin-enabled-overlay"`, `"plugin_enabled_state_persisted": true`, `"plugin_operator_scope": "already-registered plugins only"`, `"/demo/plugins/{plugin-id}/enable"`, `"/demo/plugins/{plugin-id}/disable"`, `"/demo/schedules/{schedule-id}/cancel"`, `"console_mode": "read+operator-plugin-enable-disable"`, `"enabled": true`, `"enabledStateSource": "runtime-default-enabled"`, `"enabledStatePersisted": false`, `"configStateKind": "plugin-owned-persisted-input"`, `"configPersisted": false`} {
 		if !strings.Contains(resp.Body.String(), expected) {
 			t.Fatalf("expected console payload to include %s, got %s", expected, resp.Body.String())
 		}
@@ -801,6 +812,48 @@ func TestRuntimeAppReloadsPersistedPluginEchoConfigAfterRestart(t *testing.T) {
 	}
 	if !strings.Contains(messageResp.Body.String(), "persisted: hello restart") {
 		t.Fatalf("expected restarted runtime to use persisted echo prefix, got %s", messageResp.Body.String())
+	}
+
+	consoleReq := httptest.NewRequest(http.MethodGet, "/api/console?plugin_id=plugin-echo", nil)
+	consoleResp := httptest.NewRecorder()
+	restarted.ServeHTTP(consoleResp, consoleReq)
+	if consoleResp.Code != http.StatusOK {
+		t.Fatalf("expected console 200 after restart, got %d: %s", consoleResp.Code, consoleResp.Body.String())
+	}
+	for _, expected := range []string{
+		`"id": "plugin-echo"`,
+		`"configStateKind": "plugin-owned-persisted-input"`,
+		`"configSource": "sqlite-plugin-config"`,
+		`"configPersisted": true`,
+		`"enabledStateSource": "runtime-default-enabled"`,
+		`"statusPersisted": true`,
+	} {
+		if !strings.Contains(consoleResp.Body.String(), expected) {
+			t.Fatalf("expected restarted console payload to include %q, got %s", expected, consoleResp.Body.String())
+		}
+	}
+	if !strings.Contains(consoleResp.Body.String(), `"configUpdatedAt":`) {
+		t.Fatalf("expected restarted console payload to include configUpdatedAt, got %s", consoleResp.Body.String())
+	}
+	console := readRuntimeConsoleResponse(t, restarted)
+	var pluginFound bool
+	for _, plugin := range console.Plugins {
+		if plugin.ID != "plugin-echo" {
+			continue
+		}
+		pluginFound = true
+		if plugin.ConfigStateKind != "plugin-owned-persisted-input" || plugin.ConfigSource != "sqlite-plugin-config" || !plugin.ConfigPersisted || plugin.ConfigUpdatedAt == "" {
+			t.Fatalf("expected persisted plugin config contract after restart, got %+v", plugin)
+		}
+		if plugin.EnabledStateSource != "runtime-default-enabled" || plugin.EnabledStatePersisted {
+			t.Fatalf("expected enabled overlay to stay distinct from persisted plugin config, got %+v", plugin)
+		}
+		if plugin.StatusSource == "" || !plugin.StatusPersisted {
+			t.Fatalf("expected status snapshot to stay distinct from persisted plugin config, got %+v", plugin)
+		}
+	}
+	if !pluginFound {
+		t.Fatalf("expected plugin-echo in restarted console payload, got %+v", console.Plugins)
 	}
 }
 

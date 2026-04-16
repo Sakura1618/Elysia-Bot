@@ -28,6 +28,13 @@ const consolePayload = {
       mode: 'subprocess',
       permissions: ['message:read'],
       entry: { module: 'plugins/plugin-echo' },
+      configStateKind: 'plugin-owned-persisted-input',
+      configSource: 'sqlite-plugin-config',
+      configPersisted: true,
+      configUpdatedAt: '2026-04-05T23:57:00Z',
+      enabled: true,
+      enabledStateSource: 'runtime-default-enabled',
+      enabledStatePersisted: false,
       statusSource: 'runtime-registry+runtime-dispatch-results',
       statusEvidence: 'runtime-dispatch-result:instance-config-reject',
       statusSummary:
@@ -53,6 +60,9 @@ const consolePayload = {
       mode: 'builtin',
       permissions: [],
       entry: { module: 'plugins/plugin-admin' },
+      enabled: true,
+      enabledStateSource: 'runtime-default-enabled',
+      enabledStatePersisted: false,
       statusSource: 'runtime-registry',
       statusEvidence: 'manifest-only',
       statusSummary: 'manifest registered without live runtime evidence yet',
@@ -182,6 +192,10 @@ describe('App', () => {
     expect(screen.getByText('plugin host dispatch "plugin-echo": plugin "plugin-echo" instance config required property "prefix" must be provided')).toBeInTheDocument();
     expect(screen.getByText('runtime-registry+runtime-dispatch-results')).toBeInTheDocument();
     expect(screen.getByText('runtime-dispatch-result:instance-config-reject')).toBeInTheDocument();
+    expect(screen.getByText('plugin config: plugin-owned-persisted-input via sqlite-plugin-config')).toBeInTheDocument();
+    expect(screen.getByText('plugin config updated at: 2026-04-05T23:57:00Z')).toBeInTheDocument();
+    expect(screen.getAllByText('enabled overlay: runtime-default-enabled / enabled / runtime default only')).toHaveLength(2);
+    expect(screen.getByText('status snapshot: runtime-registry+runtime-dispatch-results / runtime-dispatch-result:instance-config-reject')).toBeInTheDocument();
     expect(screen.getByText('last runtime event dispatch was rejected before subprocess launch via runtime-registry+runtime-dispatch-results; stage=instance-config; recovery=last-dispatch-failed; evidence=process-local-volatile: plugin host dispatch "plugin-echo": plugin "plugin-echo" instance config required property "prefix" must be provided')).toBeInTheDocument();
     expect(screen.getByText('last dispatch at: none observed in this process')).toBeInTheDocument();
     expect(screen.getByText('runtime started')).toBeInTheDocument();

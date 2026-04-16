@@ -35,6 +35,14 @@ export type PluginManifest = {
   permissions: string[];
   configSchema?: Record<string, unknown>;
   entry: PluginEntry;
+  configStateKind?: string;
+  configSource?: string;
+  configPersisted?: boolean;
+  configUpdatedAt?: string;
+  enabled?: boolean;
+  enabledStateSource?: string;
+  enabledStatePersisted?: boolean;
+  enabledStateUpdatedAt?: string;
   statusSource?: string;
   statusEvidence?: string;
   statusSummary?: string;

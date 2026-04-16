@@ -51,6 +51,29 @@ function PluginEvidenceTime(props: { plugin: PluginManifest }) {
   );
 }
 
+function PluginStateContract(props: { plugin: PluginManifest }) {
+  const { plugin } = props;
+
+  return (
+    <>
+      <div className="cell-subtitle">
+        plugin config: {plugin.configStateKind ?? 'not declared'}
+        {plugin.configPersisted ? ` via ${plugin.configSource ?? 'persisted config store'}` : ' not persisted for this plugin row'}
+      </div>
+      <div className="cell-subtitle">
+        plugin config updated at: {plugin.configUpdatedAt ?? 'no persisted plugin-owned config captured'}
+      </div>
+      <div className="cell-subtitle">
+        enabled overlay: {plugin.enabledStateSource ?? 'runtime-default-enabled'} / {plugin.enabled ? 'enabled' : 'disabled'}
+        {plugin.enabledStatePersisted ? ' / persisted operator override' : ' / runtime default only'}
+      </div>
+      <div className="cell-subtitle">
+        status snapshot: {plugin.statusSource ?? 'runtime-registry'} / {plugin.statusEvidence ?? 'manifest-only'}
+      </div>
+    </>
+  );
+}
+
 type PluginAttentionState = 'failing' | 'recovered' | 'normal';
 
 function getPluginAttentionState(plugin: PluginManifest): PluginAttentionState {
@@ -224,6 +247,7 @@ function PluginTable(props: {
 				  <div className="cell-subtitle">
 				    {plugin.statusSummary ?? (plugin.runtimeStateLive ? 'runtime evidence available' : 'manifest-only evidence')}
 				  </div>
+				  <PluginStateContract plugin={plugin} />
 				  <div className="cell-subtitle">recovery: {plugin.statusRecovery ?? 'no-runtime-evidence'}</div>
 				  <div className="cell-subtitle">evidence staleness: {plugin.statusStaleness ?? 'static-registration'}</div>
 				</td>
@@ -584,7 +608,7 @@ function App() {
 
       <SectionCard
 			title="Plugin lifecycle"
-			description="Read-only plugin lifecycle view aligned to the current PluginManifest JSON shape, with optional single-plugin evidence lookup."
+			description="Read-only plugin lifecycle view that keeps plugin-owned persisted config, runtime/operator enabled overlay, and runtime status evidence as separate contracts."
       >
         <div className="plugin-attention-toolbar">
           <div className="plugin-attention-summary" aria-live="polite">

@@ -22,6 +22,7 @@ type ConsoleAPI struct {
 	adapterInstances consoleAdapterInstanceReader
 	pluginSnapshots  consolePluginSnapshotReader
 	pluginEnabled    consolePluginEnabledStateReader
+	pluginConfigs    consolePluginConfigReader
 	recovery         consoleRecoverySource
 	config           Config
 	logs             []string
@@ -43,6 +44,10 @@ type ConsolePlugin struct {
 	EnabledStateSource       string                `json:"enabledStateSource,omitempty"`
 	EnabledStatePersisted    bool                  `json:"enabledStatePersisted"`
 	EnabledStateUpdatedAt    *time.Time            `json:"enabledStateUpdatedAt,omitempty"`
+	ConfigStateKind          string                `json:"configStateKind,omitempty"`
+	ConfigSource             string                `json:"configSource,omitempty"`
+	ConfigPersisted          bool                  `json:"configPersisted"`
+	ConfigUpdatedAt          *time.Time            `json:"configUpdatedAt,omitempty"`
 	StatusSource             string                `json:"statusSource,omitempty"`
 	StatusEvidence           string                `json:"statusEvidence,omitempty"`
 	StatusSummary            string                `json:"statusSummary,omitempty"`
@@ -182,6 +187,10 @@ type consolePluginEnabledStateReader interface {
 	ListPluginEnabledStates() ([]PluginEnabledState, error)
 }
 
+type consolePluginConfigReader interface {
+	ListPluginConfigs() ([]PluginConfigState, error)
+}
+
 type ConsoleSchedule struct {
 	ID              string     `json:"id"`
 	Kind            string     `json:"kind"`
@@ -220,6 +229,10 @@ type sqliteConsolePluginSnapshotReader struct {
 }
 
 type sqliteConsolePluginEnabledStateReader struct {
+	store *SQLiteStateStore
+}
+
+type sqliteConsolePluginConfigReader struct {
 	store *SQLiteStateStore
 }
 
@@ -284,6 +297,13 @@ func NewSQLiteConsolePluginEnabledStateReader(store *SQLiteStateStore) consolePl
 	return sqliteConsolePluginEnabledStateReader{store: store}
 }
 
+func NewSQLiteConsolePluginConfigReader(store *SQLiteStateStore) consolePluginConfigReader {
+	if store == nil {
+		return nil
+	}
+	return sqliteConsolePluginConfigReader{store: store}
+}
+
 func (c *ConsoleAPI) SetScheduleReader(reader consoleScheduleReader) {
 	c.schedules = reader
 }
@@ -298,6 +318,10 @@ func (c *ConsoleAPI) SetPluginSnapshotReader(reader consolePluginSnapshotReader)
 
 func (c *ConsoleAPI) SetPluginEnabledStateReader(reader consolePluginEnabledStateReader) {
 	c.pluginEnabled = reader
+}
+
+func (c *ConsoleAPI) SetPluginConfigReader(reader consolePluginConfigReader) {
+	c.pluginConfigs = reader
 }
 
 func (c *ConsoleAPI) SetJobReader(reader consoleJobReader) {
@@ -356,6 +380,15 @@ func (c *ConsoleAPI) Plugins() []ConsolePlugin {
 			}
 		}
 	}
+	persistedConfigStates := map[string]PluginConfigState{}
+	if c.pluginConfigs != nil {
+		loaded, err := c.pluginConfigs.ListPluginConfigs()
+		if err == nil {
+			for _, state := range loaded {
+				persistedConfigStates[state.PluginID] = state
+			}
+		}
+	}
 	items := make([]ConsolePlugin, 0, len(manifests))
 	for _, manifest := range manifests {
 		item := ConsolePlugin{
@@ -370,6 +403,12 @@ func (c *ConsoleAPI) Plugins() []ConsolePlugin {
 			Enabled:            true,
 			EnabledStateSource: "runtime-default-enabled",
 			StatusSource:       "runtime-registry",
+		}
+		if manifest.ID == "plugin-echo" {
+			item.ConfigStateKind = "plugin-owned-persisted-input"
+			if state, ok := persistedConfigStates[manifest.ID]; ok {
+				applyPluginConfigState(&item, state)
+			}
 		}
 		if state, ok := persistedEnabledStates[manifest.ID]; ok {
 			applyPluginEnabledState(&item, state)
@@ -400,6 +439,19 @@ func applyPluginEnabledState(item *ConsolePlugin, state PluginEnabledState) {
 	if !state.UpdatedAt.IsZero() {
 		updatedAt := state.UpdatedAt.UTC()
 		item.EnabledStateUpdatedAt = &updatedAt
+	}
+}
+
+func applyPluginConfigState(item *ConsolePlugin, state PluginConfigState) {
+	if item == nil {
+		return
+	}
+	item.ConfigStateKind = "plugin-owned-persisted-input"
+	item.ConfigSource = "sqlite-plugin-config"
+	item.ConfigPersisted = true
+	if !state.UpdatedAt.IsZero() {
+		updatedAt := state.UpdatedAt.UTC()
+		item.ConfigUpdatedAt = &updatedAt
 	}
 }
 
@@ -726,6 +778,13 @@ func (r sqliteConsolePluginEnabledStateReader) ListPluginEnabledStates() ([]Plug
 		return nil, nil
 	}
 	return r.store.ListPluginEnabledStates(context.Background())
+}
+
+func (r sqliteConsolePluginConfigReader) ListPluginConfigs() ([]PluginConfigState, error) {
+	if r.store == nil {
+		return nil, nil
+	}
+	return r.store.ListPluginConfigs(context.Background())
 }
 
 func (c *ConsoleAPI) Jobs() ([]ConsoleJob, error) {

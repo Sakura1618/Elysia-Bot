@@ -397,6 +397,40 @@ WHERE plugin_id = ?
 	return state, nil
 }
 
+func (s *SQLiteStateStore) ListPluginConfigs(ctx context.Context) ([]PluginConfigState, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT plugin_id, config_json, updated_at
+FROM plugin_configs
+ORDER BY plugin_id ASC
+`)
+	if err != nil {
+		return nil, fmt.Errorf("list plugin configs: %w", err)
+	}
+	defer rows.Close()
+	configs := make([]PluginConfigState, 0)
+	for rows.Next() {
+		var (
+			state        PluginConfigState
+			rawConfig    string
+			updatedAtRaw string
+		)
+		if err := rows.Scan(&state.PluginID, &rawConfig, &updatedAtRaw); err != nil {
+			return nil, fmt.Errorf("scan plugin config: %w", err)
+		}
+		updatedAt, err := parseSQLiteTimestamp(updatedAtRaw)
+		if err != nil {
+			return nil, fmt.Errorf("parse plugin config updated_at: %w", err)
+		}
+		state.RawConfig = append(json.RawMessage(nil), rawConfig...)
+		state.UpdatedAt = updatedAt
+		configs = append(configs, state)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate plugin configs: %w", err)
+	}
+	return configs, nil
+}
+
 func (s *SQLiteStateStore) SaveAdapterInstance(ctx context.Context, state AdapterInstanceState) error {
 	state.InstanceID = strings.TrimSpace(state.InstanceID)
 	if state.InstanceID == "" {

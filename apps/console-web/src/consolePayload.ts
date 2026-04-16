@@ -65,6 +65,14 @@ function hasPluginShape(value: unknown): boolean {
 		isString(value.apiVersion) &&
 		isString(value.mode) &&
 		isStringArray(value.permissions) &&
+		(value.configStateKind === undefined || isString(value.configStateKind)) &&
+		(value.configSource === undefined || isString(value.configSource)) &&
+		(value.configPersisted === undefined || typeof value.configPersisted === 'boolean') &&
+		(value.configUpdatedAt === undefined || isString(value.configUpdatedAt)) &&
+		(value.enabled === undefined || typeof value.enabled === 'boolean') &&
+		(value.enabledStateSource === undefined || isString(value.enabledStateSource)) &&
+		(value.enabledStatePersisted === undefined || typeof value.enabledStatePersisted === 'boolean') &&
+		(value.enabledStateUpdatedAt === undefined || isString(value.enabledStateUpdatedAt)) &&
 		(value.statusSource === undefined || isString(value.statusSource)) &&
 		(value.statusEvidence === undefined || isString(value.statusEvidence)) &&
 		(value.statusSummary === undefined || isString(value.statusSummary)) &&

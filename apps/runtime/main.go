@@ -597,6 +597,7 @@ func (a *runtimeApp) handleConsole(w http.ResponseWriter, r *http.Request) {
 	console.SetAdapterInstanceReader(runtimecore.NewSQLiteConsoleAdapterInstanceReader(a.state))
 	console.SetPluginSnapshotReader(runtimecore.NewSQLiteConsolePluginSnapshotReader(a.state))
 	console.SetPluginEnabledStateReader(runtimecore.NewSQLiteConsolePluginEnabledStateReader(a.state))
+	console.SetPluginConfigReader(runtimecore.NewSQLiteConsolePluginConfigReader(a.state))
 	console.SetRecoverySource(newRuntimeRecoverySource(a.queue, a.scheduler))
 	recovery := a.queue.LastRecoverySnapshot()
 	scheduleRecovery := a.scheduler.LastRecoverySnapshot()
@@ -611,6 +612,9 @@ func (a *runtimeApp) handleConsole(w http.ResponseWriter, r *http.Request) {
 	meta["adapter_operator_scope"] = "already-registered adapters only"
 	meta["adapter_status_model"] = "persisted-registered-instance-status"
 	meta["plugin_read_model"] = "runtime-registry+sqlite-plugin-status-snapshot"
+	meta["plugin_config_state_read_model"] = "runtime-registry+sqlite-plugin-config"
+	meta["plugin_config_state_kind"] = "plugin-owned-persisted-input"
+	meta["plugin_config_state_persisted"] = true
 	meta["plugin_enabled_state_read_model"] = "runtime-registry+sqlite-plugin-enabled-overlay"
 	meta["plugin_enabled_state_persisted"] = true
 	meta["plugin_operator_actions"] = []string{"/demo/plugins/{plugin-id}/enable", "/demo/plugins/{plugin-id}/disable"}

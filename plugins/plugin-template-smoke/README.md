@@ -28,6 +28,8 @@
 
 当前模板里的代码 manifest 与静态 `manifest.json` 也都会展示一个最小 `publish` 元数据块，用来声明发布来源与 runtime 兼容范围。
 
+当前最小插件自有状态路径，也先只支持像 `plugin-echo` 这样把**持久化配置**作为 plugin-owned input/state seed 暴露到 `/api/console` 读模型；它应与 runtime/operator-owned enabled overlay、以及 runtime-owned status snapshot 明确区分，而不是把它们混成一个通用插件状态系统。
+
 ## 当前真实开发入口
 
 最小创建与验证路径是：
