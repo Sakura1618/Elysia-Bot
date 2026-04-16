@@ -8,6 +8,11 @@ const basePlugin = {
   apiVersion: 'v0',
   mode: 'subprocess',
   permissions: ['message:read'],
+  publish: {
+    sourceType: 'git',
+    sourceUri: 'https://github.com/ohmyopencode/bot-platform/tree/main/plugins/plugin-echo',
+    runtimeVersionRange: '>=0.1.0 <1.0.0',
+  },
   entry: { module: 'plugins/plugin-echo' },
 };
 
@@ -116,6 +121,41 @@ describe('parseConsolePayload', () => {
     const parsed = parseConsolePayload(basePayload);
 
     expect(parsed.plugins[0]?.lastDispatchAt).toBeUndefined();
+  });
+
+  it('accepts plugin publish metadata when the existing manifest publish block is present', () => {
+    const parsed = parseConsolePayload(basePayload);
+
+    expect(parsed.plugins[0]?.publish).toEqual({
+      sourceType: 'git',
+      sourceUri: 'https://github.com/ohmyopencode/bot-platform/tree/main/plugins/plugin-echo',
+      runtimeVersionRange: '>=0.1.0 <1.0.0',
+    });
+  });
+
+  it('keeps plugin publish metadata optional when it is missing', () => {
+    const parsed = parseConsolePayload({
+      ...basePayload,
+      plugins: [{ ...basePlugin, publish: undefined }],
+    });
+
+    expect(parsed.plugins[0]?.publish).toBeUndefined();
+  });
+
+  it('rejects plugin publish metadata when runtimeVersionRange is not a string', () => {
+    expect(() =>
+      parseConsolePayload({
+        ...basePayload,
+        plugins: [{
+          ...basePlugin,
+          publish: {
+            sourceType: 'git',
+            sourceUri: 'https://github.com/ohmyopencode/bot-platform/tree/main/plugins/plugin-echo',
+            runtimeVersionRange: 123,
+          },
+        }],
+      }),
+    ).toThrow('Console API payload shape is incompatible with Console Web v0');
   });
 
   it('rejects plugin lastDispatchAt when it is not a string', () => {

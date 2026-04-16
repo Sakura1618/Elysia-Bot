@@ -45,7 +45,12 @@ func writeTestConfigWithPostgresSmokeStoreAt(t *testing.T, dir string, dsn strin
 
 type runtimeConsoleResponse struct {
 	Plugins []struct {
-		ID                    string `json:"id"`
+		ID      string `json:"id"`
+		Publish *struct {
+			SourceType          string `json:"sourceType"`
+			SourceURI           string `json:"sourceUri"`
+			RuntimeVersionRange string `json:"runtimeVersionRange"`
+		} `json:"publish"`
 		ConfigStateKind       string `json:"configStateKind"`
 		ConfigSource          string `json:"configSource"`
 		ConfigPersisted       bool   `json:"configPersisted"`
@@ -580,6 +585,11 @@ func TestRuntimeAppConsoleReflectsRuntimeState(t *testing.T) {
 	if !strings.Contains(resp.Body.String(), `"plugins": 3`) {
 		t.Fatalf("expected console payload to report three registered plugins, got %s", resp.Body.String())
 	}
+	for _, expected := range []string{`"publish": {`, `"sourceType": "git"`, `"sourceUri": "https://github.com/ohmyopencode/bot-platform/tree/main/plugins/plugin-echo"`, `"runtimeVersionRange": "\u003e=0.1.0 \u003c1.0.0"`} {
+		if !strings.Contains(resp.Body.String(), expected) {
+			t.Fatalf("expected console payload to include %s, got %s", expected, resp.Body.String())
+		}
+	}
 	if !strings.Contains(resp.Body.String(), `"runtime_entry": "apps/runtime"`) {
 		t.Fatalf("expected console payload to include runtime meta, got %s", resp.Body.String())
 	}
@@ -822,6 +832,10 @@ func TestRuntimeAppReloadsPersistedPluginEchoConfigAfterRestart(t *testing.T) {
 	}
 	for _, expected := range []string{
 		`"id": "plugin-echo"`,
+		`"publish": {`,
+		`"sourceType": "git"`,
+		`"sourceUri": "https://github.com/ohmyopencode/bot-platform/tree/main/plugins/plugin-echo"`,
+		`"runtimeVersionRange": "\u003e=0.1.0 \u003c1.0.0"`,
 		`"configStateKind": "plugin-owned-persisted-input"`,
 		`"configSource": "sqlite-plugin-config"`,
 		`"configPersisted": true`,
@@ -842,6 +856,9 @@ func TestRuntimeAppReloadsPersistedPluginEchoConfigAfterRestart(t *testing.T) {
 			continue
 		}
 		pluginFound = true
+		if plugin.Publish == nil || plugin.Publish.SourceType != "git" || plugin.Publish.SourceURI != "https://github.com/ohmyopencode/bot-platform/tree/main/plugins/plugin-echo" || plugin.Publish.RuntimeVersionRange != ">=0.1.0 <1.0.0" {
+			t.Fatalf("expected plugin publish metadata after restart, got %+v", plugin.Publish)
+		}
 		if plugin.ConfigStateKind != "plugin-owned-persisted-input" || plugin.ConfigSource != "sqlite-plugin-config" || !plugin.ConfigPersisted || plugin.ConfigUpdatedAt == "" {
 			t.Fatalf("expected persisted plugin config contract after restart, got %+v", plugin)
 		}

@@ -38,7 +38,12 @@ func TestConsoleAPIExposesReadOnlySystemState(t *testing.T) {
 			Version:    "0.1.0",
 			APIVersion: "v0",
 			Mode:       pluginsdk.ModeSubprocess,
-			Entry:      pluginsdk.PluginEntry{Module: "plugins/plugin-echo", Symbol: "Plugin"},
+			Publish: &pluginsdk.PluginPublish{
+				SourceType:          pluginsdk.PublishSourceTypeGit,
+				SourceURI:           "https://github.com/ohmyopencode/bot-platform/tree/main/plugins/plugin-echo",
+				RuntimeVersionRange: ">=0.1.0 <1.0.0",
+			},
+			Entry: pluginsdk.PluginEntry{Module: "plugins/plugin-echo", Symbol: "Plugin"},
 		},
 		Handlers: pluginsdk.Handlers{Event: noopConsoleHandler{}},
 	}); err != nil {
@@ -86,6 +91,9 @@ func TestConsoleAPIExposesReadOnlySystemState(t *testing.T) {
 	if plugins[0].LastDispatchAt == nil {
 		t.Fatalf("expected plugin last dispatch timestamp, got %+v", plugins[0])
 	}
+	if plugins[0].Publish == nil || plugins[0].Publish.SourceType != pluginsdk.PublishSourceTypeGit || plugins[0].Publish.SourceURI != "https://github.com/ohmyopencode/bot-platform/tree/main/plugins/plugin-echo" || plugins[0].Publish.RuntimeVersionRange != ">=0.1.0 <1.0.0" {
+		t.Fatalf("expected plugin publish metadata in console projection, got %+v", plugins[0].Publish)
+	}
 	if !strings.Contains(plugins[0].StatusSummary, "last runtime event dispatch failed via runtime-registry+runtime-dispatch-results") || !strings.Contains(plugins[0].StatusSummary, "recovery=last-dispatch-failed") || !strings.Contains(plugins[0].StatusSummary, "evidence=process-local-volatile") || !strings.Contains(plugins[0].StatusSummary, "current_failure_streak=1") {
 		t.Fatalf("expected plugin status summary to describe runtime evidence, got %q", plugins[0].StatusSummary)
 	}
@@ -117,7 +125,7 @@ func TestConsoleAPIExposesReadOnlySystemState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("render json: %v", err)
 	}
-	for _, expected := range []string{"plugin-echo", "job-console", "runtime started", "development", "admin-user", "enable", `"statusSource": "runtime-registry+runtime-dispatch-results"`, `"statusEvidence": "runtime-dispatch-result"`, `"runtimeStateLive": true`, `"statusPersisted": false`, `"statusLevel": "error"`, `"statusRecovery": "last-dispatch-failed"`, `"statusStaleness": "process-local-volatile"`, `"lastDispatchKind": "event"`, `"lastDispatchSuccess": false`, `"lastDispatchError": "subprocess host dispatch failed: timeout"`, `"lastDispatchAt":`, `"currentFailureStreak": 1`} {
+	for _, expected := range []string{"plugin-echo", "job-console", "runtime started", "development", "admin-user", "enable", `"publish": {`, `"sourceType": "git"`, `"sourceUri": "https://github.com/ohmyopencode/bot-platform/tree/main/plugins/plugin-echo"`, `"runtimeVersionRange": "\u003e=0.1.0 \u003c1.0.0"`, `"statusSource": "runtime-registry+runtime-dispatch-results"`, `"statusEvidence": "runtime-dispatch-result"`, `"runtimeStateLive": true`, `"statusPersisted": false`, `"statusLevel": "error"`, `"statusRecovery": "last-dispatch-failed"`, `"statusStaleness": "process-local-volatile"`, `"lastDispatchKind": "event"`, `"lastDispatchSuccess": false`, `"lastDispatchError": "subprocess host dispatch failed: timeout"`, `"lastDispatchAt":`, `"currentFailureStreak": 1`} {
 		if !strings.Contains(rendered, expected) {
 			t.Fatalf("expected console output to contain %q, got %s", expected, rendered)
 		}
@@ -846,7 +854,12 @@ func TestConsoleAPIServesFilteredPluginOverHTTP(t *testing.T) {
 			Version:    "0.1.0",
 			APIVersion: "v0",
 			Mode:       pluginsdk.ModeSubprocess,
-			Entry:      pluginsdk.PluginEntry{Module: "plugins/plugin-echo", Symbol: "Plugin"},
+			Publish: &pluginsdk.PluginPublish{
+				SourceType:          pluginsdk.PublishSourceTypeGit,
+				SourceURI:           "https://github.com/ohmyopencode/bot-platform/tree/main/plugins/plugin-echo",
+				RuntimeVersionRange: ">=0.1.0 <1.0.0",
+			},
+			Entry: pluginsdk.PluginEntry{Module: "plugins/plugin-echo", Symbol: "Plugin"},
 		},
 		{
 			ID:         "plugin-admin",
@@ -880,7 +893,7 @@ func TestConsoleAPIServesFilteredPluginOverHTTP(t *testing.T) {
 	if strings.Contains(recorder.Body.String(), "plugin-admin") {
 		t.Fatalf("expected filtered plugins to exclude unrelated plugin, got %s", recorder.Body.String())
 	}
-	for _, expected := range []string{"plugin-echo", `"lastDispatchSuccess": false`, `"statusRecovery": "last-dispatch-failed"`, `"lastDispatchError": "dispatch timeout"`, `"currentFailureStreak": 1`} {
+	for _, expected := range []string{"plugin-echo", `"publish": {`, `"sourceType": "git"`, `"sourceUri": "https://github.com/ohmyopencode/bot-platform/tree/main/plugins/plugin-echo"`, `"runtimeVersionRange": "\u003e=0.1.0 \u003c1.0.0"`, `"lastDispatchSuccess": false`, `"statusRecovery": "last-dispatch-failed"`, `"lastDispatchError": "dispatch timeout"`, `"currentFailureStreak": 1`} {
 		if !strings.Contains(recorder.Body.String(), expected) {
 			t.Fatalf("expected filtered plugin response to contain %q, got %s", expected, recorder.Body.String())
 		}

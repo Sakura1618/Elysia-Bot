@@ -27,6 +27,11 @@ const consolePayload = {
       apiVersion: 'v0',
       mode: 'subprocess',
       permissions: ['message:read'],
+      publish: {
+        sourceType: 'git',
+        sourceUri: 'https://github.com/ohmyopencode/bot-platform/tree/main/plugins/plugin-echo',
+        runtimeVersionRange: '>=0.1.0 <1.0.0',
+      },
       entry: { module: 'plugins/plugin-echo' },
       configStateKind: 'plugin-owned-persisted-input',
       configSource: 'sqlite-plugin-config',
@@ -195,6 +200,10 @@ describe('App', () => {
     expect(screen.getByText('plugin config: plugin-owned-persisted-input via sqlite-plugin-config')).toBeInTheDocument();
     expect(screen.getByText('plugin config updated at: 2026-04-05T23:57:00Z')).toBeInTheDocument();
     expect(screen.getAllByText('enabled overlay: runtime-default-enabled / enabled / runtime default only')).toHaveLength(2);
+    expect(screen.getByText('publish source type: git')).toBeInTheDocument();
+    expect(screen.getByText('runtime version range: >=0.1.0 <1.0.0')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'https://github.com/ohmyopencode/bot-platform/tree/main/plugins/plugin-echo' })).toBeInTheDocument();
+    expect(screen.getByText('publish metadata: not declared in this registered plugin manifest')).toBeInTheDocument();
     expect(screen.getByText('status snapshot: runtime-registry+runtime-dispatch-results / runtime-dispatch-result:instance-config-reject')).toBeInTheDocument();
     expect(screen.getByText('last runtime event dispatch was rejected before subprocess launch via runtime-registry+runtime-dispatch-results; stage=instance-config; recovery=last-dispatch-failed; evidence=process-local-volatile: plugin host dispatch "plugin-echo": plugin "plugin-echo" instance config required property "prefix" must be provided')).toBeInTheDocument();
     expect(screen.getByText('last dispatch at: none observed in this process')).toBeInTheDocument();

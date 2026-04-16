@@ -74,6 +74,27 @@ function PluginStateContract(props: { plugin: PluginManifest }) {
   );
 }
 
+function PluginPublishContract(props: { plugin: PluginManifest }) {
+  const { plugin } = props;
+
+  if (!plugin.publish) {
+    return <div className="cell-subtitle">publish metadata: not declared in this registered plugin manifest</div>;
+  }
+
+  return (
+    <>
+      <div className="cell-subtitle">publish source type: {plugin.publish.sourceType}</div>
+      <div className="cell-subtitle">
+        publish source URI:{' '}
+        <a href={plugin.publish.sourceUri} target="_blank" rel="noreferrer">
+          {plugin.publish.sourceUri}
+        </a>
+      </div>
+      <div className="cell-subtitle">runtime version range: {plugin.publish.runtimeVersionRange}</div>
+    </>
+  );
+}
+
 type PluginAttentionState = 'failing' | 'recovered' | 'normal';
 
 function getPluginAttentionState(plugin: PluginManifest): PluginAttentionState {
@@ -239,6 +260,7 @@ function PluginTable(props: {
                 <td>{plugin.version}</td>
                 <td>
                   <span className="badge">{plugin.mode}</span>
+                  <PluginPublishContract plugin={plugin} />
                 </td>
                 <td>{plugin.apiVersion}</td>
 				<td>{plugin.permissions.length > 0 ? plugin.permissions.join(', ') : 'read-only'}</td>

@@ -26,6 +26,12 @@ export type PluginEntry = {
   binary?: string;
 };
 
+export type PluginPublish = {
+  sourceType: string;
+  sourceUri: string;
+  runtimeVersionRange: string;
+};
+
 export type PluginManifest = {
   id: string;
   name: string;
@@ -35,6 +41,7 @@ export type PluginManifest = {
   permissions: string[];
   configSchema?: Record<string, unknown>;
   entry: PluginEntry;
+  publish?: PluginPublish;
   configStateKind?: string;
   configSource?: string;
   configPersisted?: boolean;

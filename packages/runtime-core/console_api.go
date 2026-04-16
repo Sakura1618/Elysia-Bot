@@ -31,6 +31,12 @@ type ConsoleAPI struct {
 	readAuthorizer   ConsoleReadRequestAuthorizer
 }
 
+type ConsolePluginPublish struct {
+	SourceType          string `json:"sourceType"`
+	SourceURI           string `json:"sourceUri"`
+	RuntimeVersionRange string `json:"runtimeVersionRange"`
+}
+
 type ConsolePlugin struct {
 	ID                       string                `json:"id"`
 	Name                     string                `json:"name"`
@@ -40,6 +46,7 @@ type ConsolePlugin struct {
 	Permissions              []string              `json:"permissions"`
 	ConfigSchema             map[string]any        `json:"configSchema,omitempty"`
 	Entry                    pluginsdk.PluginEntry `json:"entry"`
+	Publish                  *ConsolePluginPublish `json:"publish,omitempty"`
 	Enabled                  bool                  `json:"enabled"`
 	EnabledStateSource       string                `json:"enabledStateSource,omitempty"`
 	EnabledStatePersisted    bool                  `json:"enabledStatePersisted"`
@@ -400,6 +407,7 @@ func (c *ConsoleAPI) Plugins() []ConsolePlugin {
 			Permissions:        append([]string(nil), manifest.Permissions...),
 			ConfigSchema:       manifest.ConfigSchema,
 			Entry:              manifest.Entry,
+			Publish:            toConsolePluginPublish(manifest.Publish),
 			Enabled:            true,
 			EnabledStateSource: "runtime-default-enabled",
 			StatusSource:       "runtime-registry",
@@ -427,6 +435,17 @@ func (c *ConsoleAPI) Plugins() []ConsolePlugin {
 		items = append(items, item)
 	}
 	return items
+}
+
+func toConsolePluginPublish(publish *pluginsdk.PluginPublish) *ConsolePluginPublish {
+	if publish == nil {
+		return nil
+	}
+	return &ConsolePluginPublish{
+		SourceType:          publish.SourceType,
+		SourceURI:           publish.SourceURI,
+		RuntimeVersionRange: publish.RuntimeVersionRange,
+	}
 }
 
 func applyPluginEnabledState(item *ConsolePlugin, state PluginEnabledState) {
