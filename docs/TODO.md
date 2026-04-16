@@ -12,12 +12,13 @@
 
 ## Active
 
-### T7. runtime/operator 写操作最小入口
-- 目标：在只读 Console 之外，补最小 operator action。
-- 最小完成形态：
-  - 至少 1 个动作真实可用
-  - 有基本审计或日志证据
-  - 不扩成完整 control plane
+### B1. 多平台 / adapter 实例管理边界
+- 目标：让 adapter 不只是“代码里能接”，而是“平台里可管理”。
+- 子任务方向：
+  - adapter 实例配置模型
+  - adapter 连接状态读面
+  - 多 bot / 多账号状态聚合
+  - health/readiness 聚合到 adapter 级别
 
 ---
 
@@ -26,14 +27,6 @@
 ---
 
 ## Backlog
-
-### B1. 多平台 / adapter 实例管理边界
-- 目标：让 adapter 不只是“代码里能接”，而是“平台里可管理”。
-- 子任务方向：
-  - adapter 实例配置模型
-  - adapter 连接状态读面
-  - 多 bot / 多账号状态聚合
-  - health/readiness 聚合到 adapter 级别
 
 ### B2. bot / adapter / plugin 生命周期状态页
 - 目标：形成成熟机器人项目常见的统一运行状态面。
