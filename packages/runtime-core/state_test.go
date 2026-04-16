@@ -213,9 +213,10 @@ func TestSQLiteStateStorePersistsSchedulePlansRoundTrip(t *testing.T) {
 			EventType: "message.received",
 			Metadata:  map[string]any{"message_text": "hello once"},
 		},
-		DueAt:     &dueAt,
-		CreatedAt: createdAt,
-		UpdatedAt: createdAt,
+		DueAt:         &dueAt,
+		DueAtEvidence: scheduleDueAtEvidencePersisted,
+		CreatedAt:     createdAt,
+		UpdatedAt:     createdAt,
 	}
 
 	if err := store.SaveSchedulePlan(context.Background(), record); err != nil {
@@ -231,6 +232,9 @@ func TestSQLiteStateStorePersistsSchedulePlansRoundTrip(t *testing.T) {
 	}
 	if !loaded.Plan.ExecuteAt.Equal(record.Plan.ExecuteAt) || loaded.DueAt == nil || !loaded.DueAt.Equal(dueAt) {
 		t.Fatalf("expected execute/due timestamps to round-trip, got %+v", loaded)
+	}
+	if loaded.DueAtEvidence != scheduleDueAtEvidencePersisted {
+		t.Fatalf("expected dueAt evidence to round-trip, got %+v", loaded)
 	}
 	if loaded.Plan.Metadata["message_text"] != "hello once" {
 		t.Fatalf("expected schedule metadata to round-trip, got %+v", loaded.Plan.Metadata)
@@ -286,6 +290,9 @@ func TestSQLiteStateStoreRetainsSchedulePlansAcrossReopen(t *testing.T) {
 	}
 	if loaded.Plan.ID != "schedule-reopen-2" || loaded.Plan.Kind != ScheduleKindDelay || loaded.Plan.Delay != 30*time.Second {
 		t.Fatalf("expected reopened schedule plan to round-trip, got %+v", loaded)
+	}
+	if loaded.DueAtEvidence != "" {
+		t.Fatalf("expected legacy-style schedule without explicit evidence to reopen cleanly, got %+v", loaded)
 	}
 }
 

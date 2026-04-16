@@ -311,10 +311,11 @@ func (s *Scheduler) persistRestoredPlan(ctx context.Context, stored storedSchedu
 	}
 	repairedDueAt := dueAt
 	return s.store.SaveSchedulePlan(ctx, storedSchedulePlan{
-		Plan:      stored.Plan,
-		DueAt:     &repairedDueAt,
-		CreatedAt: stored.CreatedAt,
-		UpdatedAt: s.now(),
+		Plan:          stored.Plan,
+		DueAt:         &repairedDueAt,
+		DueAtEvidence: scheduleDueAtEvidenceRecoveredStartup,
+		CreatedAt:     stored.CreatedAt,
+		UpdatedAt:     s.now(),
 	})
 }
 
@@ -498,10 +499,11 @@ func (s *Scheduler) savePlanLocked(plan SchedulePlan, dueAt time.Time) error {
 		return err
 	}
 	return s.store.SaveSchedulePlan(context.Background(), storedSchedulePlan{
-		Plan:      plan,
-		DueAt:     &dueAt,
-		CreatedAt: createdAt,
-		UpdatedAt: now,
+		Plan:          plan,
+		DueAt:         &dueAt,
+		DueAtEvidence: scheduleDueAtEvidencePersisted,
+		CreatedAt:     createdAt,
+		UpdatedAt:     now,
 	})
 }
 

@@ -368,7 +368,7 @@ func TestRuntimeAppPersistsDelaySchedulePlan(t *testing.T) {
 	consoleReq := httptest.NewRequest(http.MethodGet, "/api/console", nil)
 	consoleResp := httptest.NewRecorder()
 	app.ServeHTTP(consoleResp, consoleReq)
-	for _, expected := range []string{"schedule-store-1", `"schedules": 1`, `"eventType": "message.received"`, `"jobs": 0`} {
+	for _, expected := range []string{"schedule-store-1", `"schedules": 1`, `"eventType": "message.received"`, `"jobs": 0`, `"dueAtSource": "persisted-state"`, `"dueAtEvidence": "persisted-schedule-due-at"`, `"dueAtPersisted": true`} {
 		if !strings.Contains(consoleResp.Body.String(), expected) {
 			t.Fatalf("expected console payload to include %q, got %s", expected, consoleResp.Body.String())
 		}
@@ -547,10 +547,10 @@ func TestRuntimeAppConsoleAndMetricsExposeScheduleRecoveryAfterRestart(t *testin
 	createdAt := time.Now().UTC()
 	if _, err := app.state.DBForTests().ExecContext(t.Context(), `
 	INSERT INTO schedule_plans (
-	  schedule_id, kind, cron_expr, delay_ms, execute_at, due_at, source, event_type,
+	  schedule_id, kind, cron_expr, delay_ms, execute_at, due_at, due_at_evidence, source, event_type,
 	  metadata_json, created_at, updated_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, "schedule-recovery-missing-dueat", string(runtimecore.ScheduleKindDelay), "", int64((5*time.Second)/time.Millisecond), nil, nil, "runtime-demo-scheduler", "message.received", `{}`, createdAt.Format(time.RFC3339Nano), createdAt.Format(time.RFC3339Nano)); err != nil {
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, "schedule-recovery-missing-dueat", string(runtimecore.ScheduleKindDelay), "", int64((5*time.Second)/time.Millisecond), nil, nil, "", "runtime-demo-scheduler", "message.received", `{}`, createdAt.Format(time.RFC3339Nano), createdAt.Format(time.RFC3339Nano)); err != nil {
 		t.Fatalf("insert persisted schedule plan without dueAt: %v", err)
 	}
 	if err := app.Close(); err != nil {
@@ -579,6 +579,9 @@ func TestRuntimeAppConsoleAndMetricsExposeScheduleRecoveryAfterRestart(t *testin
 		`"schedule_recovery_source": "runtime-startup-restore"`,
 		`"schedule_recovery_recovered_schedules": 1`,
 		`"schedule_recovery_total_schedules": 1`,
+		`"dueAtSource": "startup-recovery"`,
+		`"dueAtEvidence": "recovered-schedule-due-at"`,
+		`"dueAtPersisted": true`,
 		`"scheduleKinds": {`,
 		`"delay": 1`,
 		`"recoveredSchedules": 1`,

@@ -87,6 +87,7 @@ CREATE TABLE IF NOT EXISTS schedule_plans (
   delay_ms INTEGER NOT NULL,
   execute_at TEXT,
   due_at TEXT,
+  due_at_evidence TEXT NOT NULL DEFAULT '',
   source TEXT NOT NULL,
   event_type TEXT NOT NULL,
   metadata_json TEXT NOT NULL,
@@ -121,10 +122,11 @@ type PluginStatusSnapshot struct {
 }
 
 type storedSchedulePlan struct {
-	Plan      SchedulePlan
-	DueAt     *time.Time
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	Plan          SchedulePlan
+	DueAt         *time.Time
+	DueAtEvidence string
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
 }
 
 func OpenSQLiteStateStore(path string) (*SQLiteStateStore, error) {
@@ -154,6 +156,9 @@ func (s *SQLiteStateStore) Init(ctx context.Context) error {
 	}
 	if _, err := s.db.ExecContext(ctx, SQLiteSchemaV0); err != nil {
 		return fmt.Errorf("init sqlite schema: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE schedule_plans ADD COLUMN due_at_evidence TEXT NOT NULL DEFAULT ''`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
+		return fmt.Errorf("add schedule due_at_evidence column: %w", err)
 	}
 	return nil
 }
@@ -426,25 +431,27 @@ func (s *SQLiteStateStore) SaveSchedulePlan(ctx context.Context, stored storedSc
 	if updatedAt.IsZero() {
 		updatedAt = createdAt
 	}
+	dueAtEvidence := normalizeStoredScheduleDueAtEvidence(stored)
 
 	_, err = s.db.ExecContext(ctx, `
 INSERT INTO schedule_plans (
-  schedule_id, kind, cron_expr, delay_ms, execute_at, due_at, source, event_type,
-  metadata_json, created_at, updated_at
+	 schedule_id, kind, cron_expr, delay_ms, execute_at, due_at, due_at_evidence, source, event_type,
+	 metadata_json, created_at, updated_at
 )
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(schedule_id) DO UPDATE SET
-  kind=excluded.kind,
-  cron_expr=excluded.cron_expr,
-  delay_ms=excluded.delay_ms,
-  execute_at=excluded.execute_at,
-  due_at=excluded.due_at,
-  source=excluded.source,
-  event_type=excluded.event_type,
-  metadata_json=excluded.metadata_json,
-  created_at=excluded.created_at,
-  updated_at=excluded.updated_at
-`, stored.Plan.ID, stored.Plan.Kind, stored.Plan.CronExpr, stored.Plan.Delay.Milliseconds(), nullableNonZeroSQLiteTimestamp(stored.Plan.ExecuteAt), nullableSQLiteTimestamp(stored.DueAt), stored.Plan.Source, stored.Plan.EventType, string(payload), formatSQLiteTimestamp(createdAt), formatSQLiteTimestamp(updatedAt))
+	 kind=excluded.kind,
+	 cron_expr=excluded.cron_expr,
+	 delay_ms=excluded.delay_ms,
+	 execute_at=excluded.execute_at,
+	 due_at=excluded.due_at,
+	 due_at_evidence=excluded.due_at_evidence,
+	 source=excluded.source,
+	 event_type=excluded.event_type,
+	 metadata_json=excluded.metadata_json,
+	 created_at=excluded.created_at,
+	 updated_at=excluded.updated_at
+`, stored.Plan.ID, stored.Plan.Kind, stored.Plan.CronExpr, stored.Plan.Delay.Milliseconds(), nullableNonZeroSQLiteTimestamp(stored.Plan.ExecuteAt), nullableSQLiteTimestamp(stored.DueAt), dueAtEvidence, stored.Plan.Source, stored.Plan.EventType, string(payload), formatSQLiteTimestamp(createdAt), formatSQLiteTimestamp(updatedAt))
 	if err != nil {
 		return fmt.Errorf("upsert schedule plan: %w", err)
 	}
@@ -453,7 +460,7 @@ ON CONFLICT(schedule_id) DO UPDATE SET
 
 func (s *SQLiteStateStore) LoadSchedulePlan(ctx context.Context, id string) (storedSchedulePlan, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT schedule_id, kind, cron_expr, delay_ms, execute_at, due_at, source, event_type,
+SELECT schedule_id, kind, cron_expr, delay_ms, execute_at, due_at, due_at_evidence, source, event_type,
        metadata_json, created_at, updated_at
 FROM schedule_plans
 WHERE schedule_id = ?
@@ -474,7 +481,7 @@ WHERE schedule_id = ?
 
 func (s *SQLiteStateStore) ListSchedulePlans(ctx context.Context) ([]storedSchedulePlan, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT schedule_id, kind, cron_expr, delay_ms, execute_at, due_at, source, event_type,
+SELECT schedule_id, kind, cron_expr, delay_ms, execute_at, due_at, due_at_evidence, source, event_type,
        metadata_json, created_at, updated_at
 FROM schedule_plans
 ORDER BY created_at ASC, schedule_id ASC
@@ -515,13 +522,13 @@ func (s *SQLiteStateStore) HasIdempotencyKey(ctx context.Context, key string) (b
 
 func (s *SQLiteStateStore) Counts(ctx context.Context) (map[string]int, error) {
 	tables := map[string]string{
-		"event_journal":          `SELECT COUNT(*) FROM event_journal`,
-		"plugin_registry":        `SELECT COUNT(*) FROM plugin_registry`,
+		"event_journal":           `SELECT COUNT(*) FROM event_journal`,
+		"plugin_registry":         `SELECT COUNT(*) FROM plugin_registry`,
 		"plugin_status_snapshots": `SELECT COUNT(*) FROM plugin_status_snapshots`,
-		"sessions":               `SELECT COUNT(*) FROM sessions`,
-		"idempotency_keys":       `SELECT COUNT(*) FROM idempotency_keys`,
-		"jobs":                   `SELECT COUNT(*) FROM jobs`,
-		"schedule_plans":         `SELECT COUNT(*) FROM schedule_plans`,
+		"sessions":                `SELECT COUNT(*) FROM sessions`,
+		"idempotency_keys":        `SELECT COUNT(*) FROM idempotency_keys`,
+		"jobs":                    `SELECT COUNT(*) FROM jobs`,
+		"schedule_plans":          `SELECT COUNT(*) FROM schedule_plans`,
 	}
 
 	counts := make(map[string]int, len(tables))
@@ -573,11 +580,11 @@ func scanPluginStatusSnapshots(rows *sql.Rows) ([]PluginStatusSnapshot, error) {
 	snapshots := make([]PluginStatusSnapshot, 0)
 	for rows.Next() {
 		var (
-			snapshot                   PluginStatusSnapshot
-			lastDispatchSuccess        int
-			lastRecoveredAtRaw         sql.NullString
-			lastDispatchAtRaw          string
-			updatedAtRaw               string
+			snapshot            PluginStatusSnapshot
+			lastDispatchSuccess int
+			lastRecoveredAtRaw  sql.NullString
+			lastDispatchAtRaw   string
+			updatedAtRaw        string
 		)
 		if err := rows.Scan(
 			&snapshot.PluginID,
@@ -618,14 +625,15 @@ func scanStoredSchedulePlans(rows *sql.Rows) ([]storedSchedulePlan, error) {
 	plans := make([]storedSchedulePlan, 0)
 	for rows.Next() {
 		var (
-			stored       storedSchedulePlan
-			kind         string
-			delayMS      int64
-			executeAtRaw sql.NullString
-			dueAtRaw     sql.NullString
-			metadataJSON string
-			createdAtRaw string
-			updatedAtRaw string
+			stored        storedSchedulePlan
+			kind          string
+			delayMS       int64
+			executeAtRaw  sql.NullString
+			dueAtRaw      sql.NullString
+			dueAtEvidence string
+			metadataJSON  string
+			createdAtRaw  string
+			updatedAtRaw  string
 		)
 		if err := rows.Scan(
 			&stored.Plan.ID,
@@ -634,6 +642,7 @@ func scanStoredSchedulePlans(rows *sql.Rows) ([]storedSchedulePlan, error) {
 			&delayMS,
 			&executeAtRaw,
 			&dueAtRaw,
+			&dueAtEvidence,
 			&stored.Plan.Source,
 			&stored.Plan.EventType,
 			&metadataJSON,
@@ -654,6 +663,7 @@ func scanStoredSchedulePlans(rows *sql.Rows) ([]storedSchedulePlan, error) {
 			return nil, fmt.Errorf("parse schedule due_at: %w", err)
 		}
 		stored.DueAt = dueAt
+		stored.DueAtEvidence = strings.TrimSpace(dueAtEvidence)
 		if createdAt, err := parseSQLiteTimestamp(createdAtRaw); err != nil {
 			return nil, fmt.Errorf("parse schedule created_at: %w", err)
 		} else {
@@ -675,6 +685,17 @@ func scanStoredSchedulePlans(rows *sql.Rows) ([]storedSchedulePlan, error) {
 		return nil, fmt.Errorf("iterate schedule plans: %w", err)
 	}
 	return plans, nil
+}
+
+func normalizeStoredScheduleDueAtEvidence(stored storedSchedulePlan) string {
+	evidence := strings.TrimSpace(stored.DueAtEvidence)
+	if evidence != "" {
+		return evidence
+	}
+	if stored.DueAt != nil && !stored.DueAt.IsZero() {
+		return scheduleDueAtEvidencePersisted
+	}
+	return ""
 }
 
 func scanJobs(rows *sql.Rows) ([]Job, error) {

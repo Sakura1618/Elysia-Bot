@@ -157,6 +157,9 @@ type ConsoleSchedule struct {
 	DelayMs         int64      `json:"delayMs"`
 	ExecuteAt       *time.Time `json:"executeAt"`
 	DueAt           *time.Time `json:"dueAt"`
+	DueAtSource     string     `json:"dueAtSource,omitempty"`
+	DueAtEvidence   string     `json:"dueAtEvidence,omitempty"`
+	DueAtPersisted  bool       `json:"dueAtPersisted"`
 	DueReady        bool       `json:"dueReady"`
 	DueStateSummary string     `json:"dueStateSummary,omitempty"`
 	DueSummary      string     `json:"dueSummary,omitempty"`
@@ -164,6 +167,11 @@ type ConsoleSchedule struct {
 	CreatedAt       time.Time  `json:"createdAt"`
 	UpdatedAt       time.Time  `json:"updatedAt"`
 }
+
+const (
+	scheduleDueAtEvidencePersisted        = "persisted-schedule-due-at"
+	scheduleDueAtEvidenceRecoveredStartup = "recovered-schedule-due-at"
+)
 
 type sqliteConsoleScheduleReader struct {
 	store *SQLiteStateStore
@@ -684,6 +692,7 @@ func (r sqliteConsoleScheduleReader) ListSchedulePlans() ([]ConsoleSchedule, err
 			continue
 		}
 		dueReady := consoleScheduleDueReady(dueAt, time.Now().UTC())
+		dueAtEvidence := consoleScheduleDueAtEvidence(plan)
 		items = append(items, ConsoleSchedule{
 			ID:              plan.Plan.ID,
 			Kind:            string(plan.Plan.Kind),
@@ -693,10 +702,13 @@ func (r sqliteConsoleScheduleReader) ListSchedulePlans() ([]ConsoleSchedule, err
 			DelayMs:         plan.Plan.Delay.Milliseconds(),
 			ExecuteAt:       nullableConsoleTime(plan.Plan.ExecuteAt),
 			DueAt:           dueAt,
+			DueAtSource:     consoleScheduleDueAtSource(dueAtEvidence),
+			DueAtEvidence:   dueAtEvidence,
+			DueAtPersisted:  plan.DueAt != nil && !plan.DueAt.IsZero(),
 			DueReady:        dueReady,
 			DueStateSummary: consoleScheduleStateSummary(dueAt, dueReady),
-			DueSummary:      consoleScheduleDueSummary(string(plan.Plan.Kind), dueAt, dueReady),
-			ScheduleSummary: consoleScheduleSummary(plan.Plan.EventType, string(plan.Plan.Kind), dueAt, dueReady),
+			DueSummary:      consoleScheduleDueSummary(string(plan.Plan.Kind), dueAt, dueReady, dueAtEvidence),
+			ScheduleSummary: consoleScheduleSummary(plan.Plan.EventType, string(plan.Plan.Kind), dueAt, dueReady, dueAtEvidence),
 			CreatedAt:       plan.CreatedAt,
 			UpdatedAt:       plan.UpdatedAt,
 		})
@@ -704,8 +716,8 @@ func (r sqliteConsoleScheduleReader) ListSchedulePlans() ([]ConsoleSchedule, err
 	return items, nil
 }
 
-func consoleScheduleSummary(eventType string, kind string, dueAt *time.Time, dueReady bool) string {
-	dueSummary := consoleScheduleDueSummary(kind, dueAt, dueReady)
+func consoleScheduleSummary(eventType string, kind string, dueAt *time.Time, dueReady bool, dueAtEvidence string) string {
+	dueSummary := consoleScheduleDueSummary(kind, dueAt, dueReady, dueAtEvidence)
 	if eventType == "" {
 		return dueSummary
 	}
@@ -715,7 +727,7 @@ func consoleScheduleSummary(eventType string, kind string, dueAt *time.Time, due
 	return eventType + " | " + dueSummary
 }
 
-func consoleScheduleDueSummary(kind string, dueAt *time.Time, dueReady bool) string {
+func consoleScheduleDueSummary(kind string, dueAt *time.Time, dueReady bool, dueAtEvidence string) string {
 	if dueAt == nil || dueAt.IsZero() {
 		return ""
 	}
@@ -723,7 +735,8 @@ func consoleScheduleDueSummary(kind string, dueAt *time.Time, dueReady bool) str
 	if dueReady {
 		state = "due"
 	}
-	return fmt.Sprintf("%s %s at %s", kind, state, dueAt.UTC().Format(time.RFC3339))
+	evidenceSuffix := consoleScheduleDueEvidenceSuffix(dueAtEvidence)
+	return fmt.Sprintf("%s %s at %s%s", kind, state, dueAt.UTC().Format(time.RFC3339), evidenceSuffix)
 }
 
 func consoleScheduleDueReady(dueAt *time.Time, now time.Time) bool {
@@ -741,6 +754,39 @@ func consoleScheduleStateSummary(dueAt *time.Time, dueReady bool) string {
 		return "due"
 	}
 	return "scheduled"
+}
+
+func consoleScheduleDueAtEvidence(plan storedSchedulePlan) string {
+	evidence := strings.TrimSpace(plan.DueAtEvidence)
+	if evidence != "" {
+		return evidence
+	}
+	if plan.DueAt != nil && !plan.DueAt.IsZero() {
+		return scheduleDueAtEvidencePersisted
+	}
+	return scheduleDueAtEvidenceRecoveredStartup
+}
+
+func consoleScheduleDueAtSource(evidence string) string {
+	switch strings.TrimSpace(evidence) {
+	case scheduleDueAtEvidenceRecoveredStartup:
+		return "startup-recovery"
+	case scheduleDueAtEvidencePersisted:
+		return "persisted-state"
+	default:
+		return ""
+	}
+}
+
+func consoleScheduleDueEvidenceSuffix(evidence string) string {
+	switch strings.TrimSpace(evidence) {
+	case scheduleDueAtEvidenceRecoveredStartup:
+		return " (startup-recovered dueAt)"
+	case scheduleDueAtEvidencePersisted:
+		return " (persisted dueAt)"
+	default:
+		return ""
+	}
 }
 
 func (r sqliteConsoleJobReader) ListJobs() ([]Job, error) {

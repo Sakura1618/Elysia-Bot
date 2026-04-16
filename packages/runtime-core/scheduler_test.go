@@ -480,7 +480,7 @@ func TestSchedulerRestoreUsesCreatedAtForDelayPlanWhenDueAtMissing(t *testing.T)
 
 	createdAt := time.Date(2026, 4, 8, 15, 0, 0, 0, time.UTC)
 	plan := SchedulePlan{ID: "delay-missing-dueat", Kind: ScheduleKindDelay, Delay: 30 * time.Second, Source: "scheduler", EventType: "schedule.triggered"}
-	if err := store.SaveSchedulePlan(context.Background(), storedSchedulePlan{Plan: plan, DueAt: nil, CreatedAt: createdAt, UpdatedAt: createdAt}); err != nil {
+	if err := store.SaveSchedulePlan(context.Background(), storedSchedulePlan{Plan: plan, DueAt: nil, DueAtEvidence: "", CreatedAt: createdAt, UpdatedAt: createdAt}); err != nil {
 		t.Fatalf("save schedule plan: %v", err)
 	}
 
@@ -702,10 +702,10 @@ func TestSchedulerRestoreCountsRecoveredMissingDueAtAndInvalidPlans(t *testing.T
 	}
 	_, err := store.db.ExecContext(context.Background(), `
 	INSERT INTO schedule_plans (
-	  schedule_id, kind, cron_expr, delay_ms, execute_at, due_at, source, event_type,
+	  schedule_id, kind, cron_expr, delay_ms, execute_at, due_at, due_at_evidence, source, event_type,
 	  metadata_json, created_at, updated_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, "restore-cron-invalid", string(ScheduleKindCron), "bad cron", 0, nil, nil, "scheduler", "schedule.triggered", "{}", createdAt.Format(time.RFC3339Nano), createdAt.Format(time.RFC3339Nano))
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, "restore-cron-invalid", string(ScheduleKindCron), "bad cron", 0, nil, nil, "", "scheduler", "schedule.triggered", "{}", createdAt.Format(time.RFC3339Nano), createdAt.Format(time.RFC3339Nano))
 	if err != nil {
 		t.Fatalf("insert invalid persisted schedule plan: %v", err)
 	}
@@ -735,6 +735,9 @@ func TestSchedulerRestoreCountsRecoveredMissingDueAtAndInvalidPlans(t *testing.T
 	}
 	if repaired.DueAt == nil || !repaired.DueAt.Equal(createdAt.Add(30*time.Second)) {
 		t.Fatalf("expected repaired dueAt to persist back to storage, got %+v", repaired)
+	}
+	if repaired.DueAtEvidence != scheduleDueAtEvidenceRecoveredStartup {
+		t.Fatalf("expected repaired dueAt evidence to mark startup recovery, got %+v", repaired)
 	}
 	if _, ok := scheduler.dueAt["restore-cron-invalid"]; ok {
 		t.Fatal("expected invalid persisted schedule to be skipped during restore")

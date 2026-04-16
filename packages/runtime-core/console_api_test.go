@@ -1176,10 +1176,19 @@ func TestConsoleAPIExposesPersistedSchedulesAndStatusFromStore(t *testing.T) {
 		t.Fatalf("expected one schedule in payload, got %+v", payload.Schedules)
 	}
 	schedulePayload := payload.Schedules[0]
-	for _, key := range []string{"id", "kind", "source", "eventType", "delayMs", "executeAt", "dueAt", "dueReady", "dueStateSummary", "dueSummary", "scheduleSummary", "createdAt", "updatedAt"} {
+	for _, key := range []string{"id", "kind", "source", "eventType", "delayMs", "executeAt", "dueAt", "dueAtSource", "dueAtEvidence", "dueAtPersisted", "dueReady", "dueStateSummary", "dueSummary", "scheduleSummary", "createdAt", "updatedAt"} {
 		if _, ok := schedulePayload[key]; !ok {
 			t.Fatalf("expected frontend schedule key %q in payload, got %+v", key, schedulePayload)
 		}
+	}
+	if got, ok := schedulePayload["dueAtSource"].(string); !ok || got != "persisted-state" {
+		t.Fatalf("expected dueAtSource=persisted-state, got %+v", schedulePayload)
+	}
+	if got, ok := schedulePayload["dueAtEvidence"].(string); !ok || got != scheduleDueAtEvidencePersisted {
+		t.Fatalf("expected dueAtEvidence=%q, got %+v", scheduleDueAtEvidencePersisted, schedulePayload)
+	}
+	if got, ok := schedulePayload["dueAtPersisted"].(bool); !ok || !got {
+		t.Fatalf("expected dueAtPersisted=true, got %+v", schedulePayload)
 	}
 	if got, ok := schedulePayload["dueReady"].(bool); !ok || got {
 		t.Fatalf("expected dueReady=false for future schedule, got %+v", schedulePayload)
@@ -1230,8 +1239,14 @@ func TestConsoleAPIExposesComputedDueAtForPersistedDelayScheduleWhenDueAtMissing
 	if schedules[0].DueReady {
 		t.Fatalf("expected dueReady=false for future computed dueAt, got %+v", schedules[0])
 	}
+	if schedules[0].DueAtSource != "startup-recovery" || schedules[0].DueAtEvidence != scheduleDueAtEvidenceRecoveredStartup || schedules[0].DueAtPersisted {
+		t.Fatalf("expected computed delay dueAt from still-missing persisted row to remain non-persisted startup recovery evidence, got %+v", schedules[0])
+	}
 	if schedules[0].DueStateSummary != "scheduled" {
 		t.Fatalf("expected dueStateSummary=scheduled, got %+v", schedules[0])
+	}
+	if !strings.Contains(schedules[0].DueSummary, "startup-recovered dueAt") {
+		t.Fatalf("expected dueSummary to explain startup-recovered dueAt evidence, got %+v", schedules[0])
 	}
 }
 
@@ -1266,13 +1281,16 @@ func TestConsoleAPIExposesComputedDueAtForPersistedOneShotScheduleWhenDueAtMissi
 	if schedules[0].DueReady {
 		t.Fatalf("expected dueReady=false for future one-shot dueAt, got %+v", schedules[0])
 	}
+	if schedules[0].DueAtSource != "startup-recovery" || schedules[0].DueAtEvidence != scheduleDueAtEvidenceRecoveredStartup || schedules[0].DueAtPersisted {
+		t.Fatalf("expected computed one-shot dueAt from still-missing persisted row to remain non-persisted startup recovery evidence, got %+v", schedules[0])
+	}
 	if schedules[0].DueStateSummary != "scheduled" {
 		t.Fatalf("expected dueStateSummary=scheduled, got %+v", schedules[0])
 	}
-	if schedules[0].DueSummary == "" || !strings.Contains(schedules[0].DueSummary, "one-shot scheduled at ") {
+	if schedules[0].DueSummary == "" || !strings.Contains(schedules[0].DueSummary, "one-shot scheduled at ") || !strings.Contains(schedules[0].DueSummary, "startup-recovered dueAt") {
 		t.Fatalf("expected dueSummary to describe scheduled one-shot, got %+v", schedules[0])
 	}
-	if schedules[0].ScheduleSummary == "" || !strings.Contains(schedules[0].ScheduleSummary, "message.received | one-shot scheduled at ") {
+	if schedules[0].ScheduleSummary == "" || !strings.Contains(schedules[0].ScheduleSummary, "message.received | one-shot scheduled at ") || !strings.Contains(schedules[0].ScheduleSummary, "startup-recovered dueAt") {
 		t.Fatalf("expected scheduleSummary to describe scheduled one-shot, got %+v", schedules[0])
 	}
 }
@@ -1308,13 +1326,16 @@ func TestConsoleAPIExposesComputedDueAtForPersistedCronScheduleWhenDueAtMissing(
 	if schedules[0].DueReady {
 		t.Fatalf("expected dueReady=false for future cron dueAt, got %+v", schedules[0])
 	}
+	if schedules[0].DueAtSource != "startup-recovery" || schedules[0].DueAtEvidence != scheduleDueAtEvidenceRecoveredStartup || schedules[0].DueAtPersisted {
+		t.Fatalf("expected computed cron dueAt from still-missing persisted row to remain non-persisted startup recovery evidence, got %+v", schedules[0])
+	}
 	if schedules[0].DueStateSummary != "scheduled" {
 		t.Fatalf("expected dueStateSummary=scheduled, got %+v", schedules[0])
 	}
-	if schedules[0].DueSummary == "" || !strings.Contains(schedules[0].DueSummary, "cron scheduled at ") {
+	if schedules[0].DueSummary == "" || !strings.Contains(schedules[0].DueSummary, "cron scheduled at ") || !strings.Contains(schedules[0].DueSummary, "startup-recovered dueAt") {
 		t.Fatalf("expected dueSummary to describe scheduled cron, got %+v", schedules[0])
 	}
-	if schedules[0].ScheduleSummary == "" || !strings.Contains(schedules[0].ScheduleSummary, "message.received | cron scheduled at ") {
+	if schedules[0].ScheduleSummary == "" || !strings.Contains(schedules[0].ScheduleSummary, "message.received | cron scheduled at ") || !strings.Contains(schedules[0].ScheduleSummary, "startup-recovered dueAt") {
 		t.Fatalf("expected scheduleSummary to describe scheduled cron, got %+v", schedules[0])
 	}
 }
@@ -1355,10 +1376,13 @@ func TestConsoleAPIExposesPersistedDueScheduleAsDue(t *testing.T) {
 	if !schedules[0].DueReady {
 		t.Fatalf("expected dueReady=true, got %+v", schedules[0])
 	}
+	if schedules[0].DueAtSource != "persisted-state" || schedules[0].DueAtEvidence != scheduleDueAtEvidencePersisted || !schedules[0].DueAtPersisted {
+		t.Fatalf("expected explicit dueAt to be labeled as persisted-state evidence, got %+v", schedules[0])
+	}
 	if schedules[0].DueStateSummary != "due" {
 		t.Fatalf("expected dueStateSummary=due, got %+v", schedules[0])
 	}
-	if schedules[0].DueSummary == "" || !strings.Contains(schedules[0].DueSummary, "delay due at ") {
+	if schedules[0].DueSummary == "" || !strings.Contains(schedules[0].DueSummary, "delay due at ") || !strings.Contains(schedules[0].DueSummary, "persisted dueAt") {
 		t.Fatalf("expected dueSummary to describe due delay, got %+v", schedules[0])
 	}
 }
@@ -1392,18 +1416,19 @@ func TestConsoleScheduleDueSummary(t *testing.T) {
 
 	now := time.Date(2026, 4, 9, 12, 0, 0, 0, time.UTC)
 	for _, tc := range []struct {
-		name  string
-		kind  string
-		dueAt *time.Time
-		ready bool
-		want  string
+		name     string
+		kind     string
+		dueAt    *time.Time
+		ready    bool
+		evidence string
+		want     string
 	}{
 		{name: "missing dueAt", kind: "delay", want: ""},
-		{name: "scheduled delay", kind: "delay", dueAt: &now, ready: false, want: "delay scheduled at 2026-04-09T12:00:00Z"},
-		{name: "due delay", kind: "delay", dueAt: &now, ready: true, want: "delay due at 2026-04-09T12:00:00Z"},
+		{name: "scheduled delay persisted", kind: "delay", dueAt: &now, ready: false, evidence: scheduleDueAtEvidencePersisted, want: "delay scheduled at 2026-04-09T12:00:00Z (persisted dueAt)"},
+		{name: "due delay recovered", kind: "delay", dueAt: &now, ready: true, evidence: scheduleDueAtEvidenceRecoveredStartup, want: "delay due at 2026-04-09T12:00:00Z (startup-recovered dueAt)"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := consoleScheduleDueSummary(tc.kind, tc.dueAt, tc.ready); got != tc.want {
+			if got := consoleScheduleDueSummary(tc.kind, tc.dueAt, tc.ready, tc.evidence); got != tc.want {
 				t.Fatalf("expected %q, got %q", tc.want, got)
 			}
 		})
@@ -1420,15 +1445,16 @@ func TestConsoleScheduleSummary(t *testing.T) {
 		kind      string
 		dueAt     *time.Time
 		ready     bool
+		evidence  string
 		want      string
 	}{
 		{name: "missing event and due", want: ""},
 		{name: "event only", eventType: "message.received", want: "message.received"},
-		{name: "due only", kind: "delay", dueAt: &now, want: "delay scheduled at 2026-04-09T12:00:00Z"},
-		{name: "event and due", eventType: "message.received", kind: "delay", dueAt: &now, want: "message.received | delay scheduled at 2026-04-09T12:00:00Z"},
+		{name: "due only", kind: "delay", dueAt: &now, evidence: scheduleDueAtEvidencePersisted, want: "delay scheduled at 2026-04-09T12:00:00Z (persisted dueAt)"},
+		{name: "event and due", eventType: "message.received", kind: "delay", dueAt: &now, evidence: scheduleDueAtEvidenceRecoveredStartup, want: "message.received | delay scheduled at 2026-04-09T12:00:00Z (startup-recovered dueAt)"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := consoleScheduleSummary(tc.eventType, tc.kind, tc.dueAt, tc.ready); got != tc.want {
+			if got := consoleScheduleSummary(tc.eventType, tc.kind, tc.dueAt, tc.ready, tc.evidence); got != tc.want {
 				t.Fatalf("expected %q, got %q", tc.want, got)
 			}
 		})
