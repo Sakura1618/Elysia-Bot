@@ -131,6 +131,8 @@ CREATE TABLE IF NOT EXISTS schedule_plans (
   execute_at TEXT,
   due_at TEXT,
   due_at_evidence TEXT NOT NULL DEFAULT '',
+  claim_owner TEXT NOT NULL DEFAULT '',
+  claimed_at TEXT,
   source TEXT NOT NULL,
   event_type TEXT NOT NULL,
   metadata_json TEXT NOT NULL,
@@ -191,8 +193,16 @@ type storedSchedulePlan struct {
 	Plan          SchedulePlan
 	DueAt         *time.Time
 	DueAtEvidence string
+	ClaimOwner    string
+	ClaimedAt     *time.Time
 	CreatedAt     time.Time
 	UpdatedAt     time.Time
+}
+
+type schedulePlanClaim struct {
+	ClaimOwner string
+	ClaimedAt  time.Time
+	UpdatedAt  time.Time
 }
 
 func OpenSQLiteStateStore(path string) (*SQLiteStateStore, error) {
@@ -225,6 +235,12 @@ func (s *SQLiteStateStore) Init(ctx context.Context) error {
 	}
 	if _, err := s.db.ExecContext(ctx, `ALTER TABLE schedule_plans ADD COLUMN due_at_evidence TEXT NOT NULL DEFAULT ''`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
 		return fmt.Errorf("add schedule due_at_evidence column: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE schedule_plans ADD COLUMN claim_owner TEXT NOT NULL DEFAULT ''`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
+		return fmt.Errorf("add schedule claim_owner column: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE schedule_plans ADD COLUMN claimed_at TEXT`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
+		return fmt.Errorf("add schedule claimed_at column: %w", err)
 	}
 	if _, err := s.db.ExecContext(ctx, `ALTER TABLE jobs ADD COLUMN reason_code TEXT NOT NULL DEFAULT ''`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
 		return fmt.Errorf("add jobs reason_code column: %w", err)
@@ -858,13 +874,14 @@ func (s *SQLiteStateStore) SaveSchedulePlan(ctx context.Context, stored storedSc
 		updatedAt = createdAt
 	}
 	dueAtEvidence := normalizeStoredScheduleDueAtEvidence(stored)
+	claimOwner := strings.TrimSpace(stored.ClaimOwner)
 
 	_, err = s.db.ExecContext(ctx, `
 INSERT INTO schedule_plans (
-	 schedule_id, kind, cron_expr, delay_ms, execute_at, due_at, due_at_evidence, source, event_type,
+	 schedule_id, kind, cron_expr, delay_ms, execute_at, due_at, due_at_evidence, claim_owner, claimed_at, source, event_type,
 	 metadata_json, created_at, updated_at
 )
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(schedule_id) DO UPDATE SET
 	 kind=excluded.kind,
 	 cron_expr=excluded.cron_expr,
@@ -872,12 +889,14 @@ ON CONFLICT(schedule_id) DO UPDATE SET
 	 execute_at=excluded.execute_at,
 	 due_at=excluded.due_at,
 	 due_at_evidence=excluded.due_at_evidence,
+	 claim_owner=excluded.claim_owner,
+	 claimed_at=excluded.claimed_at,
 	 source=excluded.source,
 	 event_type=excluded.event_type,
 	 metadata_json=excluded.metadata_json,
 	 created_at=excluded.created_at,
 	 updated_at=excluded.updated_at
-`, stored.Plan.ID, stored.Plan.Kind, stored.Plan.CronExpr, stored.Plan.Delay.Milliseconds(), nullableNonZeroSQLiteTimestamp(stored.Plan.ExecuteAt), nullableSQLiteTimestamp(stored.DueAt), dueAtEvidence, stored.Plan.Source, stored.Plan.EventType, string(payload), formatSQLiteTimestamp(createdAt), formatSQLiteTimestamp(updatedAt))
+`, stored.Plan.ID, stored.Plan.Kind, stored.Plan.CronExpr, stored.Plan.Delay.Milliseconds(), nullableNonZeroSQLiteTimestamp(stored.Plan.ExecuteAt), nullableSQLiteTimestamp(stored.DueAt), dueAtEvidence, claimOwner, nullableSQLiteTimestamp(stored.ClaimedAt), stored.Plan.Source, stored.Plan.EventType, string(payload), formatSQLiteTimestamp(createdAt), formatSQLiteTimestamp(updatedAt))
 	if err != nil {
 		return fmt.Errorf("upsert schedule plan: %w", err)
 	}
@@ -886,7 +905,7 @@ ON CONFLICT(schedule_id) DO UPDATE SET
 
 func (s *SQLiteStateStore) LoadSchedulePlan(ctx context.Context, id string) (storedSchedulePlan, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT schedule_id, kind, cron_expr, delay_ms, execute_at, due_at, due_at_evidence, source, event_type,
+SELECT schedule_id, kind, cron_expr, delay_ms, execute_at, due_at, due_at_evidence, claim_owner, claimed_at, source, event_type,
        metadata_json, created_at, updated_at
 FROM schedule_plans
 WHERE schedule_id = ?
@@ -907,7 +926,7 @@ WHERE schedule_id = ?
 
 func (s *SQLiteStateStore) ListSchedulePlans(ctx context.Context) ([]storedSchedulePlan, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT schedule_id, kind, cron_expr, delay_ms, execute_at, due_at, due_at_evidence, source, event_type,
+SELECT schedule_id, kind, cron_expr, delay_ms, execute_at, due_at, due_at_evidence, claim_owner, claimed_at, source, event_type,
        metadata_json, created_at, updated_at
 FROM schedule_plans
 ORDER BY created_at ASC, schedule_id ASC
@@ -932,6 +951,42 @@ func (s *SQLiteStateStore) DeleteSchedulePlan(ctx context.Context, id string) er
 		return fmt.Errorf("delete schedule plan: %w", sql.ErrNoRows)
 	}
 	return nil
+}
+
+func (s *SQLiteStateStore) ClaimSchedulePlan(ctx context.Context, id string, expectedDueAt time.Time, claim schedulePlanClaim) (bool, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return false, fmt.Errorf("claim schedule plan: schedule id is required")
+	}
+	claim.ClaimOwner = strings.TrimSpace(claim.ClaimOwner)
+	if claim.ClaimOwner == "" {
+		return false, fmt.Errorf("claim schedule plan: claim owner is required")
+	}
+	if expectedDueAt.IsZero() {
+		return false, fmt.Errorf("claim schedule plan: expected dueAt is required")
+	}
+	if claim.ClaimedAt.IsZero() {
+		return false, fmt.Errorf("claim schedule plan: claimedAt is required")
+	}
+	if claim.UpdatedAt.IsZero() {
+		claim.UpdatedAt = claim.ClaimedAt
+	}
+	result, err := s.db.ExecContext(ctx, `
+UPDATE schedule_plans
+SET claim_owner = ?, claimed_at = ?, updated_at = ?
+WHERE schedule_id = ?
+  AND due_at = ?
+  AND claim_owner = ''
+  AND claimed_at IS NULL
+`, claim.ClaimOwner, formatSQLiteTimestamp(claim.ClaimedAt), formatSQLiteTimestamp(claim.UpdatedAt), id, formatSQLiteTimestamp(expectedDueAt))
+	if err != nil {
+		return false, fmt.Errorf("claim schedule plan: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("claim schedule plan rows affected: %w", err)
+	}
+	return affected == 1, nil
 }
 
 func (s *SQLiteStateStore) HasIdempotencyKey(ctx context.Context, key string) (bool, error) {
@@ -1113,6 +1168,8 @@ func scanStoredSchedulePlans(rows *sql.Rows) ([]storedSchedulePlan, error) {
 			executeAtRaw  sql.NullString
 			dueAtRaw      sql.NullString
 			dueAtEvidence string
+			claimOwner    string
+			claimedAtRaw  sql.NullString
 			metadataJSON  string
 			createdAtRaw  string
 			updatedAtRaw  string
@@ -1125,6 +1182,8 @@ func scanStoredSchedulePlans(rows *sql.Rows) ([]storedSchedulePlan, error) {
 			&executeAtRaw,
 			&dueAtRaw,
 			&dueAtEvidence,
+			&claimOwner,
+			&claimedAtRaw,
 			&stored.Plan.Source,
 			&stored.Plan.EventType,
 			&metadataJSON,
@@ -1146,6 +1205,12 @@ func scanStoredSchedulePlans(rows *sql.Rows) ([]storedSchedulePlan, error) {
 		}
 		stored.DueAt = dueAt
 		stored.DueAtEvidence = strings.TrimSpace(dueAtEvidence)
+		stored.ClaimOwner = strings.TrimSpace(claimOwner)
+		claimedAt, err := parseNullableSQLiteTimestamp(claimedAtRaw)
+		if err != nil {
+			return nil, fmt.Errorf("parse schedule claimed_at: %w", err)
+		}
+		stored.ClaimedAt = claimedAt
 		if createdAt, err := parseSQLiteTimestamp(createdAtRaw); err != nil {
 			return nil, fmt.Errorf("parse schedule created_at: %w", err)
 		} else {

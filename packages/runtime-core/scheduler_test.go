@@ -173,6 +173,78 @@ func TestSchedulerRunnerAutomaticallyFiresOneShotPlanAndStopsCleanly(t *testing.
 	}
 }
 
+func TestSchedulerRunDuePlansFiresOverdueDelayOnceAndDeletes(t *testing.T) {
+	t.Parallel()
+
+	scheduler := NewScheduler()
+	start := time.Date(2026, 4, 4, 10, 30, 0, 0, time.UTC)
+	current := start
+	scheduler.now = func() time.Time { return current }
+	if err := scheduler.Register(SchedulePlan{ID: "delay-overdue", Kind: ScheduleKindDelay, Delay: time.Minute, Source: "scheduler", EventType: "schedule.triggered"}); err != nil {
+		t.Fatalf("register overdue delay plan: %v", err)
+	}
+
+	current = start.Add(10 * time.Minute)
+	events := make([]eventmodel.Event, 0, 2)
+	scheduler.runDuePlans(context.Background(), func(event eventmodel.Event) error {
+		events = append(events, event)
+		return nil
+	})
+	if len(events) != 1 {
+		t.Fatalf("expected overdue delay plan to fire once, got %d events", len(events))
+	}
+	if events[0].System == nil || events[0].System.Name != "delay-overdue" {
+		t.Fatalf("unexpected overdue delay event %+v", events[0])
+	}
+	if _, err := scheduler.Plan("delay-overdue"); err == nil {
+		t.Fatal("expected overdue delay plan to be removed after firing")
+	}
+
+	scheduler.runDuePlans(context.Background(), func(event eventmodel.Event) error {
+		events = append(events, event)
+		return nil
+	})
+	if len(events) != 1 {
+		t.Fatalf("expected overdue delay plan not to fire again, got %d events", len(events))
+	}
+}
+
+func TestSchedulerRunDuePlansFiresOverdueOneShotOnceAndDeletes(t *testing.T) {
+	t.Parallel()
+
+	scheduler := NewScheduler()
+	start := time.Date(2026, 4, 4, 10, 45, 0, 0, time.UTC)
+	current := start
+	scheduler.now = func() time.Time { return current }
+	if err := scheduler.Register(SchedulePlan{ID: "oneshot-overdue", Kind: ScheduleKindOneShot, ExecuteAt: start.Add(time.Minute), Source: "scheduler", EventType: "schedule.triggered"}); err != nil {
+		t.Fatalf("register overdue one-shot plan: %v", err)
+	}
+
+	current = start.Add(10 * time.Minute)
+	events := make([]eventmodel.Event, 0, 2)
+	scheduler.runDuePlans(context.Background(), func(event eventmodel.Event) error {
+		events = append(events, event)
+		return nil
+	})
+	if len(events) != 1 {
+		t.Fatalf("expected overdue one-shot plan to fire once, got %d events", len(events))
+	}
+	if events[0].System == nil || events[0].System.Name != "oneshot-overdue" {
+		t.Fatalf("unexpected overdue one-shot event %+v", events[0])
+	}
+	if _, err := scheduler.Plan("oneshot-overdue"); err == nil {
+		t.Fatal("expected overdue one-shot plan to be removed after firing")
+	}
+
+	scheduler.runDuePlans(context.Background(), func(event eventmodel.Event) error {
+		events = append(events, event)
+		return nil
+	})
+	if len(events) != 1 {
+		t.Fatalf("expected overdue one-shot plan not to fire again, got %d events", len(events))
+	}
+}
+
 func TestSchedulerRunnerAutomaticallyFiresCronPlanAndReschedules(t *testing.T) {
 	t.Parallel()
 
@@ -213,6 +285,58 @@ func TestSchedulerRunnerAutomaticallyFiresCronPlanAndReschedules(t *testing.T) {
 		}
 	case <-time.After(200 * time.Millisecond):
 		t.Fatal("expected cron plan to auto-fire again after reschedule")
+	}
+}
+
+func TestSchedulerRunDuePlansCoalescesOverdueCronIntoSingleImmediateRun(t *testing.T) {
+	t.Parallel()
+
+	scheduler := NewScheduler()
+	start := time.Date(2026, 4, 4, 11, 0, 0, 0, time.UTC)
+	current := start
+	scheduler.now = func() time.Time { return current }
+	if err := scheduler.Register(SchedulePlan{ID: "cron-overdue", Kind: ScheduleKindCron, CronExpr: "* * * * *", Source: "scheduler", EventType: "schedule.triggered"}); err != nil {
+		t.Fatalf("register overdue cron plan: %v", err)
+	}
+
+	current = time.Date(2026, 4, 4, 11, 5, 30, 0, time.UTC)
+	events := make([]eventmodel.Event, 0, 3)
+	dispatch := func(event eventmodel.Event) error {
+		events = append(events, event)
+		return nil
+	}
+
+	scheduler.runDuePlans(context.Background(), dispatch)
+	if len(events) != 1 {
+		t.Fatalf("expected one immediate coalesced cron run, got %d events", len(events))
+	}
+	if events[0].System == nil || events[0].System.Name != "cron-overdue" {
+		t.Fatalf("unexpected overdue cron event %+v", events[0])
+	}
+	if _, err := scheduler.Plan("cron-overdue"); err != nil {
+		t.Fatalf("expected overdue cron plan to remain registered: %v", err)
+	}
+
+	scheduler.mu.RLock()
+	nextDueAt, ok := scheduler.dueAt["cron-overdue"]
+	scheduler.mu.RUnlock()
+	if !ok {
+		t.Fatal("expected overdue cron dueAt to remain tracked")
+	}
+	wantNextDueAt := time.Date(2026, 4, 4, 11, 6, 0, 0, time.UTC)
+	if !nextDueAt.Equal(wantNextDueAt) {
+		t.Fatalf("expected overdue cron to advance to next future slot %s, got %s", wantNextDueAt, nextDueAt)
+	}
+
+	scheduler.runDuePlans(context.Background(), dispatch)
+	if len(events) != 1 {
+		t.Fatalf("expected overdue cron not to replay additional missed slots immediately, got %d events", len(events))
+	}
+
+	current = wantNextDueAt
+	scheduler.runDuePlans(context.Background(), dispatch)
+	if len(events) != 2 {
+		t.Fatalf("expected cron to fire again at next future slot, got %d events", len(events))
 	}
 }
 
@@ -379,6 +503,101 @@ func TestSchedulerStoreRemovesFiredDelayPlanAfterAutoRun(t *testing.T) {
 	}
 }
 
+func TestSchedulerStorePersistsClaimBeforeDispatch(t *testing.T) {
+	t.Parallel()
+
+	store := openTempSQLiteStore(t)
+	defer func() { _ = store.Close() }()
+
+	scheduler := NewScheduler()
+	start := time.Date(2026, 4, 8, 10, 10, 0, 0, time.UTC)
+	current := start
+	scheduler.now = func() time.Time { return current }
+	scheduler.SetStore(store)
+	scheduler.SetRuntimeID("runtime-local:test-scheduler")
+	if err := scheduler.Register(SchedulePlan{ID: "delay-store-claim", Kind: ScheduleKindDelay, Delay: 20 * time.Millisecond, Source: "scheduler", EventType: "schedule.triggered"}); err != nil {
+		t.Fatalf("register delay schedule: %v", err)
+	}
+
+	claimed := make(chan storedSchedulePlan, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := scheduler.Start(ctx, 5*time.Millisecond, func(event eventmodel.Event) error {
+		stored, err := store.LoadSchedulePlan(context.Background(), "delay-store-claim")
+		if err != nil {
+			return err
+		}
+		claimed <- stored
+		return context.Canceled
+	}); err != nil {
+		t.Fatalf("start scheduler: %v", err)
+	}
+
+	current = start.Add(25 * time.Millisecond)
+	select {
+	case stored := <-claimed:
+		if stored.ClaimOwner != "runtime-local:test-scheduler" || stored.ClaimedAt == nil {
+			t.Fatalf("expected persisted claim before dispatch, got %+v", stored)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("expected dispatch attempt to expose persisted claim")
+	}
+}
+
+func TestSchedulerClaimDuePlanFailsWhenPersistedRowAlreadyClaimed(t *testing.T) {
+	t.Parallel()
+
+	store := openTempSQLiteStore(t)
+	defer func() { _ = store.Close() }()
+
+	createdAt := time.Date(2026, 4, 8, 10, 20, 0, 0, time.UTC)
+	dueAt := createdAt.Add(20 * time.Millisecond)
+	claimedAt := dueAt.Add(5 * time.Millisecond)
+	if err := store.SaveSchedulePlan(context.Background(), storedSchedulePlan{
+		Plan: SchedulePlan{
+			ID:        "delay-store-already-claimed",
+			Kind:      ScheduleKindDelay,
+			Delay:     20 * time.Millisecond,
+			Source:    "scheduler",
+			EventType: "schedule.triggered",
+		},
+		DueAt:         &dueAt,
+		DueAtEvidence: scheduleDueAtEvidencePersisted,
+		ClaimOwner:    "runtime-local:first",
+		ClaimedAt:     &claimedAt,
+		CreatedAt:     createdAt,
+		UpdatedAt:     claimedAt,
+	}); err != nil {
+		t.Fatalf("save already claimed schedule: %v", err)
+	}
+
+	scheduler := NewScheduler()
+	scheduler.now = func() time.Time { return createdAt.Add(time.Minute) }
+	scheduler.SetStore(store)
+	scheduler.SetRuntimeID("runtime-local:second")
+	claimed, err := scheduler.claimDuePlan(context.Background(), "delay-store-already-claimed", SchedulePlan{
+		ID:        "delay-store-already-claimed",
+		Kind:      ScheduleKindDelay,
+		Delay:     20 * time.Millisecond,
+		Source:    "scheduler",
+		EventType: "schedule.triggered",
+	}, dueAt)
+	if err != nil {
+		t.Fatalf("claim due plan: %v", err)
+	}
+	if claimed {
+		t.Fatal("expected scheduler claim to fail when persisted row is already claimed")
+	}
+
+	stored, err := store.LoadSchedulePlan(context.Background(), "delay-store-already-claimed")
+	if err != nil {
+		t.Fatalf("load schedule after failed second claim: %v", err)
+	}
+	if stored.ClaimOwner != "runtime-local:first" || stored.ClaimedAt == nil || !stored.ClaimedAt.Equal(claimedAt) {
+		t.Fatalf("expected original persisted claim to remain unchanged after failed second claim, got %+v", stored)
+	}
+}
+
 func TestSchedulerStoreUpdatesCronDueAtAfterAutoRun(t *testing.T) {
 	t.Parallel()
 
@@ -433,6 +652,13 @@ func TestSchedulerStoreUpdatesCronDueAtAfterAutoRun(t *testing.T) {
 	if _, err := fresh.Plan("cron-store-auto"); err != nil {
 		t.Fatalf("expected cron schedule to remain inspectable after auto-run: %v", err)
 	}
+	after, err := store.LoadSchedulePlan(context.Background(), "cron-store-auto")
+	if err != nil {
+		t.Fatalf("load persisted cron schedule after run: %v", err)
+	}
+	if after.ClaimOwner != "" || after.ClaimedAt != nil {
+		t.Fatalf("expected successful cron dispatch to clear persisted claim, got %+v", after)
+	}
 }
 
 func TestSchedulerStoreRetainsDelayPlanAfterDispatchFailure(t *testing.T) {
@@ -470,6 +696,13 @@ func TestSchedulerStoreRetainsDelayPlanAfterDispatchFailure(t *testing.T) {
 	if _, err := fresh.Plan("delay-store-fail"); err != nil {
 		t.Fatalf("expected failed delay schedule to remain persisted for retry, got %v", err)
 	}
+	stored, err := store.LoadSchedulePlan(context.Background(), "delay-store-fail")
+	if err != nil {
+		t.Fatalf("load failed delay schedule: %v", err)
+	}
+	if stored.ClaimOwner == "" || stored.ClaimedAt == nil {
+		t.Fatalf("expected failed delay schedule to retain persisted claim for abandoned recovery, got %+v", stored)
+	}
 }
 
 func TestSchedulerRestoreUsesCreatedAtForDelayPlanWhenDueAtMissing(t *testing.T) {
@@ -503,6 +736,47 @@ func TestSchedulerRestoreUsesCreatedAtForDelayPlanWhenDueAtMissing(t *testing.T)
 	}
 }
 
+func TestSchedulerRestoreUsesCreatedAtForCronPlanWhenDueAtMissing(t *testing.T) {
+	t.Parallel()
+
+	store := openTempSQLiteStore(t)
+	defer func() { _ = store.Close() }()
+
+	createdAt := time.Date(2026, 4, 8, 15, 0, 0, 0, time.UTC)
+	plan := SchedulePlan{ID: "cron-missing-dueat", Kind: ScheduleKindCron, CronExpr: "* * * * *", Source: "scheduler", EventType: "schedule.triggered"}
+	if err := store.SaveSchedulePlan(context.Background(), storedSchedulePlan{Plan: plan, DueAt: nil, DueAtEvidence: "", CreatedAt: createdAt, UpdatedAt: createdAt}); err != nil {
+		t.Fatalf("save schedule plan: %v", err)
+	}
+
+	scheduler := NewScheduler()
+	scheduler.now = func() time.Time { return createdAt.Add(10 * time.Minute) }
+	scheduler.SetStore(store)
+	if err := scheduler.Restore(context.Background()); err != nil {
+		t.Fatalf("restore scheduler: %v", err)
+	}
+
+	scheduler.mu.RLock()
+	restoredDueAt, ok := scheduler.dueAt[plan.ID]
+	scheduler.mu.RUnlock()
+	if !ok {
+		t.Fatalf("expected restored dueAt for %q", plan.ID)
+	}
+	want := createdAt.Add(time.Minute)
+	if !restoredDueAt.Equal(want) {
+		t.Fatalf("expected dueAt=%s, got %s", want, restoredDueAt)
+	}
+	repaired, err := store.LoadSchedulePlan(context.Background(), plan.ID)
+	if err != nil {
+		t.Fatalf("load repaired persisted schedule: %v", err)
+	}
+	if repaired.DueAt == nil || !repaired.DueAt.Equal(want) {
+		t.Fatalf("expected repaired cron dueAt=%s, got %+v", want, repaired)
+	}
+	if repaired.DueAtEvidence != scheduleDueAtEvidenceRecoveredStartup {
+		t.Fatalf("expected repaired cron dueAt evidence=%q, got %+v", scheduleDueAtEvidenceRecoveredStartup, repaired)
+	}
+}
+
 func TestRestoredScheduleDueAt(t *testing.T) {
 	t.Parallel()
 
@@ -532,8 +806,13 @@ func TestRestoredScheduleDueAt(t *testing.T) {
 			want:   &oneShotAt,
 		},
 		{
-			name:   "cron computes next due from now",
+			name:   "cron uses createdAt anchor when dueAt missing",
 			stored: storedSchedulePlan{Plan: SchedulePlan{ID: "schedule-cron", Kind: ScheduleKindCron, CronExpr: "* * * * *", Source: "scheduler", EventType: "schedule.triggered"}, CreatedAt: createdAt},
+			want:   ptrTime(createdAt.Add(1 * time.Minute)),
+		},
+		{
+			name:   "cron without createdAt falls back to now",
+			stored: storedSchedulePlan{Plan: SchedulePlan{ID: "schedule-cron-fallback", Kind: ScheduleKindCron, CronExpr: "* * * * *", Source: "scheduler", EventType: "schedule.triggered"}},
 			want:   ptrTime(now.Add(1 * time.Minute)),
 		},
 		{
@@ -606,7 +885,7 @@ func TestSchedulerStoreRetainsCronDueAtAfterDispatchFailure(t *testing.T) {
 		t.Fatalf("start scheduler: %v", err)
 	}
 
-	current = current.Add(time.Minute)
+	current = current.Add(3 * time.Minute)
 	time.Sleep(50 * time.Millisecond)
 	after, err := store.LoadSchedulePlan(context.Background(), "cron-store-fail")
 	if err != nil {
@@ -744,6 +1023,193 @@ func TestSchedulerRestoreCountsRecoveredMissingDueAtAndInvalidPlans(t *testing.T
 	}
 	if output := metrics.RenderPrometheus(); !strings.Contains(output, "bot_platform_schedule_recoveries_total 1") {
 		t.Fatalf("expected metrics to count recovered schedules, got %s", output)
+	}
+}
+
+func TestSchedulerRestoreRecoversAbandonedClaimedDelayPlanAndCatchesUpOnce(t *testing.T) {
+	t.Parallel()
+
+	store := openTempSQLiteStore(t)
+	defer func() { _ = store.Close() }()
+
+	createdAt := time.Date(2026, 4, 8, 13, 0, 0, 0, time.UTC)
+	dueAt := createdAt.Add(20 * time.Millisecond)
+	claimedAt := dueAt.Add(5 * time.Millisecond)
+	if err := store.SaveSchedulePlan(context.Background(), storedSchedulePlan{
+		Plan: SchedulePlan{
+			ID:        "restore-delay-claimed",
+			Kind:      ScheduleKindDelay,
+			Delay:     20 * time.Millisecond,
+			Source:    "scheduler",
+			EventType: "schedule.triggered",
+		},
+		DueAt:         &dueAt,
+		DueAtEvidence: scheduleDueAtEvidencePersisted,
+		ClaimOwner:    "runtime-local:dead-runtime",
+		ClaimedAt:     &claimedAt,
+		CreatedAt:     createdAt,
+		UpdatedAt:     claimedAt,
+	}); err != nil {
+		t.Fatalf("save claimed delay schedule: %v", err)
+	}
+
+	current := createdAt.Add(5 * time.Minute)
+	scheduler := NewScheduler()
+	scheduler.now = func() time.Time { return current }
+	scheduler.SetStore(store)
+	events := make(chan eventmodel.Event, 2)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := scheduler.Start(ctx, 5*time.Millisecond, func(event eventmodel.Event) error {
+		events <- event
+		return nil
+	}); err != nil {
+		t.Fatalf("start restored scheduler: %v", err)
+	}
+
+	select {
+	case event := <-events:
+		if event.System == nil || event.System.Name != "restore-delay-claimed" {
+			t.Fatalf("unexpected recovered delay event %+v", event)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("expected abandoned claimed delay schedule to catch up once")
+	}
+
+	fresh := NewScheduler()
+	fresh.SetStore(store)
+	if _, err := fresh.Plan("restore-delay-claimed"); err == nil {
+		t.Fatal("expected recovered delay plan to be deleted after successful catch-up")
+	}
+	restored, err := store.LoadSchedulePlan(context.Background(), "restore-delay-claimed")
+	if err == nil {
+		t.Fatalf("expected recovered delay schedule to be consumed after successful catch-up, got %+v", restored)
+	}
+	snapshot := scheduler.LastRecoverySnapshot()
+	if snapshot.RecoveredSchedules != 1 || snapshot.RecoveredClaims != 1 {
+		t.Fatalf("expected claimed delay restart recovery to be counted, got %+v", snapshot)
+	}
+}
+
+func TestSchedulerRestoreRecoversAbandonedClaimedCronPlanWithSingleCoalescedRun(t *testing.T) {
+	t.Parallel()
+
+	store := openTempSQLiteStore(t)
+	defer func() { _ = store.Close() }()
+
+	createdAt := time.Date(2026, 4, 8, 13, 0, 0, 0, time.UTC)
+	dueAt := createdAt.Add(time.Minute)
+	claimedAt := dueAt.Add(10 * time.Second)
+	if err := store.SaveSchedulePlan(context.Background(), storedSchedulePlan{
+		Plan: SchedulePlan{
+			ID:        "restore-cron-claimed",
+			Kind:      ScheduleKindCron,
+			CronExpr:  "* * * * *",
+			Source:    "scheduler",
+			EventType: "schedule.triggered",
+		},
+		DueAt:         &dueAt,
+		DueAtEvidence: scheduleDueAtEvidencePersisted,
+		ClaimOwner:    "runtime-local:dead-runtime",
+		ClaimedAt:     &claimedAt,
+		CreatedAt:     createdAt,
+		UpdatedAt:     claimedAt,
+	}); err != nil {
+		t.Fatalf("save claimed cron schedule: %v", err)
+	}
+
+	current := createdAt.Add(5*time.Minute + 30*time.Second)
+	scheduler := NewScheduler()
+	scheduler.now = func() time.Time { return current }
+	scheduler.SetStore(store)
+	events := make(chan eventmodel.Event, 3)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := scheduler.Start(ctx, 5*time.Millisecond, func(event eventmodel.Event) error {
+		events <- event
+		return nil
+	}); err != nil {
+		t.Fatalf("start restored scheduler: %v", err)
+	}
+
+	select {
+	case event := <-events:
+		if event.System == nil || event.System.Name != "restore-cron-claimed" {
+			t.Fatalf("unexpected recovered cron event %+v", event)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("expected abandoned claimed cron schedule to catch up once")
+	}
+
+	select {
+	case event := <-events:
+		t.Fatalf("expected recovered cron schedule not to replay all missed slots immediately, got %+v", event)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	stored, err := store.LoadSchedulePlan(context.Background(), "restore-cron-claimed")
+	if err != nil {
+		t.Fatalf("load recovered cron schedule: %v", err)
+	}
+	wantNextDueAt := time.Date(2026, 4, 8, 13, 6, 0, 0, time.UTC)
+	if stored.DueAt == nil || !stored.DueAt.Equal(wantNextDueAt) {
+		t.Fatalf("expected recovered cron dueAt=%s, got %+v", wantNextDueAt, stored)
+	}
+	if stored.ClaimOwner != "" || stored.ClaimedAt != nil {
+		t.Fatalf("expected successful recovered cron dispatch to clear claim, got %+v", stored)
+	}
+	if stored.DueAtEvidence != scheduleDueAtEvidencePersisted {
+		t.Fatalf("expected successful recovered cron dispatch to return to persisted dueAt evidence, got %+v", stored)
+	}
+	snapshot := scheduler.LastRecoverySnapshot()
+	if snapshot.RecoveredSchedules != 1 || snapshot.RecoveredClaims != 1 {
+		t.Fatalf("expected claimed cron restart recovery to be counted, got %+v", snapshot)
+	}
+}
+
+func TestSchedulerRestoreMarksAbandonedClaimedScheduleWithClaimRecoveryEvidence(t *testing.T) {
+	t.Parallel()
+
+	store := openTempSQLiteStore(t)
+	defer func() { _ = store.Close() }()
+
+	createdAt := time.Date(2026, 4, 8, 16, 0, 0, 0, time.UTC)
+	dueAt := createdAt.Add(20 * time.Millisecond)
+	claimedAt := dueAt.Add(5 * time.Millisecond)
+	if err := store.SaveSchedulePlan(context.Background(), storedSchedulePlan{
+		Plan: SchedulePlan{
+			ID:        "restore-delay-claimed-evidence",
+			Kind:      ScheduleKindDelay,
+			Delay:     20 * time.Millisecond,
+			Source:    "scheduler",
+			EventType: "schedule.triggered",
+		},
+		DueAt:         &dueAt,
+		DueAtEvidence: scheduleDueAtEvidencePersisted,
+		ClaimOwner:    "runtime-local:dead-runtime",
+		ClaimedAt:     &claimedAt,
+		CreatedAt:     createdAt,
+		UpdatedAt:     claimedAt,
+	}); err != nil {
+		t.Fatalf("save claimed delay schedule: %v", err)
+	}
+
+	scheduler := NewScheduler()
+	scheduler.now = func() time.Time { return createdAt.Add(5 * time.Minute) }
+	scheduler.SetStore(store)
+	if err := scheduler.Restore(context.Background()); err != nil {
+		t.Fatalf("restore scheduler: %v", err)
+	}
+
+	restored, err := store.LoadSchedulePlan(context.Background(), "restore-delay-claimed-evidence")
+	if err != nil {
+		t.Fatalf("load claimed recovered schedule: %v", err)
+	}
+	if restored.DueAtEvidence != scheduleDueAtEvidenceRecoveredClaim {
+		t.Fatalf("expected abandoned claimed schedule evidence=%q, got %+v", scheduleDueAtEvidenceRecoveredClaim, restored)
+	}
+	if restored.ClaimOwner != "" || restored.ClaimedAt != nil {
+		t.Fatalf("expected restore to clear active claim marker while preserving claim recovery evidence, got %+v", restored)
 	}
 }
 

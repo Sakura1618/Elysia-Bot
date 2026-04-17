@@ -14,10 +14,6 @@
 
 ## Backlog
 
-### A2. scheduler 语义补强
-- 补 misfire、catch-up/backfill、ownership/lease 等当前未覆盖的调度语义。
-- 让 schedule 恢复不只停留在“能重载 + 能最小修补 dueAt”的层面。
-
 ### A3. 通用插件配置 / 状态路径
 - 当前只有 `plugin-echo` 具备清晰的 persisted plugin-owned config contract。
 - 需要把这条路径推广成更多插件可复用的最小规范，而不是继续停留在单插件示例。

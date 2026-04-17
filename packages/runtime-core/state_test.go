@@ -380,6 +380,7 @@ func TestSQLiteStateStorePersistsSchedulePlansRoundTrip(t *testing.T) {
 
 	createdAt := time.Date(2026, 4, 7, 14, 0, 0, 0, time.UTC)
 	dueAt := time.Date(2026, 4, 7, 14, 5, 0, 0, time.UTC)
+	claimedAt := time.Date(2026, 4, 7, 14, 4, 30, 0, time.UTC)
 	record := storedSchedulePlan{
 		Plan: SchedulePlan{
 			ID:        "schedule-roundtrip-1",
@@ -391,6 +392,8 @@ func TestSQLiteStateStorePersistsSchedulePlansRoundTrip(t *testing.T) {
 		},
 		DueAt:         &dueAt,
 		DueAtEvidence: scheduleDueAtEvidencePersisted,
+		ClaimOwner:    "runtime-local:scheduler",
+		ClaimedAt:     &claimedAt,
 		CreatedAt:     createdAt,
 		UpdatedAt:     createdAt,
 	}
@@ -411,6 +414,9 @@ func TestSQLiteStateStorePersistsSchedulePlansRoundTrip(t *testing.T) {
 	}
 	if loaded.DueAtEvidence != scheduleDueAtEvidencePersisted {
 		t.Fatalf("expected dueAt evidence to round-trip, got %+v", loaded)
+	}
+	if loaded.ClaimOwner != record.ClaimOwner || loaded.ClaimedAt == nil || !loaded.ClaimedAt.Equal(claimedAt) {
+		t.Fatalf("expected claim ownership fields to round-trip, got %+v", loaded)
 	}
 	if loaded.Plan.Metadata["message_text"] != "hello once" {
 		t.Fatalf("expected schedule metadata to round-trip, got %+v", loaded.Plan.Metadata)
@@ -469,6 +475,115 @@ func TestSQLiteStateStoreRetainsSchedulePlansAcrossReopen(t *testing.T) {
 	}
 	if loaded.DueAtEvidence != "" {
 		t.Fatalf("expected legacy-style schedule without explicit evidence to reopen cleanly, got %+v", loaded)
+	}
+}
+
+func TestSQLiteStateStoreRetainsScheduleClaimsAcrossReopen(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "state.db")
+	store, err := OpenSQLiteStateStore(path)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	dueAt := time.Date(2026, 4, 7, 15, 0, 30, 0, time.UTC)
+	claimedAt := dueAt.Add(5 * time.Second)
+	if err := store.SaveSchedulePlan(context.Background(), storedSchedulePlan{
+		Plan: SchedulePlan{
+			ID:        "schedule-reopen-claimed",
+			Kind:      ScheduleKindDelay,
+			Delay:     30 * time.Second,
+			Source:    "runtime-demo-scheduler",
+			EventType: "message.received",
+		},
+		DueAt:         &dueAt,
+		DueAtEvidence: scheduleDueAtEvidenceRecoveredClaim,
+		ClaimOwner:    "runtime-local:test-scheduler",
+		ClaimedAt:     &claimedAt,
+		CreatedAt:     time.Date(2026, 4, 7, 15, 0, 0, 0, time.UTC),
+		UpdatedAt:     claimedAt,
+	}); err != nil {
+		t.Fatalf("save schedule plan: %v", err)
+	}
+	_ = store.Close()
+
+	reopened, err := OpenSQLiteStateStore(path)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer func() { _ = reopened.Close() }()
+
+	loaded, err := reopened.LoadSchedulePlan(context.Background(), "schedule-reopen-claimed")
+	if err != nil {
+		t.Fatalf("load schedule plan after reopen: %v", err)
+	}
+	if loaded.ClaimOwner != "runtime-local:test-scheduler" || loaded.ClaimedAt == nil || !loaded.ClaimedAt.Equal(claimedAt) {
+		t.Fatalf("expected reopened schedule claim to round-trip, got %+v", loaded)
+	}
+	if loaded.DueAtEvidence != scheduleDueAtEvidenceRecoveredClaim {
+		t.Fatalf("expected reopened claimed schedule dueAt evidence to round-trip, got %+v", loaded)
+	}
+}
+
+func TestSQLiteStateStoreClaimSchedulePlanIsAtomicAndExclusive(t *testing.T) {
+	t.Parallel()
+
+	store := openTempSQLiteStore(t)
+	defer func() { _ = store.Close() }()
+
+	createdAt := time.Date(2026, 4, 9, 9, 0, 0, 0, time.UTC)
+	dueAt := createdAt.Add(30 * time.Second)
+	if err := store.SaveSchedulePlan(context.Background(), storedSchedulePlan{
+		Plan: SchedulePlan{
+			ID:        "schedule-claim-exclusive",
+			Kind:      ScheduleKindDelay,
+			Delay:     30 * time.Second,
+			Source:    "runtime-demo-scheduler",
+			EventType: "message.received",
+		},
+		DueAt:         &dueAt,
+		DueAtEvidence: scheduleDueAtEvidencePersisted,
+		CreatedAt:     createdAt,
+		UpdatedAt:     createdAt,
+	}); err != nil {
+		t.Fatalf("save schedule plan: %v", err)
+	}
+
+	firstClaimedAt := dueAt.Add(5 * time.Second)
+	firstClaimed, err := store.ClaimSchedulePlan(context.Background(), "schedule-claim-exclusive", dueAt, schedulePlanClaim{
+		ClaimOwner: "runtime-local:first",
+		ClaimedAt:  firstClaimedAt,
+		UpdatedAt:  firstClaimedAt,
+	})
+	if err != nil {
+		t.Fatalf("first atomic claim: %v", err)
+	}
+	if !firstClaimed {
+		t.Fatal("expected first atomic claim to succeed")
+	}
+
+	secondClaimedAt := firstClaimedAt.Add(5 * time.Second)
+	secondClaimed, err := store.ClaimSchedulePlan(context.Background(), "schedule-claim-exclusive", dueAt, schedulePlanClaim{
+		ClaimOwner: "runtime-local:second",
+		ClaimedAt:  secondClaimedAt,
+		UpdatedAt:  secondClaimedAt,
+	})
+	if err != nil {
+		t.Fatalf("second atomic claim: %v", err)
+	}
+	if secondClaimed {
+		t.Fatal("expected second atomic claim to fail once row is already claimed")
+	}
+
+	loaded, err := store.LoadSchedulePlan(context.Background(), "schedule-claim-exclusive")
+	if err != nil {
+		t.Fatalf("load claimed schedule plan: %v", err)
+	}
+	if loaded.ClaimOwner != "runtime-local:first" || loaded.ClaimedAt == nil || !loaded.ClaimedAt.Equal(firstClaimedAt) {
+		t.Fatalf("expected first claim ownership to remain persisted exclusively, got %+v", loaded)
+	}
+	if loaded.DueAt == nil || !loaded.DueAt.Equal(dueAt) {
+		t.Fatalf("expected dueAt to remain unchanged after claim attempts, got %+v", loaded)
 	}
 }
 

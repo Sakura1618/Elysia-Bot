@@ -217,6 +217,11 @@ type ConsoleSchedule struct {
 	DueAtEvidence   string     `json:"dueAtEvidence,omitempty"`
 	DueAtPersisted  bool       `json:"dueAtPersisted"`
 	DueReady        bool       `json:"dueReady"`
+	Overdue         bool       `json:"overdue"`
+	ClaimOwner      string     `json:"claimOwner"`
+	ClaimedAt       *time.Time `json:"claimedAt"`
+	Claimed         bool       `json:"claimed"`
+	RecoveryState   string     `json:"recoveryState"`
 	DueStateSummary string     `json:"dueStateSummary,omitempty"`
 	DueSummary      string     `json:"dueSummary,omitempty"`
 	ScheduleSummary string     `json:"scheduleSummary,omitempty"`
@@ -227,6 +232,7 @@ type ConsoleSchedule struct {
 const (
 	scheduleDueAtEvidencePersisted        = "persisted-schedule-due-at"
 	scheduleDueAtEvidenceRecoveredStartup = "recovered-schedule-due-at"
+	scheduleDueAtEvidenceRecoveredClaim   = "recovered-claimed-schedule-due-at"
 )
 
 type sqliteConsoleScheduleReader struct {
@@ -963,14 +969,17 @@ func (r sqliteConsoleScheduleReader) ListSchedulePlans() ([]ConsoleSchedule, err
 	if err != nil {
 		return nil, err
 	}
+	now := time.Now().UTC()
 	items := make([]ConsoleSchedule, 0, len(stored))
 	for _, plan := range stored {
-		dueAt, err := restoredScheduleDueAt(time.Now().UTC, plan)
+		dueAt, err := restoredScheduleDueAt(func() time.Time { return now }, plan)
 		if err != nil {
 			continue
 		}
-		dueReady := consoleScheduleDueReady(dueAt, time.Now().UTC())
+		dueReady := consoleScheduleDueReady(dueAt, now)
+		overdue := consoleScheduleOverdue(dueAt, now)
 		dueAtEvidence := consoleScheduleDueAtEvidence(plan)
+		recoveryState := consoleScheduleRecoveryState(dueAtEvidence)
 		items = append(items, ConsoleSchedule{
 			ID:              plan.Plan.ID,
 			Kind:            string(plan.Plan.Kind),
@@ -984,9 +993,14 @@ func (r sqliteConsoleScheduleReader) ListSchedulePlans() ([]ConsoleSchedule, err
 			DueAtEvidence:   dueAtEvidence,
 			DueAtPersisted:  plan.DueAt != nil && !plan.DueAt.IsZero(),
 			DueReady:        dueReady,
+			Overdue:         overdue,
+			ClaimOwner:      strings.TrimSpace(plan.ClaimOwner),
+			ClaimedAt:       plan.ClaimedAt,
+			Claimed:         plan.ClaimedAt != nil && !plan.ClaimedAt.IsZero() && strings.TrimSpace(plan.ClaimOwner) != "",
+			RecoveryState:   recoveryState,
 			DueStateSummary: consoleScheduleStateSummary(dueAt, dueReady),
 			DueSummary:      consoleScheduleDueSummary(string(plan.Plan.Kind), dueAt, dueReady, dueAtEvidence),
-			ScheduleSummary: consoleScheduleSummary(plan.Plan.EventType, string(plan.Plan.Kind), dueAt, dueReady, dueAtEvidence),
+			ScheduleSummary: consoleScheduleSummary(plan.Plan.EventType, string(plan.Plan.Kind), dueAt, dueReady, dueAtEvidence, strings.TrimSpace(plan.ClaimOwner), plan.ClaimedAt),
 			CreatedAt:       plan.CreatedAt,
 			UpdatedAt:       plan.UpdatedAt,
 		})
@@ -994,15 +1008,13 @@ func (r sqliteConsoleScheduleReader) ListSchedulePlans() ([]ConsoleSchedule, err
 	return items, nil
 }
 
-func consoleScheduleSummary(eventType string, kind string, dueAt *time.Time, dueReady bool, dueAtEvidence string) string {
+func consoleScheduleSummary(eventType string, kind string, dueAt *time.Time, dueReady bool, dueAtEvidence string, claimOwner string, claimedAt *time.Time) string {
 	dueSummary := consoleScheduleDueSummary(kind, dueAt, dueReady, dueAtEvidence)
+	claimSummary := consoleScheduleClaimSummary(claimOwner, claimedAt)
 	if eventType == "" {
-		return dueSummary
+		return joinConsoleScheduleSummaryParts(dueSummary, claimSummary)
 	}
-	if dueSummary == "" {
-		return eventType
-	}
-	return eventType + " | " + dueSummary
+	return joinConsoleScheduleSummaryParts(eventType, dueSummary, claimSummary)
 }
 
 func consoleScheduleDueSummary(kind string, dueAt *time.Time, dueReady bool, dueAtEvidence string) string {
@@ -1022,6 +1034,13 @@ func consoleScheduleDueReady(dueAt *time.Time, now time.Time) bool {
 		return false
 	}
 	return !dueAt.After(now)
+}
+
+func consoleScheduleOverdue(dueAt *time.Time, now time.Time) bool {
+	if dueAt == nil || dueAt.IsZero() {
+		return false
+	}
+	return dueAt.Before(now)
 }
 
 func consoleScheduleStateSummary(dueAt *time.Time, dueReady bool) string {
@@ -1049,6 +1068,8 @@ func consoleScheduleDueAtSource(evidence string) string {
 	switch strings.TrimSpace(evidence) {
 	case scheduleDueAtEvidenceRecoveredStartup:
 		return "startup-recovery"
+	case scheduleDueAtEvidenceRecoveredClaim:
+		return "startup-claimed-recovery"
 	case scheduleDueAtEvidencePersisted:
 		return "persisted-state"
 	default:
@@ -1060,11 +1081,43 @@ func consoleScheduleDueEvidenceSuffix(evidence string) string {
 	switch strings.TrimSpace(evidence) {
 	case scheduleDueAtEvidenceRecoveredStartup:
 		return " (startup-recovered dueAt)"
+	case scheduleDueAtEvidenceRecoveredClaim:
+		return " (startup-recovered abandoned claimed dueAt)"
 	case scheduleDueAtEvidencePersisted:
 		return " (persisted dueAt)"
 	default:
 		return ""
 	}
+}
+
+func consoleScheduleRecoveryState(evidence string) string {
+	switch strings.TrimSpace(evidence) {
+	case scheduleDueAtEvidenceRecoveredClaim:
+		return "startup-recovered-abandoned-claim"
+	case scheduleDueAtEvidenceRecoveredStartup:
+		return "startup-recovered"
+	default:
+		return ""
+	}
+}
+
+func consoleScheduleClaimSummary(claimOwner string, claimedAt *time.Time) string {
+	claimOwner = strings.TrimSpace(claimOwner)
+	if claimOwner == "" || claimedAt == nil || claimedAt.IsZero() {
+		return ""
+	}
+	return fmt.Sprintf("claimed by %s at %s", claimOwner, claimedAt.UTC().Format(time.RFC3339))
+}
+
+func joinConsoleScheduleSummaryParts(parts ...string) string {
+	filtered := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			filtered = append(filtered, part)
+		}
+	}
+	return strings.Join(filtered, " | ")
 }
 
 func (r sqliteConsoleJobReader) ListJobs() ([]Job, error) {

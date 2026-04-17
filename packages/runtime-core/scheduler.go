@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"time"
 
@@ -37,6 +38,7 @@ type Scheduler struct {
 	plans        map[string]SchedulePlan
 	dueAt        map[string]time.Time
 	now          func() time.Time
+	runtimeID    string
 	running      bool
 	store        schedulerStore
 	logger       *Logger
@@ -49,12 +51,14 @@ type ScheduleRecoverySnapshot struct {
 	RecoveredAt        time.Time            `json:"recoveredAt"`
 	TotalSchedules     int                  `json:"totalSchedules"`
 	RecoveredSchedules int                  `json:"recoveredSchedules"`
+	RecoveredClaims    int                  `json:"recoveredClaims"`
 	InvalidSchedules   int                  `json:"invalidSchedules"`
 	ScheduleKinds      map[ScheduleKind]int `json:"scheduleKinds,omitempty"`
 }
 
 type schedulerStore interface {
 	SaveSchedulePlan(context.Context, storedSchedulePlan) error
+	ClaimSchedulePlan(context.Context, string, time.Time, schedulePlanClaim) (bool, error)
 	LoadSchedulePlan(context.Context, string) (storedSchedulePlan, error)
 	ListSchedulePlans(context.Context) ([]storedSchedulePlan, error)
 	DeleteSchedulePlan(context.Context, string) error
@@ -69,10 +73,21 @@ func NewScheduler() *Scheduler {
 		now: func() time.Time {
 			return time.Now().UTC()
 		},
-		logger:  NewLogger(io.Discard),
-		tracer:  NewTraceRecorder(),
-		metrics: NewMetricsRegistry(),
+		runtimeID: "runtime-local:scheduler",
+		logger:    NewLogger(io.Discard),
+		tracer:    NewTraceRecorder(),
+		metrics:   NewMetricsRegistry(),
 	}
+}
+
+func (s *Scheduler) SetRuntimeID(runtimeID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	runtimeID = normalizeScheduleClaimOwner(runtimeID)
+	if runtimeID == "" {
+		runtimeID = "runtime-local:scheduler"
+	}
+	s.runtimeID = runtimeID
 }
 
 func (s *Scheduler) SetObservability(logger *Logger, tracer *TraceRecorder, metrics *MetricsRegistry) {
@@ -260,6 +275,20 @@ func (s *Scheduler) Restore(ctx context.Context) error {
 			recovery.InvalidSchedules++
 			continue
 		}
+		if scheduleClaimIsAbandoned(stored, recovery.RecoveredAt) {
+			restored, changed, err := s.recoverAbandonedClaim(ctx, stored)
+			if err != nil {
+				return err
+			}
+			stored = restored
+			if changed {
+				recovery.RecoveredSchedules++
+				recovery.RecoveredClaims++
+				if s.metrics != nil {
+					s.metrics.IncrementScheduleRecoveries()
+				}
+			}
+		}
 		missingDueAt := stored.DueAt == nil || stored.DueAt.IsZero()
 		dueAt, err := restoredScheduleDueAt(s.now, stored)
 		if err != nil {
@@ -296,13 +325,29 @@ func (s *Scheduler) Restore(ctx context.Context) error {
 	s.mu.Unlock()
 	if s.logger != nil {
 		_ = s.logger.Log("info", "scheduler restored from persistence", LogContext{}, map[string]any{
-			"restored_schedules":       recovery.TotalSchedules,
-			"recovered_schedules":      recovery.RecoveredSchedules,
-			"invalid_schedules":        recovery.InvalidSchedules,
-			"persisted_schedule_kinds": recovery.ScheduleKinds,
+			"restored_schedules":        recovery.TotalSchedules,
+			"recovered_schedules":       recovery.RecoveredSchedules,
+			"recovered_schedule_claims": recovery.RecoveredClaims,
+			"invalid_schedules":         recovery.InvalidSchedules,
+			"persisted_schedule_kinds":  recovery.ScheduleKinds,
 		})
 	}
 	return nil
+}
+
+func (s *Scheduler) recoverAbandonedClaim(ctx context.Context, stored storedSchedulePlan) (storedSchedulePlan, bool, error) {
+	if s.store == nil {
+		return stored, false, nil
+	}
+	recovered := stored
+	recovered.ClaimOwner = ""
+	recovered.ClaimedAt = nil
+	recovered.DueAtEvidence = scheduleDueAtEvidenceRecoveredClaim
+	recovered.UpdatedAt = s.now()
+	if err := s.store.SaveSchedulePlan(ctx, recovered); err != nil {
+		return stored, false, err
+	}
+	return recovered, true, nil
 }
 
 func (s *Scheduler) persistRestoredPlan(ctx context.Context, stored storedSchedulePlan, dueAt time.Time) error {
@@ -310,10 +355,14 @@ func (s *Scheduler) persistRestoredPlan(ctx context.Context, stored storedSchedu
 		return nil
 	}
 	repairedDueAt := dueAt
+	evidence := strings.TrimSpace(stored.DueAtEvidence)
+	if evidence == "" {
+		evidence = scheduleDueAtEvidenceRecoveredStartup
+	}
 	return s.store.SaveSchedulePlan(ctx, storedSchedulePlan{
 		Plan:          stored.Plan,
 		DueAt:         &repairedDueAt,
-		DueAtEvidence: scheduleDueAtEvidenceRecoveredStartup,
+		DueAtEvidence: evidence,
 		CreatedAt:     stored.CreatedAt,
 		UpdatedAt:     s.now(),
 	})
@@ -350,10 +399,14 @@ func restoredScheduleDueAt(now func() time.Time, stored storedSchedulePlan) (*ti
 		dueAt := stored.Plan.ExecuteAt
 		return &dueAt, nil
 	case ScheduleKindCron:
-		if now == nil {
-			return nil, nil
+		anchor := stored.CreatedAt
+		if anchor.IsZero() {
+			if now == nil {
+				return nil, nil
+			}
+			anchor = now()
 		}
-		dueAt, err := nextCronDue(stored.Plan.CronExpr, now(), now())
+		dueAt, err := nextCronDue(stored.Plan.CronExpr, anchor, anchor)
 		if err != nil {
 			return nil, err
 		}
@@ -425,6 +478,10 @@ func (s *Scheduler) runDuePlans(ctx context.Context, dispatch func(eventmodel.Ev
 		if err != nil {
 			continue
 		}
+		claimed, err := s.claimDuePlan(ctx, item.id, item.plan, item.dueAt)
+		if err != nil || !claimed {
+			continue
+		}
 		if err := dispatch(event); err != nil {
 			continue
 		}
@@ -465,6 +522,44 @@ func (s *Scheduler) runDuePlans(ctx context.Context, dispatch func(eventmodel.Ev
 	}
 }
 
+func (s *Scheduler) claimDuePlan(ctx context.Context, itemID string, plan SchedulePlan, dueAt time.Time) (bool, error) {
+	if s.store == nil {
+		return true, nil
+	}
+	claimedAt := s.now()
+	claimOwner := normalizeScheduleClaimOwner(s.runtimeID)
+	if claimOwner == "" {
+		claimOwner = "runtime-local:scheduler"
+	}
+	return s.store.ClaimSchedulePlan(ctx, itemID, dueAt, schedulePlanClaim{
+		ClaimOwner: claimOwner,
+		ClaimedAt:  claimedAt,
+		UpdatedAt:  claimedAt,
+	})
+}
+
+func (s *Scheduler) clearDuePlanClaim(plan SchedulePlan, dueAt *time.Time, dueAtEvidence string) error {
+	if s.store == nil {
+		return nil
+	}
+	now := s.now()
+	createdAt := now
+	if existing, err := s.store.LoadSchedulePlan(context.Background(), plan.ID); err == nil {
+		createdAt = existing.CreatedAt
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	return s.store.SaveSchedulePlan(context.Background(), storedSchedulePlan{
+		Plan:          plan,
+		DueAt:         dueAt,
+		DueAtEvidence: dueAtEvidence,
+		ClaimOwner:    "",
+		ClaimedAt:     nil,
+		CreatedAt:     createdAt,
+		UpdatedAt:     now,
+	})
+}
+
 func (s *Scheduler) setDueAtLocked(plan SchedulePlan) {
 	dueAt, err := s.dueAtForPlan(plan)
 	if err != nil {
@@ -488,23 +583,7 @@ func (s *Scheduler) dueAtForPlan(plan SchedulePlan) (time.Time, error) {
 }
 
 func (s *Scheduler) savePlanLocked(plan SchedulePlan, dueAt time.Time) error {
-	if s.store == nil {
-		return nil
-	}
-	now := s.now()
-	createdAt := now
-	if existing, err := s.store.LoadSchedulePlan(context.Background(), plan.ID); err == nil {
-		createdAt = existing.CreatedAt
-	} else if !errors.Is(err, sql.ErrNoRows) {
-		return err
-	}
-	return s.store.SaveSchedulePlan(context.Background(), storedSchedulePlan{
-		Plan:          plan,
-		DueAt:         &dueAt,
-		DueAtEvidence: scheduleDueAtEvidencePersisted,
-		CreatedAt:     createdAt,
-		UpdatedAt:     now,
-	})
+	return s.clearDuePlanClaim(plan, &dueAt, scheduleDueAtEvidencePersisted)
 }
 
 func (s *Scheduler) deletePlanLocked(id string) error {
@@ -562,4 +641,19 @@ func nextCronDue(expr string, after time.Time, notBefore time.Time) (time.Time, 
 		next = schedule.Next(next)
 	}
 	return next, nil
+}
+
+func scheduleClaimIsAbandoned(stored storedSchedulePlan, now time.Time) bool {
+	if strings.TrimSpace(stored.ClaimOwner) == "" || stored.ClaimedAt == nil || stored.ClaimedAt.IsZero() {
+		return false
+	}
+	dueAt := stored.DueAt
+	if dueAt == nil || dueAt.IsZero() {
+		return false
+	}
+	return !dueAt.After(now)
+}
+
+func normalizeScheduleClaimOwner(owner string) string {
+	return strings.TrimSpace(owner)
 }
