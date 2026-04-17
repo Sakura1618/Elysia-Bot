@@ -323,6 +323,9 @@ func TestConsoleAPIExposesPersistedPluginConfigStateForPluginEcho(t *testing.T) 
 	}
 
 	api := NewConsoleAPI(runtime, nil, Config{}, nil, nil)
+	api.SetPluginConfigBindings(map[string]ConsolePluginConfigBinding{
+		manifest.ID: {StateKind: "plugin-owned-persisted-input"},
+	})
 	api.SetPluginConfigReader(NewSQLiteConsolePluginConfigReader(store))
 	plugins := api.Plugins()
 	if len(plugins) != 1 {
@@ -343,6 +346,81 @@ func TestConsoleAPIExposesPersistedPluginConfigStateForPluginEcho(t *testing.T) 
 		if !strings.Contains(rendered, expected) {
 			t.Fatalf("expected rendered console payload to contain %q, got %s", expected, rendered)
 		}
+	}
+}
+
+func TestConsoleAPIExposesBoundPluginConfigCapabilityWithoutPersistedState(t *testing.T) {
+	t.Parallel()
+
+	runtime := NewInMemoryRuntime(NoopSupervisor{}, DirectPluginHost{})
+	manifest := pluginsdk.PluginManifest{
+		ID:         "plugin-echo",
+		Name:       "Echo Plugin",
+		Version:    "0.1.0",
+		APIVersion: "v0",
+		Mode:       pluginsdk.ModeSubprocess,
+		Entry:      pluginsdk.PluginEntry{Module: "plugins/plugin-echo", Symbol: "Plugin"},
+	}
+	if err := runtime.RegisterPlugin(pluginsdk.Plugin{Manifest: manifest, Handlers: pluginsdk.Handlers{Event: noopConsoleHandler{}}}); err != nil {
+		t.Fatalf("register plugin: %v", err)
+	}
+
+	api := NewConsoleAPI(runtime, nil, Config{}, nil, nil)
+	api.SetPluginConfigBindings(map[string]ConsolePluginConfigBinding{
+		manifest.ID: {StateKind: "plugin-owned-persisted-input"},
+	})
+	plugins := api.Plugins()
+	if len(plugins) != 1 {
+		t.Fatalf("expected one plugin, got %+v", plugins)
+	}
+	plugin := plugins[0]
+	if plugin.ConfigStateKind != "plugin-owned-persisted-input" {
+		t.Fatalf("expected bound plugin config capability, got %+v", plugin)
+	}
+	if plugin.ConfigPersisted || plugin.ConfigSource != "" || plugin.ConfigUpdatedAt != nil {
+		t.Fatalf("expected bound plugin without persisted row to omit persisted metadata, got %+v", plugin)
+	}
+	if plugin.EnabledStatePersisted {
+		t.Fatalf("expected config capability binding not to affect enabled overlay metadata, got %+v", plugin)
+	}
+}
+
+func TestConsoleAPIUnboundPluginConfigRowDoesNotExposeConfigCapability(t *testing.T) {
+	t.Parallel()
+
+	runtime := NewInMemoryRuntime(NoopSupervisor{}, DirectPluginHost{})
+	store := openTempSQLiteStore(t)
+	defer func() { _ = store.Close() }()
+	manifest := pluginsdk.PluginManifest{
+		ID:         "plugin-admin",
+		Name:       "Admin Plugin",
+		Version:    "0.1.0",
+		APIVersion: "v0",
+		Mode:       pluginsdk.ModeSubprocess,
+		Entry:      pluginsdk.PluginEntry{Module: "plugins/plugin-admin", Symbol: "Plugin"},
+	}
+	if err := runtime.RegisterPlugin(pluginsdk.Plugin{Manifest: manifest, Handlers: pluginsdk.Handlers{Event: noopConsoleHandler{}}}); err != nil {
+		t.Fatalf("register plugin: %v", err)
+	}
+	if err := store.SavePluginConfig(context.Background(), manifest.ID, json.RawMessage(`{"ignored":true}`)); err != nil {
+		t.Fatalf("save plugin config: %v", err)
+	}
+
+	api := NewConsoleAPI(runtime, nil, Config{}, nil, nil)
+	api.SetPluginConfigBindings(map[string]ConsolePluginConfigBinding{
+		"plugin-echo": {StateKind: "plugin-owned-persisted-input"},
+	})
+	api.SetPluginConfigReader(NewSQLiteConsolePluginConfigReader(store))
+	plugins := api.Plugins()
+	if len(plugins) != 1 {
+		t.Fatalf("expected one plugin, got %+v", plugins)
+	}
+	plugin := plugins[0]
+	if plugin.ConfigStateKind != "" || plugin.ConfigPersisted || plugin.ConfigSource != "" || plugin.ConfigUpdatedAt != nil {
+		t.Fatalf("expected unbound plugin config row to stay hidden from capability surface, got %+v", plugin)
+	}
+	if plugin.StatusSource != "runtime-registry" {
+		t.Fatalf("expected unbound plugin config row not to affect unrelated plugin status metadata, got %+v", plugin)
 	}
 }
 

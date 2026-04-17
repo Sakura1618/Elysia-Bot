@@ -23,6 +23,7 @@ type ConsoleAPI struct {
 	pluginSnapshots  consolePluginSnapshotReader
 	pluginEnabled    consolePluginEnabledStateReader
 	pluginConfigs    consolePluginConfigReader
+	pluginConfigMeta map[string]ConsolePluginConfigBinding
 	recovery         consoleRecoverySource
 	config           Config
 	logs             []string
@@ -70,6 +71,10 @@ type ConsolePlugin struct {
 	StatusLevel              string                `json:"statusLevel,omitempty"`
 	StatusRecovery           string                `json:"statusRecovery,omitempty"`
 	StatusStaleness          string                `json:"statusStaleness,omitempty"`
+}
+
+type ConsolePluginConfigBinding struct {
+	StateKind string
 }
 
 type ConsoleAdapterInstance struct {
@@ -271,7 +276,7 @@ type RuntimeStatus struct {
 }
 
 func NewConsoleAPI(runtime *InMemoryRuntime, queue *JobQueue, config Config, logs []string, audits AuditLogReader) *ConsoleAPI {
-	return &ConsoleAPI{runtime: runtime, queue: queue, config: config, logs: logs, audits: audits, meta: map[string]any{}, readAuthorizer: NewConsoleReadAuthorizer(config.RBAC)}
+	return &ConsoleAPI{runtime: runtime, queue: queue, config: config, logs: logs, audits: audits, meta: map[string]any{}, pluginConfigMeta: map[string]ConsolePluginConfigBinding{}, readAuthorizer: NewConsoleReadAuthorizer(config.RBAC)}
 }
 
 func NewSQLiteConsoleJobReader(store *SQLiteStateStore) consoleJobReader {
@@ -341,6 +346,18 @@ func (c *ConsoleAPI) SetPluginEnabledStateReader(reader consolePluginEnabledStat
 
 func (c *ConsoleAPI) SetPluginConfigReader(reader consolePluginConfigReader) {
 	c.pluginConfigs = reader
+}
+
+func (c *ConsoleAPI) SetPluginConfigBindings(bindings map[string]ConsolePluginConfigBinding) {
+	if len(bindings) == 0 {
+		c.pluginConfigMeta = map[string]ConsolePluginConfigBinding{}
+		return
+	}
+	cloned := make(map[string]ConsolePluginConfigBinding, len(bindings))
+	for pluginID, binding := range bindings {
+		cloned[pluginID] = binding
+	}
+	c.pluginConfigMeta = cloned
 }
 
 func (c *ConsoleAPI) SetJobReader(reader consoleJobReader) {
@@ -424,10 +441,10 @@ func (c *ConsoleAPI) Plugins() []ConsolePlugin {
 			EnabledStateSource: "runtime-default-enabled",
 			StatusSource:       "runtime-registry",
 		}
-		if manifest.ID == "plugin-echo" {
-			item.ConfigStateKind = "plugin-owned-persisted-input"
+		if binding, ok := c.pluginConfigMeta[manifest.ID]; ok {
+			applyPluginConfigBinding(&item, binding)
 			if state, ok := persistedConfigStates[manifest.ID]; ok {
-				applyPluginConfigState(&item, state)
+				applyPluginConfigState(&item, binding, state)
 			}
 		}
 		if state, ok := persistedEnabledStates[manifest.ID]; ok {
@@ -473,11 +490,26 @@ func applyPluginEnabledState(item *ConsolePlugin, state PluginEnabledState) {
 	}
 }
 
-func applyPluginConfigState(item *ConsolePlugin, state PluginConfigState) {
+func applyPluginConfigBinding(item *ConsolePlugin, binding ConsolePluginConfigBinding) {
 	if item == nil {
 		return
 	}
-	item.ConfigStateKind = "plugin-owned-persisted-input"
+	stateKind := strings.TrimSpace(binding.StateKind)
+	if stateKind == "" {
+		return
+	}
+	item.ConfigStateKind = stateKind
+}
+
+func applyPluginConfigState(item *ConsolePlugin, binding ConsolePluginConfigBinding, state PluginConfigState) {
+	if item == nil {
+		return
+	}
+	stateKind := strings.TrimSpace(binding.StateKind)
+	if stateKind == "" {
+		return
+	}
+	item.ConfigStateKind = stateKind
 	item.ConfigSource = "sqlite-plugin-config"
 	item.ConfigPersisted = true
 	if !state.UpdatedAt.IsZero() {

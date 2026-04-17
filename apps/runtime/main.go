@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"crypto/rand"
-	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -40,6 +39,7 @@ type runtimeApp struct {
 	audits          *runtimecore.InMemoryAuditLog
 	state           *runtimecore.SQLiteStateStore
 	smokeStore      runtimeSmokeStore
+	pluginConfigs   appPluginConfigRegistry
 	lifecycle       *runtimecore.PluginLifecycleService
 	queue           *runtimecore.JobQueue
 	scheduler       *runtimecore.Scheduler
@@ -386,6 +386,7 @@ func newRuntimeAppWithOutput(configPath string, output io.Writer) (*runtimeApp, 
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite state store: %w", err)
 	}
+	pluginConfigs := newAppPluginConfigRegistry()
 	queue.SetStore(state)
 	queue.SetAlertSink(state)
 	if err := queue.Restore(context.Background()); err != nil {
@@ -411,15 +412,27 @@ func newRuntimeAppWithOutput(configPath string, output io.Writer) (*runtimeApp, 
 		runtime.SetCommandAuthorizer(runtimecore.NewAdminCommandAuthorizer(config.RBAC))
 	}
 
-	echoConfig, echoRawConfig, err := loadPersistedEchoConfig(state)
+	echoBinding, ok := pluginConfigs.Lookup("plugin-echo")
+	if !ok {
+		_ = smokeStore.Close()
+		_ = state.Close()
+		return nil, fmt.Errorf("plugin config binding for %q is required", "plugin-echo")
+	}
+	echoConfigState, err := loadPersistedPluginConfig(state, echoBinding)
 	if err != nil {
 		_ = smokeStore.Close()
 		_ = state.Close()
-		return nil, fmt.Errorf("load echo plugin config: %w", err)
+		return nil, fmt.Errorf("load plugin config for %q: %w", echoBinding.PluginID, err)
+	}
+	echoConfig, ok := echoConfigState.TypedConfig.(pluginecho.Config)
+	if !ok {
+		_ = smokeStore.Close()
+		_ = state.Close()
+		return nil, fmt.Errorf("plugin config binding %q returned %T, want pluginecho.Config", echoBinding.PluginID, echoConfigState.TypedConfig)
 	}
 	echoPlugin := pluginecho.New(replies, echoConfig)
 	echoDefinition := echoPlugin.Definition()
-	echoDefinition.InstanceConfig = echoRawConfig
+	echoDefinition.InstanceConfig = echoConfigState.InstanceConfig
 	echoDefinition.Handlers.Event = sourceScopedEventHandler{allowed: allowedSources("onebot", "runtime-demo-scheduler"), inner: echoPlugin}
 	if err := runtime.RegisterPlugin(echoDefinition); err != nil {
 		_ = smokeStore.Close()
@@ -498,6 +511,7 @@ func newRuntimeAppWithOutput(configPath string, output io.Writer) (*runtimeApp, 
 		audits:        audits,
 		state:         state,
 		smokeStore:    smokeStore,
+		pluginConfigs: pluginConfigs,
 		lifecycle:     lifecycle,
 		queue:         queue,
 		scheduler:     scheduler,
@@ -513,6 +527,7 @@ func newRuntimeAppWithOutput(configPath string, output io.Writer) (*runtimeApp, 
 				"/demo/schedules/{schedule-id}/cancel",
 				"/demo/plugins/{plugin-id}/disable",
 				"/demo/plugins/{plugin-id}/enable",
+				"/demo/plugins/{plugin-id}/config",
 				"/demo/replies",
 				"/demo/state/counts",
 			},
@@ -522,7 +537,7 @@ func newRuntimeAppWithOutput(configPath string, output io.Writer) (*runtimeApp, 
 			"scheduler_interval_ms":   settings.SchedulerIntervalMs,
 			"ai_job_dispatcher":       "runtime-job-queue",
 			"runtime_worker_id":       runtimeWorkerID(),
-			"console_mode":            "read+operator-plugin-enable-disable",
+			"console_mode":            "read+operator-plugin-enable-disable+plugin-config",
 		},
 		mux: http.NewServeMux(),
 	}
@@ -636,6 +651,7 @@ func (a *runtimeApp) handleConsole(w http.ResponseWriter, r *http.Request) {
 	console.SetPluginSnapshotReader(runtimecore.NewSQLiteConsolePluginSnapshotReader(a.state))
 	console.SetPluginEnabledStateReader(runtimecore.NewSQLiteConsolePluginEnabledStateReader(a.state))
 	console.SetPluginConfigReader(runtimecore.NewSQLiteConsolePluginConfigReader(a.state))
+	console.SetPluginConfigBindings(a.pluginConfigs.ConsoleBindings())
 	console.SetRecoverySource(newRuntimeRecoverySource(a.queue, a.scheduler))
 	recovery := a.queue.LastRecoverySnapshot()
 	scheduleRecovery := a.scheduler.LastRecoverySnapshot()
@@ -651,8 +667,10 @@ func (a *runtimeApp) handleConsole(w http.ResponseWriter, r *http.Request) {
 	meta["adapter_status_model"] = "persisted-registered-instance-status"
 	meta["plugin_read_model"] = "runtime-registry+sqlite-plugin-status-snapshot"
 	meta["plugin_config_state_read_model"] = "runtime-registry+sqlite-plugin-config"
-	meta["plugin_config_state_kind"] = "plugin-owned-persisted-input"
+	meta["plugin_config_state_kind"] = pluginConfigStateKindPersistedInput
 	meta["plugin_config_state_persisted"] = true
+	meta["plugin_config_operator_actions"] = []string{"/demo/plugins/{plugin-id}/config"}
+	meta["plugin_config_operator_scope"] = "plugins with app-local persisted config bindings only"
 	meta["plugin_enabled_state_read_model"] = "runtime-registry+sqlite-plugin-enabled-overlay"
 	meta["plugin_enabled_state_persisted"] = true
 	meta["plugin_operator_actions"] = []string{"/demo/plugins/{plugin-id}/enable", "/demo/plugins/{plugin-id}/disable"}
@@ -1186,8 +1204,9 @@ func (a *runtimeApp) handlePluginConfigOperator(w http.ResponseWriter, r *http.R
 		http.NotFound(w, r)
 		return
 	}
-	if pluginID != "plugin-echo" {
-		http.Error(w, "plugin config operator only supports plugin-echo", http.StatusNotFound)
+	binding, ok := a.pluginConfigs.Lookup(pluginID)
+	if !ok {
+		http.Error(w, fmt.Sprintf("plugin config operator not found for %q", pluginID), http.StatusNotFound)
 		return
 	}
 	actor := strings.TrimSpace(r.Header.Get(runtimecore.ConsoleReadActorHeader))
@@ -1204,12 +1223,12 @@ func (a *runtimeApp) handlePluginConfigOperator(w http.ResponseWriter, r *http.R
 		http.Error(w, fmt.Sprintf("read plugin config: %v", err), http.StatusBadRequest)
 		return
 	}
-	rawConfigJSON, _, typedConfig, err := validateAndDecodeEchoConfig(rawBody)
+	decoded, err := binding.Decode(rawBody)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if err := a.state.SavePluginConfig(r.Context(), pluginID, rawConfigJSON); err != nil {
+	if err := a.state.SavePluginConfig(r.Context(), pluginID, decoded.RawConfigJSON); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -1237,10 +1256,10 @@ func (a *runtimeApp) handlePluginConfigOperator(w http.ResponseWriter, r *http.R
 		"accepted":    true,
 		"reason":      "plugin_config_updated",
 		"plugin_id":   pluginID,
-		"config":      map[string]any{"prefix": typedConfig.Prefix},
+		"config":      decoded.ResponseConfig,
 		"updated_at":  stored.UpdatedAt.UTC().Format(time.RFC3339),
 		"persisted":   true,
-		"config_path": "/demo/plugins/plugin-echo/config",
+		"config_path": binding.ConfigPath,
 	}
 	_ = json.NewEncoder(w).Encode(response)
 }
@@ -1369,49 +1388,6 @@ func parsePluginConfigPath(path string) (pluginID string, ok bool) {
 		return "", false
 	}
 	return pluginID, true
-}
-
-func loadPersistedEchoConfig(state *runtimecore.SQLiteStateStore) (pluginecho.Config, map[string]any, error) {
-	defaultConfig := pluginecho.Config{Prefix: "echo: "}
-	if state == nil {
-		return defaultConfig, nil, nil
-	}
-	stored, err := state.LoadPluginConfig(context.Background(), "plugin-echo")
-	if err == sql.ErrNoRows {
-		return defaultConfig, nil, nil
-	}
-	if err != nil {
-		return pluginecho.Config{}, nil, err
-	}
-	_, rawConfig, typedConfig, err := validateAndDecodeEchoConfig(stored.RawConfig)
-	if err != nil {
-		return pluginecho.Config{}, nil, err
-	}
-	return typedConfig, rawConfig, nil
-}
-
-func validateAndDecodeEchoConfig(raw []byte) (json.RawMessage, map[string]any, pluginecho.Config, error) {
-	var rawConfig map[string]any
-	if err := json.Unmarshal(raw, &rawConfig); err != nil {
-		return nil, nil, pluginecho.Config{}, fmt.Errorf("plugin-echo config must be a JSON object: %w", err)
-	}
-	if rawConfig == nil {
-		return nil, nil, pluginecho.Config{}, errors.New("plugin-echo config must be a JSON object")
-	}
-	if prefix, exists := rawConfig["prefix"]; exists {
-		if _, ok := prefix.(string); !ok {
-			return nil, nil, pluginecho.Config{}, errors.New(`plugin-echo config property "prefix" must be a string`)
-		}
-	}
-	encoded, err := json.Marshal(rawConfig)
-	if err != nil {
-		return nil, nil, pluginecho.Config{}, fmt.Errorf("marshal plugin-echo config: %w", err)
-	}
-	var typedConfig pluginecho.Config
-	if err := json.Unmarshal(encoded, &typedConfig); err != nil {
-		return nil, nil, pluginecho.Config{}, fmt.Errorf("decode plugin-echo config: %w", err)
-	}
-	return encoded, rawConfig, typedConfig, nil
 }
 
 func actorRoles(cfg *runtimecore.RBACConfig) map[string][]string {

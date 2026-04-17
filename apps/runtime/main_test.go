@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -180,6 +181,40 @@ func readRuntimeConsoleResponse(t *testing.T, app *runtimeApp) runtimeConsoleRes
 		t.Fatalf("decode console payload: %v", err)
 	}
 	return payload
+}
+
+func consoleMetaString(t *testing.T, meta map[string]any, key string) string {
+	t.Helper()
+	value, ok := meta[key]
+	if !ok {
+		t.Fatalf("expected console meta to include %q", key)
+	}
+	text, ok := value.(string)
+	if !ok {
+		t.Fatalf("expected console meta %q to be a string, got %#v", key, value)
+	}
+	return text
+}
+
+func consoleMetaStringSlice(t *testing.T, meta map[string]any, key string) []string {
+	t.Helper()
+	value, ok := meta[key]
+	if !ok {
+		t.Fatalf("expected console meta to include %q", key)
+	}
+	items, ok := value.([]any)
+	if !ok {
+		t.Fatalf("expected console meta %q to decode as []any, got %#v", key, value)
+	}
+	result := make([]string, 0, len(items))
+	for _, item := range items {
+		text, ok := item.(string)
+		if !ok {
+			t.Fatalf("expected console meta %q item to be a string, got %#v", key, item)
+		}
+		result = append(result, text)
+	}
+	return result
 }
 
 func hasConsoleSchedule(payload runtimeConsoleResponse, scheduleID string) bool {
@@ -689,10 +724,37 @@ func TestRuntimeAppConsoleReflectsRuntimeState(t *testing.T) {
 	if !strings.Contains(resp.Body.String(), `"plugin_read_model": "runtime-registry+sqlite-plugin-status-snapshot"`) {
 		t.Fatalf("expected console payload to include plugin_read_model=runtime-registry+sqlite-plugin-status-snapshot, got %s", resp.Body.String())
 	}
-	for _, expected := range []string{`"plugin_config_state_read_model": "runtime-registry+sqlite-plugin-config"`, `"plugin_config_state_kind": "plugin-owned-persisted-input"`, `"plugin_config_state_persisted": true`, `"plugin_enabled_state_read_model": "runtime-registry+sqlite-plugin-enabled-overlay"`, `"plugin_enabled_state_persisted": true`, `"plugin_operator_scope": "already-registered plugins only"`, `"/demo/plugins/{plugin-id}/enable"`, `"/demo/plugins/{plugin-id}/disable"`, `"/demo/schedules/{schedule-id}/cancel"`, `"console_mode": "read+operator-plugin-enable-disable"`, `"enabled": true`, `"enabledStateSource": "runtime-default-enabled"`, `"enabledStatePersisted": false`, `"configStateKind": "plugin-owned-persisted-input"`, `"configPersisted": false`} {
+	for _, expected := range []string{`"plugin_config_state_read_model": "runtime-registry+sqlite-plugin-config"`, `"plugin_config_state_kind": "plugin-owned-persisted-input"`, `"plugin_config_state_persisted": true`, `"plugin_config_operator_actions": [`, `"plugin_config_operator_scope": "plugins with app-local persisted config bindings only"`, `"plugin_enabled_state_read_model": "runtime-registry+sqlite-plugin-enabled-overlay"`, `"plugin_enabled_state_persisted": true`, `"plugin_operator_scope": "already-registered plugins only"`, `"/demo/plugins/{plugin-id}/enable"`, `"/demo/plugins/{plugin-id}/disable"`, `"/demo/plugins/{plugin-id}/config"`, `"/demo/schedules/{schedule-id}/cancel"`, `"console_mode": "read+operator-plugin-enable-disable+plugin-config"`, `"enabled": true`, `"enabledStateSource": "runtime-default-enabled"`, `"enabledStatePersisted": false`, `"configStateKind": "plugin-owned-persisted-input"`, `"configPersisted": false`} {
 		if !strings.Contains(resp.Body.String(), expected) {
 			t.Fatalf("expected console payload to include %s, got %s", expected, resp.Body.String())
 		}
+	}
+	console := readRuntimeConsoleResponse(t, app)
+	expectedDemoPaths := []string{
+		"/demo/onebot/message",
+		"/demo/ai/message",
+		"/demo/jobs/enqueue",
+		"/demo/jobs/timeout",
+		"/demo/jobs/{job-id}/retry",
+		"/demo/schedules/echo-delay",
+		"/demo/schedules/{schedule-id}/cancel",
+		"/demo/plugins/{plugin-id}/disable",
+		"/demo/plugins/{plugin-id}/enable",
+		"/demo/plugins/{plugin-id}/config",
+		"/demo/replies",
+		"/demo/state/counts",
+	}
+	if got := consoleMetaString(t, console.Meta, "console_mode"); got != "read+operator-plugin-enable-disable+plugin-config" {
+		t.Fatalf("expected console_mode to advertise plugin-config capability, got %q", got)
+	}
+	if got := consoleMetaString(t, console.Meta, "plugin_config_operator_scope"); got != "plugins with app-local persisted config bindings only" {
+		t.Fatalf("expected plugin_config_operator_scope to describe binding-driven capability, got %q", got)
+	}
+	if got := consoleMetaStringSlice(t, console.Meta, "plugin_config_operator_actions"); !reflect.DeepEqual(got, []string{"/demo/plugins/{plugin-id}/config"}) {
+		t.Fatalf("expected exact plugin_config_operator_actions, got %+v", got)
+	}
+	if got := consoleMetaStringSlice(t, console.Meta, "demo_paths"); !reflect.DeepEqual(got, expectedDemoPaths) {
+		t.Fatalf("expected exact demo_paths, got %+v", got)
 	}
 	if !strings.Contains(resp.Body.String(), `"plugin_dispatch_source": "sqlite-plugin-status-snapshot+runtime-dispatch-results"`) {
 		t.Fatalf("expected console payload to include plugin_dispatch_source=sqlite-plugin-status-snapshot+runtime-dispatch-results, got %s", resp.Body.String())
@@ -1494,6 +1556,29 @@ func TestRuntimeAppPluginEchoConfigOperatorReturnsForbiddenAndRecordsDeniedAudit
 	}
 	if entries[0].Actor != "viewer-user" || entries[0].Action != "plugin.config" || entries[0].Permission != "plugin:config" || entries[0].Target != "plugin-echo" || entries[0].Allowed || entries[0].Reason != "permission_denied" {
 		t.Fatalf("expected denied config audit entry, got %+v", entries[0])
+	}
+}
+
+func TestRuntimeAppPluginConfigOperatorReturnsNotFoundForUnboundPlugin(t *testing.T) {
+	t.Parallel()
+
+	app, err := newRuntimeApp(writeWriteActionRBACConfig(t))
+	if err != nil {
+		t.Fatalf("new runtime app: %v", err)
+	}
+	defer func() { _ = app.Close() }()
+
+	configReq := httptest.NewRequest(http.MethodPost, "/demo/plugins/plugin-admin/config", strings.NewReader(`{"prefix":"ignored: "}`))
+	configReq.Header.Set("Content-Type", "application/json")
+	configReq.Header.Set(runtimecore.ConsoleReadActorHeader, "config-operator")
+	configResp := httptest.NewRecorder()
+	app.ServeHTTP(configResp, configReq)
+
+	if configResp.Code != http.StatusNotFound {
+		t.Fatalf("expected unbound plugin config operator 404, got %d: %s", configResp.Code, configResp.Body.String())
+	}
+	if len(app.audits.AuditEntries()) != 0 {
+		t.Fatalf("expected unbound plugin config operator not to record auth or allow audit, got %+v", app.audits.AuditEntries())
 	}
 }
 

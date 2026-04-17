@@ -14,10 +14,6 @@
 
 ## Backlog
 
-### A3. 通用插件配置 / 状态路径
-- 当前只有 `plugin-echo` 具备清晰的 persisted plugin-owned config contract。
-- 需要把这条路径推广成更多插件可复用的最小规范，而不是继续停留在单插件示例。
-
 ### A4. subprocess 实例配置递归校验补全
 - 当前实例配置校验仍有明确的深层递归边界。
 - 需要继续推进 deeper nested required / enum / default / type 协同行为与 default merge 语义。
