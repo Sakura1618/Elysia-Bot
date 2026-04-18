@@ -67,7 +67,7 @@ func waitForAIJobStatus(t *testing.T, app *runtimeApp, jobID string, expected ru
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-        app.queue.DispatchReady(t.Context(), time.Now().UTC())
+		app.queue.DispatchReady(t.Context(), time.Now().UTC())
 		stored, err := app.queue.Inspect(t.Context(), jobID)
 		if err == nil && stored.Status == expected {
 			return stored
@@ -160,6 +160,17 @@ type runtimeConsoleResponse struct {
 	Schedules []struct {
 		ID string `json:"id"`
 	} `json:"schedules"`
+	Workflows []struct {
+		ID             string `json:"id"`
+		PluginID       string `json:"pluginId"`
+		Status         string `json:"status"`
+		WaitingFor     string `json:"waitingFor"`
+		Completed      bool   `json:"completed"`
+		Compensated    bool   `json:"compensated"`
+		StatusSource   string `json:"statusSource"`
+		StatePersisted bool   `json:"statePersisted"`
+		RuntimeOwner   string `json:"runtimeOwner"`
+	} `json:"workflows"`
 	Status struct {
 		Adapters  int `json:"adapters"`
 		Schedules int `json:"schedules"`
@@ -281,6 +292,15 @@ func runtimeDemoOneBotMessageBody(t *testing.T, messageID int64, rawMessage stri
 func performRuntimeOneBotMessageRequest(t *testing.T, app *runtimeApp, body string) *httptest.ResponseRecorder {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodPost, "/demo/onebot/message", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	app.ServeHTTP(resp, req)
+	return resp
+}
+
+func performRuntimeWorkflowMessageRequest(t *testing.T, app *runtimeApp, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/demo/workflows/message", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	resp := httptest.NewRecorder()
 	app.ServeHTTP(resp, req)
@@ -442,6 +462,15 @@ func hasConsoleSchedule(payload runtimeConsoleResponse, scheduleID string) bool 
 func hasConsoleAdapter(payload runtimeConsoleResponse, adapterID string) bool {
 	for _, adapter := range payload.Adapters {
 		if adapter.ID == adapterID {
+			return true
+		}
+	}
+	return false
+}
+
+func hasConsoleWorkflow(payload runtimeConsoleResponse, workflowID string) bool {
+	for _, workflow := range payload.Workflows {
+		if workflow.ID == workflowID {
 			return true
 		}
 	}
@@ -1157,8 +1186,8 @@ func TestRuntimeAppConsoleReflectsRuntimeState(t *testing.T) {
 			t.Fatalf("expected console payload to include %s, got %s", expected, resp.Body.String())
 		}
 	}
-	if !strings.Contains(resp.Body.String(), `"plugins": 3`) {
-		t.Fatalf("expected console payload to report three registered plugins, got %s", resp.Body.String())
+	if !strings.Contains(resp.Body.String(), `"plugins": 4`) {
+		t.Fatalf("expected console payload to report four registered plugins, got %s", resp.Body.String())
 	}
 	for _, expected := range []string{`"publish": {`, `"sourceType": "git"`, `"sourceUri": "https://github.com/ohmyopencode/bot-platform/tree/main/plugins/plugin-echo"`, `"runtimeVersionRange": "\u003e=0.1.0 \u003c1.0.0"`} {
 		if !strings.Contains(resp.Body.String(), expected) {
@@ -1180,7 +1209,7 @@ func TestRuntimeAppConsoleReflectsRuntimeState(t *testing.T) {
 	if !strings.Contains(resp.Body.String(), `"plugin_read_model": "runtime-registry+sqlite-plugin-status-snapshot"`) {
 		t.Fatalf("expected console payload to include plugin_read_model=runtime-registry+sqlite-plugin-status-snapshot, got %s", resp.Body.String())
 	}
-	for _, expected := range []string{`"plugin_config_state_read_model": "runtime-registry+sqlite-plugin-config"`, `"plugin_config_state_kind": "plugin-owned-persisted-input"`, `"plugin_config_state_persisted": true`, `"plugin_config_operator_actions": [`, `"plugin_config_operator_scope": "plugins with app-local persisted config bindings only"`, `"plugin_enabled_state_read_model": "runtime-registry+sqlite-plugin-enabled-overlay"`, `"plugin_enabled_state_persisted": true`, `"plugin_operator_scope": "already-registered plugins only"`, `"/demo/plugins/{plugin-id}/enable"`, `"/demo/plugins/{plugin-id}/disable"`, `"/demo/plugins/{plugin-id}/config"`, `"/demo/schedules/{schedule-id}/cancel"`, `"console_mode": "read+operator-plugin-enable-disable+plugin-config"`, `"enabled": true`, `"enabledStateSource": "runtime-default-enabled"`, `"enabledStatePersisted": false`, `"configStateKind": "plugin-owned-persisted-input"`, `"configPersisted": false`} {
+	for _, expected := range []string{`"plugin_config_state_read_model": "runtime-registry+sqlite-plugin-config"`, `"plugin_config_state_kind": "plugin-owned-persisted-input"`, `"plugin_config_state_persisted": true`, `"plugin_config_operator_actions": [`, `"plugin_config_operator_scope": "plugins with app-local persisted config bindings only"`, `"plugin_enabled_state_read_model": "runtime-registry+sqlite-plugin-enabled-overlay"`, `"plugin_enabled_state_persisted": true`, `"plugin_operator_scope": "already-registered plugins only"`, `"workflow_read_model": "sqlite-workflow-instances"`, `"workflow_status_source": "sqlite-workflow-instances"`, `"workflow_status_persisted": true`, `"workflow_runtime_owner": "runtime-core"`, `"/demo/plugins/{plugin-id}/enable"`, `"/demo/plugins/{plugin-id}/disable"`, `"/demo/plugins/{plugin-id}/config"`, `"/demo/schedules/{schedule-id}/cancel"`, `"console_mode": "read+operator-plugin-enable-disable+plugin-config"`, `"enabled": true`, `"enabledStateSource": "runtime-default-enabled"`, `"enabledStatePersisted": false`, `"configStateKind": "plugin-owned-persisted-input"`, `"configPersisted": false`} {
 		if !strings.Contains(resp.Body.String(), expected) {
 			t.Fatalf("expected console payload to include %s, got %s", expected, resp.Body.String())
 		}
@@ -1188,6 +1217,7 @@ func TestRuntimeAppConsoleReflectsRuntimeState(t *testing.T) {
 	console := readRuntimeConsoleResponse(t, app)
 	expectedDemoPaths := []string{
 		"/demo/onebot/message",
+		"/demo/workflows/message",
 		"/demo/ai/message",
 		"/demo/jobs/enqueue",
 		"/demo/jobs/timeout",
@@ -1458,8 +1488,8 @@ func TestRuntimeAppReloadsPersistedPluginEchoConfigAfterRestart(t *testing.T) {
 	if !strings.Contains(consoleResp.Body.String(), `"configUpdatedAt":`) {
 		t.Fatalf("expected restarted console payload to include configUpdatedAt, got %s", consoleResp.Body.String())
 	}
-    consoleReq = consoleRequestWithViewer("/api/console")
-    consoleResp = httptest.NewRecorder()
+	consoleReq = consoleRequestWithViewer("/api/console")
+	consoleResp = httptest.NewRecorder()
 	restarted.ServeHTTP(consoleResp, consoleReq)
 	if consoleResp.Code != http.StatusOK {
 		t.Fatalf("expected console 200 after restart, got %d: %s", consoleResp.Code, consoleResp.Body.String())
@@ -1490,6 +1520,91 @@ func TestRuntimeAppReloadsPersistedPluginEchoConfigAfterRestart(t *testing.T) {
 	if !pluginFound {
 		t.Fatalf("expected plugin-echo in restarted console payload, got %+v", console.Plugins)
 	}
+}
+
+func TestRuntimeAppWorkflowDemoPersistsAndRecoversAcrossRestart(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	configPath := writeTestConfigAt(t, dir)
+
+	app, err := newRuntimeApp(configPath)
+	if err != nil {
+		t.Fatalf(`new runtime app: %v`, err)
+	}
+	startResp := performRuntimeWorkflowMessageRequest(t, app, `{"actor_id":"user-1","message":"start workflow"}`)
+	if startResp.Code != http.StatusOK {
+		t.Fatalf(`expected workflow start 200, got %d: %s`, startResp.Code, startResp.Body.String())
+	}
+	if !strings.Contains(startResp.Body.String(), `workflow started, please send another message to continue`) {
+		t.Fatalf(`expected workflow start reply, got %s`, startResp.Body.String())
+	}
+	started, err := app.state.LoadWorkflowInstance(t.Context(), `workflow-user-1`)
+	if err != nil {
+		t.Fatalf(`load started workflow instance: %v`, err)
+	}
+	if started.PluginID != `plugin-workflow-demo` || started.Status != runtimecore.WorkflowRuntimeStatusWaitingEvent {
+		t.Fatalf(`expected waiting persisted workflow after first request, got %+v`, started)
+	}
+	if started.Workflow.WaitingFor != `message.received` || started.Workflow.State[`greeting`] != `start workflow` || started.Workflow.Completed {
+		t.Fatalf(`expected workflow runtime to persist waiting state after first request, got %+v`, started.Workflow)
+	}
+	if err := app.Close(); err != nil {
+		t.Fatalf(`close first app: %v`, err)
+	}
+
+	restarted, err := newRuntimeApp(configPath)
+	if err != nil {
+		t.Fatalf(`restart runtime app: %v`, err)
+	}
+	defer func() { _ = restarted.Close() }()
+	recovery := restarted.workflowRuntime.LastRecoverySnapshot()
+	if recovery.TotalWorkflows != 1 || recovery.RecoveredWorkflows != 1 || recovery.StatusCounts[runtimecore.WorkflowRuntimeStatusWaitingEvent] != 1 {
+		t.Fatalf(`expected workflow runtime recovery snapshot after restart, got %+v`, recovery)
+	}
+	resumeResp := performRuntimeWorkflowMessageRequest(t, restarted, `{"actor_id":"user-1","message":"continue"}`)
+	if resumeResp.Code != http.StatusOK {
+		t.Fatalf(`expected workflow resume 200, got %d: %s`, resumeResp.Code, resumeResp.Body.String())
+	}
+	if !strings.Contains(resumeResp.Body.String(), `workflow resumed and completed`) {
+		t.Fatalf(`expected workflow resume reply, got %s`, resumeResp.Body.String())
+	}
+	completed, err := restarted.state.LoadWorkflowInstance(t.Context(), `workflow-user-1`)
+	if err != nil {
+		t.Fatalf(`load completed workflow instance: %v`, err)
+	}
+	if completed.Status != runtimecore.WorkflowRuntimeStatusCompleted || !completed.Workflow.Completed || !completed.Workflow.Compensated {
+		t.Fatalf(`expected completed persisted workflow after restart resume, got %+v`, completed)
+	}
+	consoleReq := httptest.NewRequest(http.MethodGet, "/api/console", nil)
+	consoleResp := httptest.NewRecorder()
+	restarted.ServeHTTP(consoleResp, consoleReq)
+	if consoleResp.Code != http.StatusOK {
+		t.Fatalf(`expected console 200 after workflow recovery, got %d: %s`, consoleResp.Code, consoleResp.Body.String())
+	}
+	if !strings.Contains(consoleResp.Body.String(), `"workflow_read_model": "sqlite-workflow-instances"`) {
+		t.Fatalf(`expected console meta to expose workflow read model, got %s`, consoleResp.Body.String())
+	}
+	var console runtimeConsoleResponse
+	if err := json.Unmarshal(consoleResp.Body.Bytes(), &console); err != nil {
+		t.Fatalf(`decode console payload: %v`, err)
+	}
+	if !hasConsoleWorkflow(console, `workflow-user-1`) {
+		t.Fatalf(`expected console payload to expose persisted workflow instance, got %+v`, console.Workflows)
+	}
+	for _, workflow := range console.Workflows {
+		if workflow.ID != `workflow-user-1` {
+			continue
+		}
+		if workflow.PluginID != `plugin-workflow-demo` || workflow.Status != `completed` || !workflow.Completed || !workflow.Compensated {
+			t.Fatalf(`expected completed workflow facts in console payload, got %+v`, workflow)
+		}
+		if workflow.StatusSource != `sqlite-workflow-instances` || !workflow.StatePersisted || workflow.RuntimeOwner != `runtime-core` {
+			t.Fatalf(`expected workflow console provenance metadata, got %+v`, workflow)
+		}
+		return
+	}
+	t.Fatalf(`expected workflow-user-1 in console payload, got %+v`, console.Workflows)
 }
 
 func TestRuntimeAppConsoleReturnsForbiddenWhenConsoleReadAuthorizationDenies(t *testing.T) {
@@ -3097,8 +3212,8 @@ func TestRuntimeAppConsoleReadsPersistedAdapterInstanceAfterRestart(t *testing.T
 	if adapter.Adapter != "onebot" || adapter.Source != "onebot" || adapter.Status != "registered" || adapter.Health != "ready" || !adapter.Online || !adapter.StatePersisted {
 		t.Fatalf("expected restarted console adapter facts, got %+v", adapter)
 	}
-    consoleReq = consoleRequestWithViewer("/api/console")
-    consoleResp = httptest.NewRecorder()
+	consoleReq = consoleRequestWithViewer("/api/console")
+	consoleResp = httptest.NewRecorder()
 	restarted.ServeHTTP(consoleResp, consoleReq)
 	for _, expected := range []string{`"id": "adapter-onebot-demo"`, `"adapter": "onebot"`, `"status": "registered"`, `"health": "ready"`, `"online": true`, `"statePersisted": true`, `"adapter_read_model": "sqlite-adapter-instances"`} {
 		if !strings.Contains(consoleResp.Body.String(), expected) {
@@ -3187,8 +3302,8 @@ func TestRuntimeAppLoadsConfiguredBotInstancesAndExposesThemAfterRestart(t *test
 	if _, exists := beta.Config["self_id"]; exists {
 		t.Fatalf("expected beta config to omit optional self_id, got %+v", beta.Config)
 	}
-    consoleReq = consoleRequestWithViewer("/api/console")
-    consoleResp = httptest.NewRecorder()
+	consoleReq = consoleRequestWithViewer("/api/console")
+	consoleResp = httptest.NewRecorder()
 	restarted.ServeHTTP(consoleResp, consoleReq)
 	for _, expected := range []string{`"id": "adapter-onebot-alpha"`, `"id": "adapter-onebot-beta"`, `"source": "onebot-alpha"`, `"source": "onebot-beta"`, `"demo_path": "/demo/onebot/message"`, `"demo_path": "/demo/onebot/message-beta"`, `"self_id": 10001`, `"adapter_read_model": "sqlite-adapter-instances"`} {
 		if !strings.Contains(consoleResp.Body.String(), expected) {
@@ -3230,7 +3345,7 @@ func TestRuntimeAppRestoresPersistedDelayScheduleAfterRestart(t *testing.T) {
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-        restarted.queue.DispatchReady(t.Context(), time.Now().UTC())
+		restarted.queue.DispatchReady(t.Context(), time.Now().UTC())
 		repliesReq := httptest.NewRequest(http.MethodGet, "/demo/replies", nil)
 		repliesResp := httptest.NewRecorder()
 		restarted.ServeHTTP(repliesResp, repliesReq)
@@ -3624,7 +3739,7 @@ func TestRuntimeAppAIQueueDispatcherUsesRuntimeDispatchPath(t *testing.T) {
 	jobID := extractAIJobID(resp.Body.String())
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-        app.queue.DispatchReady(t.Context(), time.Now().UTC())
+		app.queue.DispatchReady(t.Context(), time.Now().UTC())
 		stored, inspectErr := app.queue.Inspect(t.Context(), jobID)
 		if inspectErr == nil && stored.Status == runtimecore.JobStatusDone {
 			entries := app.logs.Lines()
@@ -3657,7 +3772,7 @@ func TestRuntimeAppInvalidAIReplyHandleTransitionsJobOutOfPending(t *testing.T) 
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-        app.queue.DispatchReady(t.Context(), time.Now().UTC())
+		app.queue.DispatchReady(t.Context(), time.Now().UTC())
 		stored, inspectErr := app.queue.Inspect(t.Context(), job.ID)
 		if inspectErr != nil {
 			t.Fatalf("inspect ai job: %v", inspectErr)
@@ -3700,7 +3815,7 @@ func TestRuntimeAppDispatchFailureTransitionsAIJobOutOfPending(t *testing.T) {
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-        app.queue.DispatchReady(t.Context(), time.Now().UTC())
+		app.queue.DispatchReady(t.Context(), time.Now().UTC())
 		stored, inspectErr := app.queue.Inspect(t.Context(), job.ID)
 		if inspectErr != nil {
 			t.Fatalf("inspect ai job: %v", inspectErr)
@@ -3859,7 +3974,7 @@ func TestRuntimeAppAIMessageFailureFeedback(t *testing.T) {
 	jobID := extractAIJobID(resp.Body.String())
 	deadline := time.Now().Add(2500 * time.Millisecond)
 	for time.Now().Before(deadline) {
-        app.queue.DispatchReady(t.Context(), time.Now().UTC())
+		app.queue.DispatchReady(t.Context(), time.Now().UTC())
 		repliesReq := httptest.NewRequest(http.MethodGet, "/demo/replies", nil)
 		repliesResp := httptest.NewRecorder()
 		app.ServeHTTP(repliesResp, repliesReq)
@@ -4243,5 +4358,3 @@ func extractAIJobID(raw string) string {
 	_ = json.Unmarshal([]byte(raw), &payload)
 	return payload.JobID
 }
-
-

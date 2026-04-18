@@ -4,10 +4,13 @@ go 1.25.0
 
 require (
 	github.com/ohmyopencode/bot-platform/adapters/adapter-onebot v0.0.0
+	github.com/ohmyopencode/bot-platform/packages/event-model v0.0.0
+	github.com/ohmyopencode/bot-platform/packages/plugin-sdk v0.0.0
 	github.com/ohmyopencode/bot-platform/packages/runtime-core v0.0.0
+	github.com/ohmyopencode/bot-platform/plugins/plugin-admin v0.0.0
 	github.com/ohmyopencode/bot-platform/plugins/plugin-ai-chat v0.0.0
 	github.com/ohmyopencode/bot-platform/plugins/plugin-echo v0.0.0
-	gopkg.in/yaml.v3 v3.0.1
+	github.com/ohmyopencode/bot-platform/plugins/plugin-workflow-demo v0.0.0
 )
 
 require (
@@ -24,6 +27,7 @@ require (
 	golang.org/x/sync v0.19.0 // indirect
 	golang.org/x/sys v0.42.0 // indirect
 	golang.org/x/text v0.34.0 // indirect
+	gopkg.in/yaml.v3 v3.0.1 // indirect
 	modernc.org/libc v1.70.0 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
@@ -32,8 +36,16 @@ require (
 
 replace github.com/ohmyopencode/bot-platform/adapters/adapter-onebot => ../../adapters/adapter-onebot
 
+replace github.com/ohmyopencode/bot-platform/packages/event-model => ../../packages/event-model
+
+replace github.com/ohmyopencode/bot-platform/packages/plugin-sdk => ../../packages/plugin-sdk
+
 replace github.com/ohmyopencode/bot-platform/packages/runtime-core => ../../packages/runtime-core
+
+replace github.com/ohmyopencode/bot-platform/plugins/plugin-admin => ../../plugins/plugin-admin
 
 replace github.com/ohmyopencode/bot-platform/plugins/plugin-ai-chat => ../../plugins/plugin-ai-chat
 
 replace github.com/ohmyopencode/bot-platform/plugins/plugin-echo => ../../plugins/plugin-echo
+
+replace github.com/ohmyopencode/bot-platform/plugins/plugin-workflow-demo => ../../plugins/plugin-workflow-demo

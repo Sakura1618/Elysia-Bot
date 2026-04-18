@@ -301,6 +301,62 @@ func TestConsoleAPIExposesPersistedPluginEnabledOverlay(t *testing.T) {
 	}
 }
 
+func TestConsoleAPIExposesPersistedWorkflowInstances(t *testing.T) {
+	t.Parallel()
+
+	store := openTempSQLiteStore(t)
+	defer func() { _ = store.Close() }()
+	workflow := NewWorkflow(
+		`workflow-user-1`,
+		WorkflowStep{Kind: WorkflowStepKindPersist, Name: `greeting`, Value: `hello`},
+		WorkflowStep{Kind: WorkflowStepKindWaitEvent, Name: `wait-confirm`, Value: `message.received`},
+	)
+	workflow.State[`greeting`] = `hello`
+	workflow.CurrentIndex = 1
+	workflow.WaitingFor = `message.received`
+	if err := store.SaveWorkflowInstance(context.Background(), WorkflowInstanceState{
+		WorkflowID:    `workflow-user-1`,
+		PluginID:      `plugin-workflow-demo`,
+		Status:        WorkflowRuntimeStatusWaitingEvent,
+		Workflow:      workflow,
+		LastEventID:   `evt-1`,
+		LastEventType: `message.received`,
+		CreatedAt:     time.Date(2026, 4, 19, 9, 0, 0, 0, time.UTC),
+		UpdatedAt:     time.Date(2026, 4, 19, 9, 1, 0, 0, time.UTC),
+	}); err != nil {
+		t.Fatalf(`save workflow instance: %v`, err)
+	}
+
+	api := NewConsoleAPI(NewInMemoryRuntime(NoopSupervisor{}, DirectPluginHost{}), nil, Config{}, nil, nil)
+	api.SetWorkflowReader(NewSQLiteConsoleWorkflowReader(store))
+	workflows, err := api.Workflows()
+	if err != nil {
+		t.Fatalf(`console workflows: %v`, err)
+	}
+	if len(workflows) != 1 {
+		t.Fatalf(`expected one workflow in console payload, got %+v`, workflows)
+	}
+	workflowItem := workflows[0]
+	if workflowItem.ID != `workflow-user-1` || workflowItem.PluginID != `plugin-workflow-demo` || workflowItem.Status != string(WorkflowRuntimeStatusWaitingEvent) {
+		t.Fatalf(`expected persisted workflow identity/status in console payload, got %+v`, workflowItem)
+	}
+	if !workflowItem.StatePersisted || workflowItem.StatusSource != `sqlite-workflow-instances` || workflowItem.RuntimeOwner != `runtime-core` {
+		t.Fatalf(`expected workflow console provenance metadata, got %+v`, workflowItem)
+	}
+	if workflowItem.WaitingFor != `message.received` || workflowItem.State[`greeting`] != `hello` {
+		t.Fatalf(`expected persisted workflow read-side fields, got %+v`, workflowItem)
+	}
+	rendered, err := api.RenderJSON()
+	if err != nil {
+		t.Fatalf(`render console json: %v`, err)
+	}
+	for _, expected := range []string{`"workflows": [`, `"id": "workflow-user-1"`, `"pluginId": "plugin-workflow-demo"`, `"status": "waiting_event"`, `"statusSource": "sqlite-workflow-instances"`, `"runtimeOwner": "runtime-core"`} {
+		if !strings.Contains(rendered, expected) {
+			t.Fatalf(`expected rendered console payload to contain %q, got %s`, expected, rendered)
+		}
+	}
+}
+
 func TestConsoleAPIExposesPersistedPluginConfigStateForPluginEcho(t *testing.T) {
 	t.Parallel()
 

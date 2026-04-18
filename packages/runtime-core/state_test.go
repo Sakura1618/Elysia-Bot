@@ -1048,3 +1048,64 @@ func openTempSQLiteStore(t *testing.T) *SQLiteStateStore {
 	}
 	return store
 }
+
+func TestSQLiteStateStorePersistsWorkflowInstancesAcrossReopen(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), `state.db`)
+	ctx := context.Background()
+	workflow := NewWorkflow(
+		`workflow-user-1`,
+		WorkflowStep{Kind: WorkflowStepKindPersist, Name: `greeting`, Value: `hello`},
+		WorkflowStep{Kind: WorkflowStepKindWaitEvent, Name: `wait-confirm`, Value: `message.received`},
+	)
+	workflow.State[`greeting`] = `hello`
+	workflow.CurrentIndex = 1
+	workflow.WaitingFor = `message.received`
+	createdAt := time.Date(2026, 4, 19, 10, 0, 0, 0, time.UTC)
+	updatedAt := createdAt.Add(time.Minute)
+
+	store, err := OpenSQLiteStateStore(path)
+	if err != nil {
+		t.Fatalf(`open store: %v`, err)
+	}
+	if err := store.SaveWorkflowInstance(ctx, WorkflowInstanceState{
+		WorkflowID:    `workflow-user-1`,
+		PluginID:      `plugin-workflow-demo`,
+		Status:        WorkflowRuntimeStatusWaitingEvent,
+		Workflow:      workflow,
+		LastEventID:   `evt-1`,
+		LastEventType: `message.received`,
+		CreatedAt:     createdAt,
+		UpdatedAt:     updatedAt,
+	}); err != nil {
+		t.Fatalf(`save workflow instance: %v`, err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf(`close store: %v`, err)
+	}
+
+	reopened, err := OpenSQLiteStateStore(path)
+	if err != nil {
+		t.Fatalf(`reopen store: %v`, err)
+	}
+	defer func() { _ = reopened.Close() }()
+
+	loaded, err := reopened.LoadWorkflowInstance(ctx, `workflow-user-1`)
+	if err != nil {
+		t.Fatalf(`load workflow instance: %v`, err)
+	}
+	if loaded.WorkflowID != `workflow-user-1` || loaded.PluginID != `plugin-workflow-demo` || loaded.Status != WorkflowRuntimeStatusWaitingEvent {
+		t.Fatalf(`expected persisted workflow identity/state after reopen, got %+v`, loaded)
+	}
+	if loaded.Workflow.WaitingFor != `message.received` || loaded.Workflow.State[`greeting`] != `hello` || loaded.LastEventID != `evt-1` || loaded.LastEventType != `message.received` {
+		t.Fatalf(`expected persisted workflow fields after reopen, got %+v`, loaded)
+	}
+	instances, err := reopened.ListWorkflowInstances(ctx)
+	if err != nil {
+		t.Fatalf(`list workflow instances: %v`, err)
+	}
+	if len(instances) != 1 || instances[0].WorkflowID != `workflow-user-1` {
+		t.Fatalf(`expected one persisted workflow instance, got %+v`, instances)
+	}
+}

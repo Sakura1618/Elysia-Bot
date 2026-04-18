@@ -179,6 +179,19 @@ CREATE TABLE IF NOT EXISTS rollout_operation_records (
 
 const CurrentRBACSnapshotKey = "current"
 
+const sqliteWorkflowInstancesSchema = `
+CREATE TABLE IF NOT EXISTS workflow_instances (
+  workflow_id TEXT PRIMARY KEY,
+  plugin_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  workflow_json TEXT NOT NULL,
+  last_event_id TEXT NOT NULL,
+  last_event_type TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+`
+
 type SQLiteStateStore struct {
 	db *sql.DB
 }
@@ -335,6 +348,112 @@ func (s *SQLiteStateStore) Init(ctx context.Context) error {
 
 func (s *SQLiteStateStore) Close() error {
 	return s.db.Close()
+}
+
+func (s *SQLiteStateStore) SaveWorkflowInstance(ctx context.Context, instance WorkflowInstanceState) error {
+	if s == nil {
+		return fmt.Errorf(`save workflow instance: sqlite state store is required`)
+	}
+	if err := s.ensureWorkflowInstanceTable(ctx); err != nil {
+		return err
+	}
+	instance.WorkflowID = strings.TrimSpace(instance.WorkflowID)
+	instance.PluginID = strings.TrimSpace(instance.PluginID)
+	if instance.WorkflowID == `` {
+		return fmt.Errorf(`save workflow instance: workflow id is required`)
+	}
+	if instance.PluginID == `` {
+		return fmt.Errorf(`save workflow instance: plugin id is required`)
+	}
+	instance.Workflow.ID = instance.WorkflowID
+	if strings.TrimSpace(string(instance.Status)) == `` {
+		instance.Status = workflowRuntimeStatus(instance.Workflow)
+	}
+	createdAt := instance.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = time.Now().UTC()
+	}
+	updatedAt := instance.UpdatedAt
+	if updatedAt.IsZero() {
+		updatedAt = createdAt
+	}
+	payload, err := json.Marshal(cloneWorkflow(instance.Workflow))
+	if err != nil {
+		return fmt.Errorf(`marshal workflow instance: %w`, err)
+	}
+	_, err = s.db.ExecContext(ctx, `
+INSERT INTO workflow_instances (
+  workflow_id, plugin_id, status, workflow_json, last_event_id, last_event_type, created_at, updated_at
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(workflow_id) DO UPDATE SET
+  plugin_id=excluded.plugin_id,
+  status=excluded.status,
+  workflow_json=excluded.workflow_json,
+  last_event_id=excluded.last_event_id,
+  last_event_type=excluded.last_event_type,
+  created_at=excluded.created_at,
+  updated_at=excluded.updated_at
+`, instance.WorkflowID, instance.PluginID, string(instance.Status), string(payload), strings.TrimSpace(instance.LastEventID), strings.TrimSpace(instance.LastEventType), formatSQLiteTimestamp(createdAt), formatSQLiteTimestamp(updatedAt))
+	if err != nil {
+		return fmt.Errorf(`upsert workflow instance: %w`, err)
+	}
+	return nil
+}
+
+func (s *SQLiteStateStore) LoadWorkflowInstance(ctx context.Context, workflowID string) (WorkflowInstanceState, error) {
+	if s == nil {
+		return WorkflowInstanceState{}, fmt.Errorf(`load workflow instance: sqlite state store is required`)
+	}
+	if err := s.ensureWorkflowInstanceTable(ctx); err != nil {
+		return WorkflowInstanceState{}, err
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT workflow_id, plugin_id, status, workflow_json, last_event_id, last_event_type, created_at, updated_at
+FROM workflow_instances
+WHERE workflow_id = ?
+`, strings.TrimSpace(workflowID))
+	if err != nil {
+		return WorkflowInstanceState{}, fmt.Errorf(`load workflow instance: %w`, err)
+	}
+	defer rows.Close()
+	instances, err := scanWorkflowInstances(rows)
+	if err != nil {
+		return WorkflowInstanceState{}, err
+	}
+	if len(instances) == 0 {
+		return WorkflowInstanceState{}, sql.ErrNoRows
+	}
+	return instances[0], nil
+}
+
+func (s *SQLiteStateStore) ListWorkflowInstances(ctx context.Context) ([]WorkflowInstanceState, error) {
+	if s == nil {
+		return nil, nil
+	}
+	if err := s.ensureWorkflowInstanceTable(ctx); err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT workflow_id, plugin_id, status, workflow_json, last_event_id, last_event_type, created_at, updated_at
+FROM workflow_instances
+ORDER BY created_at ASC, workflow_id ASC
+`)
+	if err != nil {
+		return nil, fmt.Errorf(`list workflow instances: %w`, err)
+	}
+	defer rows.Close()
+	return scanWorkflowInstances(rows)
+}
+
+func (s *SQLiteStateStore) ensureWorkflowInstanceTable(ctx context.Context) error {
+	if s == nil {
+		return fmt.Errorf(`ensure workflow instance table: sqlite state store is required`)
+	}
+	if _, err := s.db.ExecContext(ctx, sqliteWorkflowInstancesSchema); err != nil {
+		return fmt.Errorf(`ensure workflow instance table: %w`, err)
+	}
+	return nil
 }
 
 func (s *SQLiteStateStore) RecordEvent(ctx context.Context, event eventmodel.Event) error {
@@ -1874,6 +1993,45 @@ func scanAlerts(rows *sql.Rows) ([]AlertRecord, error) {
 
 func formatSQLiteTimestamp(value time.Time) string {
 	return value.UTC().Format(time.RFC3339Nano)
+}
+
+func scanWorkflowInstances(rows *sql.Rows) ([]WorkflowInstanceState, error) {
+	instances := make([]WorkflowInstanceState, 0)
+	for rows.Next() {
+		var (
+			instance     WorkflowInstanceState
+			status       string
+			workflowJSON string
+			createdAtRaw string
+			updatedAtRaw string
+		)
+		if err := rows.Scan(&instance.WorkflowID, &instance.PluginID, &status, &workflowJSON, &instance.LastEventID, &instance.LastEventType, &createdAtRaw, &updatedAtRaw); err != nil {
+			return nil, fmt.Errorf(`scan workflow instance: %w`, err)
+		}
+		instance.Status = WorkflowRuntimeStatus(strings.TrimSpace(status))
+		if err := json.Unmarshal([]byte(workflowJSON), &instance.Workflow); err != nil {
+			return nil, fmt.Errorf(`unmarshal workflow instance: %w`, err)
+		}
+		instance.Workflow.ID = instance.WorkflowID
+		if strings.TrimSpace(string(instance.Status)) == `` {
+			instance.Status = workflowRuntimeStatus(instance.Workflow)
+		}
+		createdAt, err := parseSQLiteTimestamp(createdAtRaw)
+		if err != nil {
+			return nil, fmt.Errorf(`parse workflow instance created_at: %w`, err)
+		}
+		instance.CreatedAt = createdAt
+		updatedAt, err := parseSQLiteTimestamp(updatedAtRaw)
+		if err != nil {
+			return nil, fmt.Errorf(`parse workflow instance updated_at: %w`, err)
+		}
+		instance.UpdatedAt = updatedAt
+		instances = append(instances, instance)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf(`iterate workflow instances: %w`, err)
+	}
+	return instances, nil
 }
 
 func nullableSQLiteTimestamp(value *time.Time) any {

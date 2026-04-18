@@ -21,6 +21,7 @@ type ConsoleAPI struct {
 	replayOps        consoleReplayOperationReader
 	rolloutOps       consoleRolloutOperationReader
 	schedules        consoleScheduleReader
+	workflows        consoleWorkflowReader
 	adapterInstances consoleAdapterInstanceReader
 	pluginSnapshots  consolePluginSnapshotReader
 	pluginEnabled    consolePluginEnabledStateReader
@@ -232,6 +233,10 @@ type consoleScheduleReader interface {
 	ListSchedulePlans() ([]ConsoleSchedule, error)
 }
 
+type consoleWorkflowReader interface {
+	ListWorkflowInstances() ([]WorkflowInstanceState, error)
+}
+
 type consoleAdapterInstanceReader interface {
 	ListAdapterInstances() ([]AdapterInstanceState, error)
 }
@@ -273,6 +278,26 @@ type ConsoleSchedule struct {
 	UpdatedAt       time.Time  `json:"updatedAt"`
 }
 
+type ConsoleWorkflow struct {
+	ID             string         `json:"id"`
+	PluginID       string         `json:"pluginId"`
+	Status         string         `json:"status"`
+	CurrentIndex   int            `json:"currentIndex"`
+	WaitingFor     string         `json:"waitingFor,omitempty"`
+	SleepingUntil  *time.Time     `json:"sleepingUntil,omitempty"`
+	Completed      bool           `json:"completed"`
+	Compensated    bool           `json:"compensated"`
+	State          map[string]any `json:"state,omitempty"`
+	LastEventID    string         `json:"lastEventId,omitempty"`
+	LastEventType  string         `json:"lastEventType,omitempty"`
+	StatusSource   string         `json:"statusSource,omitempty"`
+	StatePersisted bool           `json:"statePersisted"`
+	RuntimeOwner   string         `json:"runtimeOwner,omitempty"`
+	CreatedAt      time.Time      `json:"createdAt"`
+	UpdatedAt      time.Time      `json:"updatedAt"`
+	Summary        string         `json:"summary,omitempty"`
+}
+
 const (
 	scheduleDueAtEvidencePersisted        = "persisted-schedule-due-at"
 	scheduleDueAtEvidenceRecoveredStartup = "recovered-schedule-due-at"
@@ -300,6 +325,10 @@ type sqliteConsolePluginConfigReader struct {
 }
 
 type sqliteConsoleJobReader struct {
+	store *SQLiteStateStore
+}
+
+type sqliteConsoleWorkflowReader struct {
 	store *SQLiteStateStore
 }
 
@@ -362,6 +391,13 @@ func NewSQLiteConsoleScheduleReader(store *SQLiteStateStore) consoleScheduleRead
 	return sqliteConsoleScheduleReader{store: store}
 }
 
+func NewSQLiteConsoleWorkflowReader(store *SQLiteStateStore) consoleWorkflowReader {
+	if store == nil {
+		return nil
+	}
+	return sqliteConsoleWorkflowReader{store: store}
+}
+
 func NewSQLiteConsoleAdapterInstanceReader(store *SQLiteStateStore) consoleAdapterInstanceReader {
 	if store == nil {
 		return nil
@@ -392,6 +428,10 @@ func NewSQLiteConsolePluginConfigReader(store *SQLiteStateStore) consolePluginCo
 
 func (c *ConsoleAPI) SetScheduleReader(reader consoleScheduleReader) {
 	c.schedules = reader
+}
+
+func (c *ConsoleAPI) SetWorkflowReader(reader consoleWorkflowReader) {
+	c.workflows = reader
 }
 
 func (c *ConsoleAPI) SetAdapterInstanceReader(reader consoleAdapterInstanceReader) {
@@ -1091,6 +1131,21 @@ func (c *ConsoleAPI) Schedules() ([]ConsoleSchedule, error) {
 	return plans, nil
 }
 
+func (c *ConsoleAPI) Workflows() ([]ConsoleWorkflow, error) {
+	if c.workflows == nil {
+		return []ConsoleWorkflow{}, nil
+	}
+	loaded, err := c.workflows.ListWorkflowInstances()
+	if err != nil {
+		return nil, fmt.Errorf(`load console workflows: %w`, err)
+	}
+	items := make([]ConsoleWorkflow, 0, len(loaded))
+	for _, instance := range loaded {
+		items = append(items, toConsoleWorkflow(instance))
+	}
+	return items, nil
+}
+
 func (c *ConsoleAPI) Status() (RuntimeStatus, error) {
 	status := RuntimeStatus{}
 	if c.runtime != nil {
@@ -1139,6 +1194,10 @@ func (c *ConsoleAPI) renderJSONWithFilters(logQuery, jobQuery, pluginID string) 
 	if err != nil {
 		return "", err
 	}
+	workflows, err := c.Workflows()
+	if err != nil {
+		return "", err
+	}
 	status, err := c.Status()
 	if err != nil {
 		return "", err
@@ -1151,6 +1210,7 @@ func (c *ConsoleAPI) renderJSONWithFilters(logQuery, jobQuery, pluginID string) 
 		"plugins":       c.FilteredPlugins(pluginID),
 		"jobs":          jobs,
 		"schedules":     schedules,
+		"workflows":     workflows,
 		"logs":          c.Logs(logQuery),
 		"audits":        c.Audits(),
 		"config":        c.Config(),
@@ -1208,6 +1268,50 @@ func (r sqliteConsoleScheduleReader) ListSchedulePlans() ([]ConsoleSchedule, err
 		})
 	}
 	return items, nil
+}
+
+func (r sqliteConsoleWorkflowReader) ListWorkflowInstances() ([]WorkflowInstanceState, error) {
+	if r.store == nil {
+		return nil, nil
+	}
+	return r.store.ListWorkflowInstances(context.Background())
+}
+
+func toConsoleWorkflow(instance WorkflowInstanceState) ConsoleWorkflow {
+	item := ConsoleWorkflow{
+		ID:             instance.WorkflowID,
+		PluginID:       instance.PluginID,
+		Status:         string(instance.Status),
+		CurrentIndex:   instance.Workflow.CurrentIndex,
+		WaitingFor:     instance.Workflow.WaitingFor,
+		Completed:      instance.Workflow.Completed,
+		Compensated:    instance.Workflow.Compensated,
+		State:          cloneWorkflowStateMap(instance.Workflow.State),
+		LastEventID:    instance.LastEventID,
+		LastEventType:  instance.LastEventType,
+		StatusSource:   `sqlite-workflow-instances`,
+		StatePersisted: true,
+		RuntimeOwner:   `runtime-core`,
+		CreatedAt:      instance.CreatedAt,
+		UpdatedAt:      instance.UpdatedAt,
+	}
+	if instance.Workflow.SleepingUntil != nil {
+		sleepingUntil := instance.Workflow.SleepingUntil.UTC()
+		item.SleepingUntil = &sleepingUntil
+	}
+	item.Summary = consoleWorkflowSummary(item)
+	return item
+}
+
+func consoleWorkflowSummary(item ConsoleWorkflow) string {
+	summary := fmt.Sprintf(`workflow %s for %s is %s via %s`, item.ID, item.PluginID, item.Status, item.StatusSource)
+	if item.WaitingFor != `` {
+		summary += `; waiting_for=` + item.WaitingFor
+	}
+	if item.StatePersisted {
+		summary += `; persisted state survives restart`
+	}
+	return summary
 }
 
 func consoleScheduleSummary(eventType string, kind string, dueAt *time.Time, dueReady bool, dueAtEvidence string, claimOwner string, claimedAt *time.Time) string {

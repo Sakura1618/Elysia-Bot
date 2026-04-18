@@ -23,6 +23,7 @@ import (
 	pluginadmin "github.com/ohmyopencode/bot-platform/plugins/plugin-admin"
 	pluginaichat "github.com/ohmyopencode/bot-platform/plugins/plugin-ai-chat"
 	pluginecho "github.com/ohmyopencode/bot-platform/plugins/plugin-echo"
+	pluginworkflowdemo "github.com/ohmyopencode/bot-platform/plugins/plugin-workflow-demo"
 )
 
 type runtimeApp struct {
@@ -44,6 +45,7 @@ type runtimeApp struct {
 	lifecycle       *runtimecore.PluginLifecycleService
 	queue           *runtimecore.JobQueue
 	scheduler       *runtimecore.Scheduler
+	workflowRuntime *runtimecore.WorkflowRuntime
 	schedulerCancel context.CancelFunc
 	authorizer      *runtimecore.CurrentRBACAuthorizerProvider
 	consoleMeta     map[string]any
@@ -471,6 +473,12 @@ func newRuntimeAppWithOutput(configPath string, output io.Writer) (*runtimeApp, 
 	scheduler := runtimecore.NewScheduler()
 	scheduler.SetObservability(logger, tracer, metrics)
 	scheduler.SetStore(state)
+	workflowRuntime := runtimecore.NewWorkflowRuntime(state)
+	if err := workflowRuntime.Restore(context.Background()); err != nil {
+		_ = smokeStore.Close()
+		_ = state.Close()
+		return nil, fmt.Errorf("restore workflow runtime: %w", err)
+	}
 
 	runtime := runtimecore.NewInMemoryRuntime(runtimecore.NoopSupervisor{}, runtimecore.DirectPluginHost{})
 	runtime.SetObservability(logger, tracer, metrics)
@@ -546,7 +554,7 @@ func newRuntimeAppWithOutput(configPath string, output io.Writer) (*runtimeApp, 
 	rolloutManager := runtimecore.NewSQLiteRolloutManager(sqlitePluginManifestReader{store: state}, sqliteStaticCandidateManifestReader{manifests: map[string]pluginsdk.PluginManifest{
 		echoDefinition.Manifest.ID: nextRuntimeCandidateManifest(echoDefinition.Manifest),
 		aiDefinition.Manifest.ID:   nextRuntimeCandidateManifest(aiDefinition.Manifest),
-		"plugin-admin":            nextRuntimeCandidateManifest(pluginsdk.PluginManifest{ID: "plugin-admin", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess}),
+		"plugin-admin":             nextRuntimeCandidateManifest(pluginsdk.PluginManifest{ID: "plugin-admin", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess}),
 	}}, state)
 	adminPlugin := pluginadmin.New(lifecycle, rolloutManager, replayService, authorizerProvider, actorRoles(config.RBAC), policies(config.RBAC), audits)
 	adminDefinition := adminPlugin.Definition()
@@ -559,6 +567,19 @@ func newRuntimeAppWithOutput(configPath string, output io.Writer) (*runtimeApp, 
 		_ = smokeStore.Close()
 		_ = state.Close()
 		return nil, fmt.Errorf("save admin plugin manifest: %w", err)
+	}
+	workflowPlugin := pluginworkflowdemo.New(replies, workflowRuntime)
+	workflowDefinition := workflowPlugin.Definition()
+	workflowDefinition.Handlers.Event = sourceScopedEventHandler{allowed: allowedSources("runtime-workflow-demo"), inner: workflowPlugin}
+	if err := runtime.RegisterPlugin(workflowDefinition); err != nil {
+		_ = smokeStore.Close()
+		_ = state.Close()
+		return nil, fmt.Errorf("register workflow plugin: %w", err)
+	}
+	if err := state.SavePluginManifest(context.Background(), workflowDefinition.Manifest); err != nil {
+		_ = smokeStore.Close()
+		_ = state.Close()
+		return nil, fmt.Errorf("save workflow plugin manifest: %w", err)
 	}
 	botInstances := configuredBotInstances(settings)
 	for _, instance := range botInstances {
@@ -589,29 +610,31 @@ func newRuntimeAppWithOutput(configPath string, output io.Writer) (*runtimeApp, 
 	onebotIngress.SetObservability(tracer)
 
 	app := &runtimeApp{
-		config:        config,
-		settings:      settings,
-		runtime:       runtime,
-		runtimeRaw:    runtime,
-		logger:        logger,
-		tracer:        tracer,
-		metrics:       metrics,
-		logs:          logs,
-		replies:       replies,
-		onebotIngress: onebotIngress,
-		audits:        audits,
-		state:         state,
-		smokeStore:    smokeStore,
-		replay:        replayService,
-		pluginConfigs: pluginConfigs,
-		lifecycle:     lifecycle,
-		queue:         queue,
-		scheduler:     scheduler,
-		authorizer:    authorizerProvider,
+		config:          config,
+		settings:        settings,
+		runtime:         runtime,
+		runtimeRaw:      runtime,
+		logger:          logger,
+		tracer:          tracer,
+		metrics:         metrics,
+		logs:            logs,
+		replies:         replies,
+		onebotIngress:   onebotIngress,
+		audits:          audits,
+		state:           state,
+		smokeStore:      smokeStore,
+		replay:          replayService,
+		pluginConfigs:   pluginConfigs,
+		lifecycle:       lifecycle,
+		queue:           queue,
+		scheduler:       scheduler,
+		workflowRuntime: workflowRuntime,
+		authorizer:      authorizerProvider,
 		consoleMeta: map[string]any{
 			"runtime_entry": "apps/runtime",
 			"demo_paths": []string{
 				"/demo/onebot/message",
+				"/demo/workflows/message",
 				"/demo/ai/message",
 				"/demo/jobs/enqueue",
 				"/demo/jobs/timeout",
@@ -704,6 +727,7 @@ func (a *runtimeApp) consoleReadPermissionConfigured() bool {
 func (a *runtimeApp) routes() {
 	a.mux.HandleFunc("/healthz", a.handleHealth)
 	a.mux.HandleFunc("/demo/onebot/message", a.handleOneBotMessage)
+	a.mux.HandleFunc("/demo/workflows/message", a.handleWorkflowMessage)
 	a.mux.HandleFunc("/demo/ai/message", a.handleAIMessage)
 	a.mux.HandleFunc("/demo/jobs/enqueue", a.handleJobEnqueue)
 	a.mux.HandleFunc("/demo/jobs/timeout", a.handleJobTimeout)
@@ -775,6 +799,7 @@ func (a *runtimeApp) handleConsole(w http.ResponseWriter, r *http.Request) {
 	console.SetReplayOperationReader(runtimecore.NewSQLiteConsoleReplayOperationReader(a.state))
 	console.SetRolloutOperationReader(runtimecore.NewSQLiteConsoleRolloutOperationReader(a.state))
 	console.SetScheduleReader(runtimecore.NewSQLiteConsoleScheduleReader(a.state))
+	console.SetWorkflowReader(runtimecore.NewSQLiteConsoleWorkflowReader(a.state))
 	console.SetAdapterInstanceReader(runtimecore.NewSQLiteConsoleAdapterInstanceReader(a.state))
 	console.SetPluginSnapshotReader(runtimecore.NewSQLiteConsolePluginSnapshotReader(a.state))
 	console.SetPluginEnabledStateReader(runtimecore.NewSQLiteConsolePluginEnabledStateReader(a.state))
@@ -870,6 +895,10 @@ func (a *runtimeApp) handleConsole(w http.ResponseWriter, r *http.Request) {
 	meta["schedule_read_model"] = "sqlite"
 	meta["schedule_status_source"] = "sqlite-schedule-plans"
 	meta["schedule_status_persisted"] = true
+	meta["workflow_read_model"] = "sqlite-workflow-instances"
+	meta["workflow_status_source"] = "sqlite-workflow-instances"
+	meta["workflow_status_persisted"] = true
+	meta["workflow_runtime_owner"] = "runtime-core"
 	meta["schedule_operator_actions"] = []string{"/demo/schedules/{schedule-id}/cancel"}
 	meta["schedule_operator_scope"] = "currently-registered schedules only"
 	meta["schedule_recovery_source"] = "runtime-startup-restore"

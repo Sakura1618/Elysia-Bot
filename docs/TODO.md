@@ -14,10 +14,6 @@
 
 ## Backlog
 
-### A9. workflow engine 运行态成熟度
-- workflow demo 已存在，但还没有更成熟的恢复、查询、运行时治理语义。
-- 需要把 workflow 从演示级能力推进到更稳定的运行时边界。
-
 ### A10. adapter / transport 扩展与实例路由
 - 当前已支持多 bot instance registry，但事件 source、per-instance routing、更多协议适配器仍未真正展开。
 - 需要继续补更多 adapter 覆盖与实例级别的路由/管理边界。

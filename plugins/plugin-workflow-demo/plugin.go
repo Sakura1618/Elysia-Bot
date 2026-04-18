@@ -3,25 +3,23 @@ package pluginworkflowdemo
 import (
 	"context"
 	"errors"
-	"time"
 
 	eventmodel "github.com/ohmyopencode/bot-platform/packages/event-model"
 	pluginsdk "github.com/ohmyopencode/bot-platform/packages/plugin-sdk"
+	runtimecore "github.com/ohmyopencode/bot-platform/packages/runtime-core"
 )
 
-type SessionStore interface {
-	SaveSession(ctx context.Context, session pluginsdk.SessionState) error
+type WorkflowService interface {
+	StartOrResume(context.Context, string, string, string, string, runtimecore.Workflow) (runtimecore.WorkflowTransition, error)
 }
 
 type Plugin struct {
 	Manifest     pluginsdk.PluginManifest
 	ReplyService pluginsdk.ReplyService
-	Sessions     SessionStore
-	Workflows    map[string]pluginsdk.Workflow
-	Now          func() time.Time
+	Workflows    WorkflowService
 }
 
-func New(replyService pluginsdk.ReplyService, sessions SessionStore) *Plugin {
+func New(replyService pluginsdk.ReplyService, workflows WorkflowService) *Plugin {
 	return &Plugin{
 		Manifest: pluginsdk.PluginManifest{
 			ID:         "plugin-workflow-demo",
@@ -31,14 +29,11 @@ func New(replyService pluginsdk.ReplyService, sessions SessionStore) *Plugin {
 			Mode:       pluginsdk.ModeSubprocess,
 			Permissions: []string{
 				"reply:send",
-				"session:write",
 			},
 			Entry: pluginsdk.PluginEntry{Module: "plugins/plugin-workflow-demo", Symbol: "Plugin"},
 		},
 		ReplyService: replyService,
-		Sessions:     sessions,
-		Workflows:    map[string]pluginsdk.Workflow{},
-		Now:          time.Now().UTC,
+		Workflows:    workflows,
 	}
 }
 
@@ -50,62 +45,30 @@ func (p *Plugin) OnEvent(event eventmodel.Event, ctx eventmodel.ExecutionContext
 	if event.Type != "message.received" || event.Message == nil || ctx.Reply == nil {
 		return nil
 	}
-	if p.ReplyService == nil || p.Sessions == nil {
-		return errors.New("reply service and session store are required")
+	if p.ReplyService == nil || p.Workflows == nil {
+		return errors.New("reply service and workflow runtime are required")
 	}
-
-	sessionID := workflowSessionID(event)
-	workflow, exists := p.Workflows[sessionID]
-	if !exists {
-		workflow = pluginsdk.NewWorkflow(
-			sessionID,
-			pluginsdk.WorkflowStep{Kind: pluginsdk.WorkflowStepKindPersist, Name: "greeting", Value: event.Message.Text},
-			pluginsdk.WorkflowStep{Kind: pluginsdk.WorkflowStepKindWaitEvent, Name: "wait-confirm", Value: "message.received"},
-			pluginsdk.WorkflowStep{Kind: pluginsdk.WorkflowStepKindCompensate, Name: "complete"},
-		)
-		var err error
-		workflow, err = workflow.Advance(p.Now())
-		if err != nil {
-			return err
-		}
-		workflow, err = workflow.Advance(p.Now())
-		if err != nil {
-			return err
-		}
-		p.Workflows[sessionID] = workflow
-		if err := p.persistWorkflow(sessionID, workflow); err != nil {
-			return err
-		}
+	workflowID := workflowSessionID(event)
+	transition, err := p.Workflows.StartOrResume(context.Background(), workflowID, p.Manifest.ID, event.Type, event.EventID, demoWorkflow(workflowID, event.Message.Text))
+	if err != nil {
+		return err
+	}
+	if transition.Started {
 		return p.ReplyService.ReplyText(*ctx.Reply, "workflow started, please send another message to continue")
 	}
-
-	var err error
-	workflow, err = workflow.ResumeWithEvent(event.Type)
-	if err != nil {
-		return err
+	if transition.Resumed {
+		return p.ReplyService.ReplyText(*ctx.Reply, "workflow resumed and completed")
 	}
-	workflow, err = workflow.Advance(p.Now())
-	if err != nil {
-		return err
-	}
-	p.Workflows[sessionID] = workflow
-	if err := p.persistWorkflow(sessionID, workflow); err != nil {
-		return err
-	}
-	return p.ReplyService.ReplyText(*ctx.Reply, "workflow resumed and completed")
+	return nil
 }
 
-func (p *Plugin) persistWorkflow(sessionID string, workflow pluginsdk.Workflow) error {
-	return p.Sessions.SaveSession(context.Background(), pluginsdk.SessionState{
-		SessionID: sessionID,
-		PluginID:  p.Manifest.ID,
-		State: map[string]any{
-			"current_index": workflow.CurrentIndex,
-			"waiting_for":   workflow.WaitingFor,
-			"completed":     workflow.Completed,
-			"compensated":   workflow.Compensated,
-		},
-	})
+func demoWorkflow(workflowID string, greeting string) runtimecore.Workflow {
+	return runtimecore.NewWorkflow(
+		workflowID,
+		runtimecore.WorkflowStep{Kind: runtimecore.WorkflowStepKindPersist, Name: "greeting", Value: greeting},
+		runtimecore.WorkflowStep{Kind: runtimecore.WorkflowStepKindWaitEvent, Name: "wait-confirm", Value: "message.received"},
+		runtimecore.WorkflowStep{Kind: runtimecore.WorkflowStepKindCompensate, Name: "complete"},
+	)
 }
 
 func workflowSessionID(event eventmodel.Event) string {
