@@ -16,7 +16,12 @@ type EventJournalReader interface {
 type EventReplayer struct {
 	journal EventJournalReader
 	runtime *InMemoryRuntime
+	store   replayOperationRecorder
 	now     func() time.Time
+}
+
+type replayOperationRecorder interface {
+	SaveReplayOperationRecord(context.Context, ReplayOperationRecord) error
 }
 
 type ReplayPolicyDeclaration struct {
@@ -46,14 +51,25 @@ func ReplayPolicy() ReplayPolicyDeclaration {
 			"replay currently re-dispatches exactly one stored event selected by event_id",
 			"replay identity is isolated from the original event by rewritten event_id, trace_id, and idempotency_key",
 			"events already marked as replay or already using replay identity prefixes are rejected",
+			"explicit replay attempts are persisted as operational records and remain visible after restart",
 		},
 	}
-	declaration.Summary = "namespace=" + declaration.Namespace + "; single-event explicit replay only; isolated replay identity rewrite; replay-of-replay rejected; no batch replay or dry-run"
+	declaration.Summary = "namespace=" + declaration.Namespace + "; single-event explicit replay only; isolated replay identity rewrite; replay-of-replay rejected; replay attempts persist as operational records; no batch replay or dry-run"
 	return declaration
 }
 
 func NewEventReplayer(journal EventJournalReader, runtime *InMemoryRuntime) *EventReplayer {
-	return &EventReplayer{journal: journal, runtime: runtime, now: time.Now().UTC}
+	replayer := &EventReplayer{journal: journal, runtime: runtime, now: time.Now().UTC}
+	if recorder, ok := journal.(replayOperationRecorder); ok {
+		replayer.store = recorder
+	}
+	return replayer
+}
+
+func NewEventReplayerWithStore(journal EventJournalReader, runtime *InMemoryRuntime, store replayOperationRecorder) *EventReplayer {
+	replayer := NewEventReplayer(journal, runtime)
+	replayer.store = store
+	return replayer
 }
 
 func (r *EventReplayer) ReplayEvent(ctx context.Context, eventID string) (eventmodel.Event, error) {
@@ -78,6 +94,7 @@ func (r *EventReplayer) ReplayEvent(ctx context.Context, eventID string) (eventm
 	replayed := original
 	now := r.now()
 	suffix := fmt.Sprintf("%d", now.UnixNano())
+	replayID := replayOperationID(original.EventID, now)
 	replayed.EventID = "replay-" + original.EventID + "-" + suffix
 	replayed.TraceID = "replay-" + original.TraceID + "-" + suffix
 	replayed.IdempotencyKey = "replay:" + original.EventID + ":" + suffix
@@ -89,9 +106,42 @@ func (r *EventReplayer) ReplayEvent(ctx context.Context, eventID string) (eventm
 	replayed.Metadata["replay_namespace"] = replayNamespace
 
 	if err := r.runtime.DispatchEvent(ctx, replayed); err != nil {
+		r.recordReplayResult(ctx, ReplayOperationRecord{
+			ReplayID:      replayID,
+			SourceEventID: original.EventID,
+			ReplayEventID: replayed.EventID,
+			Status:        "failed",
+			Reason:        err.Error(),
+			OccurredAt:    now,
+			UpdatedAt:     now,
+		})
 		return replayed, err
 	}
+	r.recordReplayResult(ctx, ReplayOperationRecord{
+		ReplayID:      replayID,
+		SourceEventID: original.EventID,
+		ReplayEventID: replayed.EventID,
+		Status:        "succeeded",
+		Reason:        "replay_dispatched",
+		OccurredAt:    now,
+		UpdatedAt:     now,
+	})
 	return replayed, nil
+}
+
+func (r *EventReplayer) recordReplayResult(ctx context.Context, record ReplayOperationRecord) {
+	if r == nil || r.store == nil {
+		return
+	}
+	_ = r.store.SaveReplayOperationRecord(ctx, record)
+}
+
+func replayOperationID(sourceEventID string, occurredAt time.Time) string {
+	trimmed := strings.TrimSpace(sourceEventID)
+	if trimmed == "" {
+		trimmed = "unknown"
+	}
+	return "replay-op-" + trimmed + "-" + fmt.Sprintf("%d", occurredAt.UTC().UnixNano())
 }
 
 func cloneMetadata(metadata map[string]any) map[string]any {

@@ -65,6 +65,13 @@ func TestEventReplayerRedispatchesStoredEventWithReplayIdentity(t *testing.T) {
 	if handler.ctx.EventID != replayed.EventID || handler.ctx.TraceID != replayed.TraceID {
 		t.Fatalf("expected runtime execution context to use replayed identity, got %+v", handler.ctx)
 	}
+	records, err := store.ListReplayOperationRecords(context.Background())
+	if err != nil {
+		t.Fatalf("list replay operation records: %v", err)
+	}
+	if len(records) != 1 || records[0].SourceEventID != original.EventID || records[0].ReplayEventID != replayed.EventID || records[0].Status != "succeeded" || records[0].Reason != "replay_dispatched" {
+		t.Fatalf("expected persisted replay success record, got %+v", records)
+	}
 }
 
 func TestEventReplayerReturnsReplayIdentityOnDispatchFailure(t *testing.T) {
@@ -98,6 +105,13 @@ func TestEventReplayerReturnsReplayIdentityOnDispatchFailure(t *testing.T) {
 	}
 	if replayed.Metadata["replay_namespace"] != replayNamespace {
 		t.Fatalf("expected replay namespace marker on failure, got %+v", replayed.Metadata)
+	}
+	records, listErr := store.ListReplayOperationRecords(context.Background())
+	if listErr != nil {
+		t.Fatalf("list replay operation records: %v", listErr)
+	}
+	if len(records) != 1 || records[0].SourceEventID != original.EventID || records[0].ReplayEventID != replayed.EventID || records[0].Status != "failed" || !strings.Contains(records[0].Reason, "dispatch") {
+		t.Fatalf("expected persisted replay failure record, got %+v", records)
 	}
 }
 

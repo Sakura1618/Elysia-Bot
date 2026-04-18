@@ -498,6 +498,109 @@ func TestCurrentRBACAuthorizerProviderReloadFromStoreUpdatesDecisionsWithoutReco
 	}
 }
 
+func TestSQLiteStateStorePersistsReplayOperationRecordsAcrossReopen(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "state.db")
+	ctx := context.Background()
+	occurredAt := time.Date(2026, 4, 19, 10, 0, 0, 0, time.UTC)
+
+	store, err := OpenSQLiteStateStore(path)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	if err := store.SaveReplayOperationRecord(ctx, ReplayOperationRecord{
+		ReplayID:      "replay-op-1",
+		SourceEventID: "evt-source-1",
+		ReplayEventID: "replay-evt-source-1-1",
+		Status:        "succeeded",
+		Reason:        "replay_dispatched",
+		OccurredAt:    occurredAt,
+		UpdatedAt:     occurredAt,
+	}); err != nil {
+		t.Fatalf("save replay operation record: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	reopened, err := OpenSQLiteStateStore(path)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer func() { _ = reopened.Close() }()
+
+	records, err := reopened.ListReplayOperationRecords(ctx)
+	if err != nil {
+		t.Fatalf("list replay operation records: %v", err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("expected one replay operation record, got %+v", records)
+	}
+	if records[0].ReplayID != "replay-op-1" || records[0].SourceEventID != "evt-source-1" || records[0].ReplayEventID != "replay-evt-source-1-1" || records[0].Status != "succeeded" || records[0].Reason != "replay_dispatched" {
+		t.Fatalf("unexpected replay operation record %+v", records[0])
+	}
+	counts, err := reopened.Counts(ctx)
+	if err != nil {
+		t.Fatalf("counts after reopen: %v", err)
+	}
+	if counts["replay_operation_records"] != 1 {
+		t.Fatalf("expected one replay operation record count, got %+v", counts)
+	}
+}
+
+func TestSQLiteStateStorePersistsRolloutOperationRecordsAcrossReopen(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "state.db")
+	ctx := context.Background()
+	occurredAt := time.Date(2026, 4, 19, 10, 30, 0, 0, time.UTC)
+
+	store, err := OpenSQLiteStateStore(path)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	if err := store.SaveRolloutOperationRecord(ctx, RolloutOperationRecord{
+		OperationID:      "rollout-op-prepare-1",
+		PluginID:         "plugin-echo",
+		Action:           "prepare",
+		CurrentVersion:   "0.1.0",
+		CandidateVersion: "0.2.0-candidate",
+		Status:           "prepared",
+		OccurredAt:       occurredAt,
+		UpdatedAt:        occurredAt,
+	}); err != nil {
+		t.Fatalf("save rollout operation record: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	reopened, err := OpenSQLiteStateStore(path)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer func() { _ = reopened.Close() }()
+
+	records, err := reopened.ListRolloutOperationRecords(ctx)
+	if err != nil {
+		t.Fatalf("list rollout operation records: %v", err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("expected one rollout operation record, got %+v", records)
+	}
+	if records[0].OperationID != "rollout-op-prepare-1" || records[0].PluginID != "plugin-echo" || records[0].Action != "prepare" || records[0].CurrentVersion != "0.1.0" || records[0].CandidateVersion != "0.2.0-candidate" || records[0].Status != "prepared" {
+		t.Fatalf("unexpected rollout operation record %+v", records[0])
+	}
+	counts, err := reopened.Counts(ctx)
+	if err != nil {
+		t.Fatalf("counts after reopen: %v", err)
+	}
+	if counts["rollout_operation_records"] != 1 {
+		t.Fatalf("expected one rollout operation record count, got %+v", counts)
+	}
+}
+
 func TestSQLiteStateStorePersistsSchedulePlansRoundTrip(t *testing.T) {
 	t.Parallel()
 

@@ -153,6 +153,28 @@ CREATE TABLE IF NOT EXISTS rbac_snapshots (
   policies_json TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS replay_operation_records (
+  replay_id TEXT PRIMARY KEY,
+  source_event_id TEXT NOT NULL,
+  replay_event_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  occurred_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS rollout_operation_records (
+  operation_id TEXT PRIMARY KEY,
+  plugin_id TEXT NOT NULL,
+  action TEXT NOT NULL,
+  current_version TEXT NOT NULL,
+  candidate_version TEXT NOT NULL,
+  status TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  occurred_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 `
 
 const CurrentRBACSnapshotKey = "current"
@@ -216,6 +238,28 @@ type RBACSnapshotState struct {
 	ConsoleReadPermission string
 	Policies              map[string]pluginsdk.AuthorizationPolicy
 	UpdatedAt             time.Time
+}
+
+type ReplayOperationRecord struct {
+	ReplayID      string
+	SourceEventID string
+	ReplayEventID string
+	Status        string
+	Reason        string
+	OccurredAt    time.Time
+	UpdatedAt     time.Time
+}
+
+type RolloutOperationRecord struct {
+	OperationID      string
+	PluginID         string
+	Action           string
+	CurrentVersion   string
+	CandidateVersion string
+	Status           string
+	Reason           string
+	OccurredAt       time.Time
+	UpdatedAt        time.Time
 }
 
 type storedSchedulePlan struct {
@@ -1045,6 +1089,8 @@ func (s *SQLiteStateStore) Counts(ctx context.Context) (map[string]int, error) {
 		"schedule_plans":          `SELECT COUNT(*) FROM schedule_plans`,
 		"operator_identities":     `SELECT COUNT(*) FROM operator_identities`,
 		"rbac_snapshots":          `SELECT COUNT(*) FROM rbac_snapshots`,
+		"replay_operation_records":  `SELECT COUNT(*) FROM replay_operation_records`,
+		"rollout_operation_records": `SELECT COUNT(*) FROM rollout_operation_records`,
 	}
 
 	counts := make(map[string]int, len(tables))
@@ -1056,6 +1102,134 @@ func (s *SQLiteStateStore) Counts(ctx context.Context) (map[string]int, error) {
 		counts[name] = count
 	}
 	return counts, nil
+}
+
+func (s *SQLiteStateStore) SaveReplayOperationRecord(ctx context.Context, record ReplayOperationRecord) error {
+	if s == nil {
+		return fmt.Errorf("save replay operation record: sqlite state store is required")
+	}
+	return saveReplayOperationRecordWithExecutor(ctx, s.db, record)
+}
+
+func saveReplayOperationRecordWithExecutor(ctx context.Context, executor sqliteExecContexter, record ReplayOperationRecord) error {
+	record.ReplayID = strings.TrimSpace(record.ReplayID)
+	if record.ReplayID == "" {
+		return fmt.Errorf("save replay operation record: replay id is required")
+	}
+	record.SourceEventID = strings.TrimSpace(record.SourceEventID)
+	if record.SourceEventID == "" {
+		return fmt.Errorf("save replay operation record: source event id is required")
+	}
+	record.ReplayEventID = strings.TrimSpace(record.ReplayEventID)
+	if record.ReplayEventID == "" {
+		return fmt.Errorf("save replay operation record: replay event id is required")
+	}
+	record.Status = strings.TrimSpace(record.Status)
+	if record.Status == "" {
+		return fmt.Errorf("save replay operation record: status is required")
+	}
+	record.Reason = strings.TrimSpace(record.Reason)
+	occurredAt := record.OccurredAt
+	if occurredAt.IsZero() {
+		occurredAt = time.Now().UTC()
+	}
+	updatedAt := record.UpdatedAt
+	if updatedAt.IsZero() {
+		updatedAt = occurredAt
+	}
+	_, err := executor.ExecContext(ctx, `
+INSERT INTO replay_operation_records (replay_id, source_event_id, replay_event_id, status, reason, occurred_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(replay_id) DO UPDATE SET
+  source_event_id=excluded.source_event_id,
+  replay_event_id=excluded.replay_event_id,
+  status=excluded.status,
+  reason=excluded.reason,
+  occurred_at=excluded.occurred_at,
+  updated_at=excluded.updated_at
+`, record.ReplayID, record.SourceEventID, record.ReplayEventID, record.Status, record.Reason, formatSQLiteTimestamp(occurredAt), formatSQLiteTimestamp(updatedAt))
+	if err != nil {
+		return fmt.Errorf("upsert replay operation record: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLiteStateStore) ListReplayOperationRecords(ctx context.Context) ([]ReplayOperationRecord, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT replay_id, source_event_id, replay_event_id, status, reason, occurred_at, updated_at
+FROM replay_operation_records
+ORDER BY occurred_at DESC, replay_id DESC
+`)
+	if err != nil {
+		return nil, fmt.Errorf("list replay operation records: %w", err)
+	}
+	defer rows.Close()
+	return scanReplayOperationRecords(rows)
+}
+
+func (s *SQLiteStateStore) SaveRolloutOperationRecord(ctx context.Context, record RolloutOperationRecord) error {
+	if s == nil {
+		return fmt.Errorf("save rollout operation record: sqlite state store is required")
+	}
+	return saveRolloutOperationRecordWithExecutor(ctx, s.db, record)
+}
+
+func saveRolloutOperationRecordWithExecutor(ctx context.Context, executor sqliteExecContexter, record RolloutOperationRecord) error {
+	record.OperationID = strings.TrimSpace(record.OperationID)
+	if record.OperationID == "" {
+		return fmt.Errorf("save rollout operation record: operation id is required")
+	}
+	record.PluginID = strings.TrimSpace(record.PluginID)
+	if record.PluginID == "" {
+		return fmt.Errorf("save rollout operation record: plugin id is required")
+	}
+	record.Action = strings.TrimSpace(record.Action)
+	if record.Action == "" {
+		return fmt.Errorf("save rollout operation record: action is required")
+	}
+	record.Status = strings.TrimSpace(record.Status)
+	if record.Status == "" {
+		return fmt.Errorf("save rollout operation record: status is required")
+	}
+	record.Reason = strings.TrimSpace(record.Reason)
+	occurredAt := record.OccurredAt
+	if occurredAt.IsZero() {
+		occurredAt = time.Now().UTC()
+	}
+	updatedAt := record.UpdatedAt
+	if updatedAt.IsZero() {
+		updatedAt = occurredAt
+	}
+	_, err := executor.ExecContext(ctx, `
+INSERT INTO rollout_operation_records (operation_id, plugin_id, action, current_version, candidate_version, status, reason, occurred_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(operation_id) DO UPDATE SET
+  plugin_id=excluded.plugin_id,
+  action=excluded.action,
+  current_version=excluded.current_version,
+  candidate_version=excluded.candidate_version,
+  status=excluded.status,
+  reason=excluded.reason,
+  occurred_at=excluded.occurred_at,
+  updated_at=excluded.updated_at
+`, record.OperationID, record.PluginID, record.Action, record.CurrentVersion, record.CandidateVersion, record.Status, record.Reason, formatSQLiteTimestamp(occurredAt), formatSQLiteTimestamp(updatedAt))
+	if err != nil {
+		return fmt.Errorf("upsert rollout operation record: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLiteStateStore) ListRolloutOperationRecords(ctx context.Context) ([]RolloutOperationRecord, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT operation_id, plugin_id, action, current_version, candidate_version, status, reason, occurred_at, updated_at
+FROM rollout_operation_records
+ORDER BY occurred_at DESC, operation_id DESC
+`)
+	if err != nil {
+		return nil, fmt.Errorf("list rollout operation records: %w", err)
+	}
+	defer rows.Close()
+	return scanRolloutOperationRecords(rows)
 }
 
 func (s *SQLiteStateStore) ReplaceCurrentRBACState(ctx context.Context, identities []OperatorIdentityState, snapshot RBACSnapshotState) error {
@@ -1416,6 +1590,64 @@ func scanRBACSnapshots(rows *sql.Rows) ([]RBACSnapshotState, error) {
 		return nil, fmt.Errorf("iterate rbac snapshots: %w", err)
 	}
 	return states, nil
+}
+
+func scanReplayOperationRecords(rows *sql.Rows) ([]ReplayOperationRecord, error) {
+	records := make([]ReplayOperationRecord, 0)
+	for rows.Next() {
+		var (
+			record        ReplayOperationRecord
+			occurredAtRaw string
+			updatedAtRaw  string
+		)
+		if err := rows.Scan(&record.ReplayID, &record.SourceEventID, &record.ReplayEventID, &record.Status, &record.Reason, &occurredAtRaw, &updatedAtRaw); err != nil {
+			return nil, fmt.Errorf("scan replay operation record: %w", err)
+		}
+		occurredAt, err := parseSQLiteTimestamp(occurredAtRaw)
+		if err != nil {
+			return nil, fmt.Errorf("parse replay operation record occurred_at: %w", err)
+		}
+		record.OccurredAt = occurredAt
+		updatedAt, err := parseSQLiteTimestamp(updatedAtRaw)
+		if err != nil {
+			return nil, fmt.Errorf("parse replay operation record updated_at: %w", err)
+		}
+		record.UpdatedAt = updatedAt
+		records = append(records, record)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate replay operation records: %w", err)
+	}
+	return records, nil
+}
+
+func scanRolloutOperationRecords(rows *sql.Rows) ([]RolloutOperationRecord, error) {
+	records := make([]RolloutOperationRecord, 0)
+	for rows.Next() {
+		var (
+			record        RolloutOperationRecord
+			occurredAtRaw string
+			updatedAtRaw  string
+		)
+		if err := rows.Scan(&record.OperationID, &record.PluginID, &record.Action, &record.CurrentVersion, &record.CandidateVersion, &record.Status, &record.Reason, &occurredAtRaw, &updatedAtRaw); err != nil {
+			return nil, fmt.Errorf("scan rollout operation record: %w", err)
+		}
+		occurredAt, err := parseSQLiteTimestamp(occurredAtRaw)
+		if err != nil {
+			return nil, fmt.Errorf("parse rollout operation record occurred_at: %w", err)
+		}
+		record.OccurredAt = occurredAt
+		updatedAt, err := parseSQLiteTimestamp(updatedAtRaw)
+		if err != nil {
+			return nil, fmt.Errorf("parse rollout operation record updated_at: %w", err)
+		}
+		record.UpdatedAt = updatedAt
+		records = append(records, record)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate rollout operation records: %w", err)
+	}
+	return records, nil
 }
 
 func scanStoredSchedulePlans(rows *sql.Rows) ([]storedSchedulePlan, error) {

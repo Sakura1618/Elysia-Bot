@@ -68,6 +68,29 @@ type runtimeSmokeStore interface {
 
 type runtimeServeFunc func(string, http.Handler) error
 
+type sqlitePluginManifestReader struct {
+	store *runtimecore.SQLiteStateStore
+}
+
+func (r sqlitePluginManifestReader) LoadPluginManifest(pluginID string) (pluginsdk.PluginManifest, error) {
+	if r.store == nil {
+		return pluginsdk.PluginManifest{}, fmt.Errorf("plugin manifest store is required")
+	}
+	return r.store.LoadPluginManifest(context.Background(), pluginID)
+}
+
+type sqliteStaticCandidateManifestReader struct {
+	manifests map[string]pluginsdk.PluginManifest
+}
+
+func (r sqliteStaticCandidateManifestReader) LoadPluginManifest(pluginID string) (pluginsdk.PluginManifest, error) {
+	manifest, ok := r.manifests[strings.TrimSpace(pluginID)]
+	if !ok {
+		return pluginsdk.PluginManifest{}, fmt.Errorf("plugin manifest not found")
+	}
+	return manifest, nil
+}
+
 type runtimeConfigCheckResult struct {
 	Status              string `json:"status"`
 	Mode                string `json:"mode"`
@@ -87,6 +110,18 @@ type runtimeHealthResponse struct {
 	SQLitePath          string                  `json:"sqlite_path"`
 	SchedulerIntervalMs int                     `json:"scheduler_interval_ms"`
 	Components          runtimeHealthComponents `json:"components"`
+}
+
+func nextRuntimeCandidateManifest(manifest pluginsdk.PluginManifest) pluginsdk.PluginManifest {
+	candidate := manifest
+	version := strings.TrimSpace(candidate.Version)
+	if version == "" {
+		version = "0.0.1-candidate"
+	} else {
+		version += "-candidate"
+	}
+	candidate.Version = version
+	return candidate
 }
 
 type runtimeHealthComponents struct {
@@ -168,13 +203,14 @@ func (s postgresRuntimeSmokeStore) Close() error {
 type runtimeAppReplayService struct {
 	journal runtimecore.EventJournalReader
 	runtime *runtimecore.InMemoryRuntime
+	store   *runtimecore.SQLiteStateStore
 }
 
 func (s *runtimeAppReplayService) ReplayEvent(eventID string) (eventmodel.Event, error) {
 	if s == nil {
 		return eventmodel.Event{}, fmt.Errorf("replay service is required")
 	}
-	return runtimecore.NewEventReplayer(s.journal, s.runtime).ReplayEvent(context.Background(), eventID)
+	return runtimecore.NewEventReplayerWithStore(s.journal, s.runtime, s.store).ReplayEvent(context.Background(), eventID)
 }
 
 const (
@@ -454,7 +490,7 @@ func newRuntimeAppWithOutput(configPath string, output io.Writer) (*runtimeApp, 
 		_ = state.Close()
 		return nil, fmt.Errorf("selected smoke store backend %q does not implement event journal reader", settings.SmokeStoreBackend)
 	}
-	replayService := &runtimeAppReplayService{journal: replayJournal, runtime: runtime}
+	replayService := &runtimeAppReplayService{journal: replayJournal, runtime: runtime, store: state}
 	aiProvider, err := buildAIProvider(context.Background(), config, runtimecore.NewSecretRegistry(runtimecore.EnvSecretProvider{}, audits), logger)
 	if err != nil {
 		_ = smokeStore.Close()
@@ -507,7 +543,12 @@ func newRuntimeAppWithOutput(configPath string, output io.Writer) (*runtimeApp, 
 		_ = state.Close()
 		return nil, fmt.Errorf("save ai plugin manifest: %w", err)
 	}
-	adminPlugin := pluginadmin.New(lifecycle, nil, replayService, authorizerProvider, actorRoles(config.RBAC), policies(config.RBAC), audits)
+	rolloutManager := runtimecore.NewSQLiteRolloutManager(sqlitePluginManifestReader{store: state}, sqliteStaticCandidateManifestReader{manifests: map[string]pluginsdk.PluginManifest{
+		echoDefinition.Manifest.ID: nextRuntimeCandidateManifest(echoDefinition.Manifest),
+		aiDefinition.Manifest.ID:   nextRuntimeCandidateManifest(aiDefinition.Manifest),
+		"plugin-admin":            nextRuntimeCandidateManifest(pluginsdk.PluginManifest{ID: "plugin-admin", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess}),
+	}}, state)
+	adminPlugin := pluginadmin.New(lifecycle, rolloutManager, replayService, authorizerProvider, actorRoles(config.RBAC), policies(config.RBAC), audits)
 	adminDefinition := adminPlugin.Definition()
 	if err := runtime.RegisterPlugin(adminDefinition); err != nil {
 		_ = smokeStore.Close()
@@ -731,6 +772,8 @@ func (a *runtimeApp) handleConsole(w http.ResponseWriter, r *http.Request) {
 	console.SetCurrentAuthorizerProvider(a.authorizer)
 	console.SetJobReader(runtimecore.NewSQLiteConsoleJobReader(a.state))
 	console.SetAlertReader(runtimecore.NewSQLiteConsoleAlertReader(a.state))
+	console.SetReplayOperationReader(runtimecore.NewSQLiteConsoleReplayOperationReader(a.state))
+	console.SetRolloutOperationReader(runtimecore.NewSQLiteConsoleRolloutOperationReader(a.state))
 	console.SetScheduleReader(runtimecore.NewSQLiteConsoleScheduleReader(a.state))
 	console.SetAdapterInstanceReader(runtimecore.NewSQLiteConsoleAdapterInstanceReader(a.state))
 	console.SetPluginSnapshotReader(runtimecore.NewSQLiteConsolePluginSnapshotReader(a.state))
@@ -774,7 +817,6 @@ func (a *runtimeApp) handleConsole(w http.ResponseWriter, r *http.Request) {
 	meta["rbac_current_state"] = "persisted-runtime-current-snapshot"
 	meta["rbac_system_model_state"] = "not-complete-global-rbac-authn-or-audit-system"
 	meta["rbac_current_authorization_paths"] = []string{"admin-command-runtime-authorizer", "event-metadata-runtime-authorizer", "job-metadata-runtime-authorizer", "schedule-metadata-runtime-authorizer", "console-read-authorizer", "job-operator-runtime-authorizer", "schedule-operator-runtime-authorizer", "plugin-config-runtime-authorizer", "plugin-admin-current-authorizer-provider"}
-	meta["rbac_current_authorization_paths_count"] = 6
 	meta["rbac_current_authorization_paths_count"] = 9
 	meta["rbac_authorization_boundaries"] = []string{"admin-command-runtime-authorizer", "event-metadata-runtime-authorizer", "job-metadata-runtime-authorizer", "schedule-metadata-runtime-authorizer", "console-read-authorizer", "job-operator-runtime-authorizer", "schedule-operator-runtime-authorizer", "plugin-config-runtime-authorizer", "plugin-admin-current-authorizer-provider"}
 	meta["rbac_authorizer_entrypoints"] = []string{"admin-command-runtime-authorizer", "event-metadata-runtime-authorizer", "job-metadata-runtime-authorizer", "schedule-metadata-runtime-authorizer", "console-read-authorizer", "job-operator-runtime-authorizer", "schedule-operator-runtime-authorizer", "plugin-config-runtime-authorizer", "plugin-admin-current-authorizer-provider"}
@@ -799,6 +841,8 @@ func (a *runtimeApp) handleConsole(w http.ResponseWriter, r *http.Request) {
 	meta["rbac_console_limitations"] = []string{"console read authorization is optional and only enforced when rbac.console_read_permission is configured", "console read authorization currently reads actor only from the X-Bot-Platform-Actor header", "deny audit taxonomy currently distinguishes only permission_denied and plugin_scope_denied", "manifest permission gate remains a separate dispatch contract check and does not emit deny audit entries", "target_plugin_id remains a dispatch filter, not a global RBAC resource kind", "current slice persists and reloads a single runtime snapshot but does not add login/authn UX or a global resource hierarchy"}
 	meta["replay_policy"] = runtimecore.ReplayPolicy()
 	meta["replay_namespace"] = runtimecore.ReplayPolicy().Namespace
+	meta["replay_record_read_model"] = "sqlite-replay-operation-records"
+	meta["replay_record_persisted"] = true
 	meta["replay_console_limitations"] = []string{"replay policy declaration is read-only and mirrors existing runtime behavior only", "replay remains limited to single-event explicit replay via admin command; no batch replay or dry-run"}
 	meta["secrets_policy"] = runtimecore.SecretPolicy()
 	meta["secrets_provider"] = runtimecore.SecretPolicy().Provider
@@ -806,7 +850,9 @@ func (a *runtimeApp) handleConsole(w http.ResponseWriter, r *http.Request) {
 	meta["secrets_console_limitations"] = []string{"secrets policy declaration is read-only and mirrors existing runtime behavior only", "secrets remain limited to env provider and webhook token single-read path; no secret write API, rotation, or console management"}
 	meta["rollout_policy"] = runtimecore.RolloutPolicy()
 	meta["rollout_record_store"] = runtimecore.RolloutPolicy().RecordStore
-	meta["rollout_console_limitations"] = []string{"rollout policy declaration is read-only and mirrors existing runtime behavior only", "rollout remains limited to manual /admin prepare|activate with minimal manifest preflight and activate-time drift re-check; no rollback, staged rollout, or persisted rollout history"}
+	meta["rollout_record_read_model"] = "sqlite-rollout-operation-records"
+	meta["rollout_record_persisted"] = true
+	meta["rollout_console_limitations"] = []string{"rollout policy declaration is read-only and mirrors existing runtime behavior only", "rollout remains limited to manual /admin prepare|activate with minimal manifest preflight and activate-time drift re-check; no rollback or staged rollout"}
 	meta["log_source"] = "runtime-log-buffer"
 	meta["trace_source"] = "runtime-trace-recorder"
 	meta["metrics_source"] = "runtime-metrics-registry"

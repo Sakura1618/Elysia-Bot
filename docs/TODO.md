@@ -14,10 +14,6 @@
 
 ## Backlog
 
-### A8. secrets / replay / rollout 继续扩展
-- 当前这些子系统都有局部实现，但还不是完整统一体系。
-- 需要继续补 secret 生命周期、replay 更丰富模式、rollout 历史/回退/阶段化语义。
-
 ### A9. workflow engine 运行态成熟度
 - workflow demo 已存在，但还没有更成熟的恢复、查询、运行时治理语义。
 - 需要把 workflow 从演示级能力推进到更稳定的运行时边界。

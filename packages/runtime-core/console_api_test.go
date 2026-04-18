@@ -725,7 +725,7 @@ func TestConsoleAPIServesReadOnlyJSONOverHTTP(t *testing.T) {
 	if !strings.Contains(recorder.Body.String(), `"secrets_policy"`) || !strings.Contains(recorder.Body.String(), `"secrets_provider": "env"`) || !strings.Contains(recorder.Body.String(), `"BOT_PLATFORM_"`) {
 		t.Fatalf("expected console http payload to expose secrets policy declaration, got %s", recorder.Body.String())
 	}
-	if !strings.Contains(recorder.Body.String(), `"rollout_policy"`) || !strings.Contains(recorder.Body.String(), `"rollout_record_store": "in-memory-per-runtime-process"`) || !strings.Contains(recorder.Body.String(), `"/admin prepare \u003cplugin-id\u003e"`) {
+	if !strings.Contains(recorder.Body.String(), `"rollout_policy"`) || !strings.Contains(recorder.Body.String(), `"rollout_record_store": "sqlite-current-runtime-rollout-operations"`) || !strings.Contains(recorder.Body.String(), `"/admin prepare \u003cplugin-id\u003e"`) {
 		t.Fatalf("expected console http payload to expose rollout policy declaration, got %s", recorder.Body.String())
 	}
 }
@@ -759,6 +759,53 @@ func TestConsoleAPIServesReadOnlyJSONWhenConsoleReadAuthorizerAllows(t *testing.
 	}
 	if len(audits.AuditEntries()) != 0 {
 		t.Fatalf("expected allowed console read not to record deny audit, got %+v", audits.AuditEntries())
+	}
+}
+
+func TestConsoleAPIExposesPersistedReplayAndRolloutOperations(t *testing.T) {
+	t.Parallel()
+
+	store := openTempSQLiteStore(t)
+	defer func() { _ = store.Close() }()
+	replayAt := time.Date(2026, 4, 19, 12, 0, 0, 0, time.UTC)
+	rolloutAt := time.Date(2026, 4, 19, 12, 5, 0, 0, time.UTC)
+	if err := store.SaveReplayOperationRecord(context.Background(), ReplayOperationRecord{
+		ReplayID:      "replay-op-console-1",
+		SourceEventID: "evt-source-console-1",
+		ReplayEventID: "replay-evt-source-console-1-1",
+		Status:        "succeeded",
+		Reason:        "replay_dispatched",
+		OccurredAt:    replayAt,
+		UpdatedAt:     replayAt,
+	}); err != nil {
+		t.Fatalf("save replay operation record: %v", err)
+	}
+	if err := store.SaveRolloutOperationRecord(context.Background(), RolloutOperationRecord{
+		OperationID:      "rollout-op-console-1",
+		PluginID:         "plugin-echo",
+		Action:           "prepare",
+		CurrentVersion:   "0.1.0",
+		CandidateVersion: "0.2.0-candidate",
+		Status:           "prepared",
+		OccurredAt:       rolloutAt,
+		UpdatedAt:        rolloutAt,
+	}); err != nil {
+		t.Fatalf("save rollout operation record: %v", err)
+	}
+
+	api := NewConsoleAPI(nil, nil, Config{}, []string{"runtime started"}, NewInMemoryAuditLog())
+	api.SetReplayOperationReader(NewSQLiteConsoleReplayOperationReader(store))
+	api.SetRolloutOperationReader(NewSQLiteConsoleRolloutOperationReader(store))
+	api.SetMeta(map[string]any{"replay_policy": ReplayPolicy(), "secrets_policy": SecretPolicy(), "rollout_policy": RolloutPolicy(), "replay_record_read_model": "sqlite-replay-operation-records", "rollout_record_read_model": "sqlite-rollout-operation-records"})
+
+	raw, err := api.RenderJSON()
+	if err != nil {
+		t.Fatalf("render json: %v", err)
+	}
+	for _, expected := range []string{`"replayOps": [`, `"replayId": "replay-op-console-1"`, `"stateSource": "sqlite-replay-operation-records"`, `"persisted": true`, `"sourceEventId": "evt-source-console-1"`, `"reason": "replay_dispatched"`, `"rolloutOps": [`, `"operationId": "rollout-op-console-1"`, `"pluginId": "plugin-echo"`, `"action": "prepare"`, `"currentVersion": "0.1.0"`, `"candidateVersion": "0.2.0-candidate"`, `"stateSource": "sqlite-rollout-operation-records"`, `"replay_policy"`, `"secrets_policy"`, `"rollout_policy"`} {
+		if !strings.Contains(raw, expected) {
+			t.Fatalf("expected console JSON to include %q, got %s", expected, raw)
+		}
 	}
 }
 

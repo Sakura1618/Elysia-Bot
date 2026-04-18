@@ -1,9 +1,12 @@
 package runtimecore
 
 import (
+	"context"
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	pluginsdk "github.com/ohmyopencode/bot-platform/packages/plugin-sdk"
 )
@@ -66,6 +69,98 @@ func TestRolloutManagerActivatesPreparedRecord(t *testing.T) {
 	}
 	if record.Status != pluginsdk.RolloutStatusActivated {
 		t.Fatalf("expected activated rollout record, got %+v", record)
+	}
+}
+
+func TestSQLiteRolloutManagerPersistsPrepareRecordAcrossRestart(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "state.db")
+	store, err := OpenSQLiteStateStore(path)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	manager := NewSQLiteRolloutManager(
+		manifestMapReader{"plugin-echo": {ID: "plugin-echo", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess}},
+		manifestMapReader{"plugin-echo": {ID: "plugin-echo", Version: "0.2.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess}},
+		store,
+	)
+	manager.now = func() time.Time { return time.Date(2026, 4, 19, 11, 0, 0, 0, time.UTC) }
+	if _, err := manager.Prepare("plugin-echo"); err != nil {
+		t.Fatalf("prepare rollout: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	reopened, err := OpenSQLiteStateStore(path)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer func() { _ = reopened.Close() }()
+	manager2 := NewSQLiteRolloutManager(
+		manifestMapReader{"plugin-echo": {ID: "plugin-echo", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess}},
+		manifestMapReader{"plugin-echo": {ID: "plugin-echo", Version: "0.2.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess}},
+		reopened,
+	)
+	record, ok := manager2.Record("plugin-echo")
+	if !ok || record.Status != pluginsdk.RolloutStatusPrepared || record.CandidateVersion != "0.2.0" {
+		t.Fatalf("expected persisted prepared rollout record after restore, got %+v ok=%v", record, ok)
+	}
+	records, err := reopened.ListRolloutOperationRecords(context.Background())
+	if err != nil {
+		t.Fatalf("list rollout operation records: %v", err)
+	}
+	if len(records) != 1 || records[0].Action != "prepare" || records[0].Status != "prepared" {
+		t.Fatalf("expected one persisted prepare operation, got %+v", records)
+	}
+}
+
+func TestSQLiteRolloutManagerPersistsActivateRecordAcrossRestart(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "state.db")
+	store, err := OpenSQLiteStateStore(path)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	manager := NewSQLiteRolloutManager(
+		manifestMapReader{"plugin-echo": {ID: "plugin-echo", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess}},
+		manifestMapReader{"plugin-echo": {ID: "plugin-echo", Version: "0.2.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess}},
+		store,
+	)
+	manager.now = func() time.Time { return time.Date(2026, 4, 19, 11, 30, 0, 0, time.UTC) }
+	if _, err := manager.Prepare("plugin-echo"); err != nil {
+		t.Fatalf("prepare rollout: %v", err)
+	}
+	manager.now = func() time.Time { return time.Date(2026, 4, 19, 11, 31, 0, 0, time.UTC) }
+	if _, err := manager.Activate("plugin-echo"); err != nil {
+		t.Fatalf("activate rollout: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	reopened, err := OpenSQLiteStateStore(path)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer func() { _ = reopened.Close() }()
+
+	manager2 := NewSQLiteRolloutManager(
+		manifestMapReader{"plugin-echo": {ID: "plugin-echo", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess}},
+		manifestMapReader{"plugin-echo": {ID: "plugin-echo", Version: "0.2.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess}},
+		reopened,
+	)
+	record, ok := manager2.Record("plugin-echo")
+	if !ok || record.Status != pluginsdk.RolloutStatusActivated {
+		t.Fatalf("expected persisted activated rollout record after restore, got %+v ok=%v", record, ok)
+	}
+	records, err := reopened.ListRolloutOperationRecords(context.Background())
+	if err != nil {
+		t.Fatalf("list rollout operation records: %v", err)
+	}
+	if len(records) != 2 || records[0].Action != "activate" || records[0].Status != "activated" {
+		t.Fatalf("expected persisted activate operation first, got %+v", records)
 	}
 }
 
@@ -186,8 +281,8 @@ func TestRolloutPolicyDeclarationMatchesCurrentRuntimeBoundaries(t *testing.T) {
 	t.Parallel()
 
 	policy := RolloutPolicy()
-	if policy.RecordStore != "in-memory-per-runtime-process" {
-		t.Fatalf("expected in-memory rollout record store, got %+v", policy)
+	if policy.RecordStore != "sqlite-current-runtime-rollout-operations" {
+		t.Fatalf("expected sqlite rollout record store, got %+v", policy)
 	}
 	for _, expected := range []string{"/admin prepare <plugin-id>", "/admin activate <plugin-id>", "manifest.id-match", "manifest.mode-match", "manifest.api-version-match", "manifest.version-changed", "prepared-record-required", "prepare-time-drift-recheck", "lifecycle-enable-before-activated-mark", "rollout_prepared", "rollout_activated", "rollout_drifted", "rollout_failed", "rollback", "staged-rollout", "persisted-rollout-history"} {
 		if !strings.Contains(policy.Summary, "manual /admin prepare|activate only") && expected == "/admin prepare <plugin-id>" {
@@ -198,7 +293,7 @@ func TestRolloutPolicyDeclarationMatchesCurrentRuntimeBoundaries(t *testing.T) {
 			t.Fatalf("expected rollout policy declaration to contain %q, got %+v", expected, policy)
 		}
 	}
-	if !strings.Contains(policy.Summary, "no rollback or persisted rollout history") {
+	if !strings.Contains(policy.Summary, "no rollback or staged rollout") {
 		t.Fatalf("expected rollout summary to describe unsupported boundaries, got %+v", policy)
 	}
 }

@@ -18,6 +18,8 @@ type ConsoleAPI struct {
 	queue            *JobQueue
 	jobs             consoleJobReader
 	alerts           consoleAlertReader
+	replayOps        consoleReplayOperationReader
+	rolloutOps       consoleRolloutOperationReader
 	schedules        consoleScheduleReader
 	adapterInstances consoleAdapterInstanceReader
 	pluginSnapshots  consolePluginSnapshotReader
@@ -101,6 +103,14 @@ type consoleAlertReader interface {
 	ListAlerts() ([]AlertRecord, error)
 }
 
+type consoleReplayOperationReader interface {
+	ListReplayOperationRecords() ([]ReplayOperationRecord, error)
+}
+
+type consoleRolloutOperationReader interface {
+	ListRolloutOperationRecords() ([]RolloutOperationRecord, error)
+}
+
 type ConsoleJob struct {
 	ID                      string                  `json:"id"`
 	Type                    string                  `json:"type"`
@@ -176,6 +186,34 @@ type ConsoleRecovery struct {
 	InvalidSchedules   int            `json:"invalidSchedules"`
 	ScheduleKinds      map[string]int `json:"scheduleKinds,omitempty"`
 	Summary            string         `json:"summary,omitempty"`
+}
+
+type ConsoleReplayOperation struct {
+	ReplayID      string     `json:"replayId"`
+	SourceEventID string     `json:"sourceEventId"`
+	ReplayEventID string     `json:"replayEventId"`
+	Status        string     `json:"status"`
+	Reason        string     `json:"reason,omitempty"`
+	OccurredAt    *time.Time `json:"occurredAt,omitempty"`
+	UpdatedAt     *time.Time `json:"updatedAt,omitempty"`
+	StateSource   string     `json:"stateSource,omitempty"`
+	Persisted     bool       `json:"persisted"`
+	Summary       string     `json:"summary,omitempty"`
+}
+
+type ConsoleRolloutOperation struct {
+	OperationID      string     `json:"operationId"`
+	PluginID         string     `json:"pluginId"`
+	Action           string     `json:"action"`
+	CurrentVersion   string     `json:"currentVersion,omitempty"`
+	CandidateVersion string     `json:"candidateVersion,omitempty"`
+	Status           string     `json:"status"`
+	Reason           string     `json:"reason,omitempty"`
+	OccurredAt       *time.Time `json:"occurredAt,omitempty"`
+	UpdatedAt        *time.Time `json:"updatedAt,omitempty"`
+	StateSource      string     `json:"stateSource,omitempty"`
+	Persisted        bool       `json:"persisted"`
+	Summary          string     `json:"summary,omitempty"`
 }
 
 type ConsoleObservability struct {
@@ -269,6 +307,14 @@ type sqliteConsoleAlertReader struct {
 	store *SQLiteStateStore
 }
 
+type sqliteConsoleReplayOperationReader struct {
+	store *SQLiteStateStore
+}
+
+type sqliteConsoleRolloutOperationReader struct {
+	store *SQLiteStateStore
+}
+
 type RuntimeStatus struct {
 	Adapters  int `json:"adapters"`
 	Plugins   int `json:"plugins"`
@@ -293,6 +339,20 @@ func NewSQLiteConsoleAlertReader(store *SQLiteStateStore) consoleAlertReader {
 		return nil
 	}
 	return sqliteConsoleAlertReader{store: store}
+}
+
+func NewSQLiteConsoleReplayOperationReader(store *SQLiteStateStore) consoleReplayOperationReader {
+	if store == nil {
+		return nil
+	}
+	return sqliteConsoleReplayOperationReader{store: store}
+}
+
+func NewSQLiteConsoleRolloutOperationReader(store *SQLiteStateStore) consoleRolloutOperationReader {
+	if store == nil {
+		return nil
+	}
+	return sqliteConsoleRolloutOperationReader{store: store}
 }
 
 func NewSQLiteConsoleScheduleReader(store *SQLiteStateStore) consoleScheduleReader {
@@ -368,6 +428,14 @@ func (c *ConsoleAPI) SetJobReader(reader consoleJobReader) {
 
 func (c *ConsoleAPI) SetAlertReader(reader consoleAlertReader) {
 	c.alerts = reader
+}
+
+func (c *ConsoleAPI) SetReplayOperationReader(reader consoleReplayOperationReader) {
+	c.replayOps = reader
+}
+
+func (c *ConsoleAPI) SetRolloutOperationReader(reader consoleRolloutOperationReader) {
+	c.rolloutOps = reader
 }
 
 func (c *ConsoleAPI) SetRecoverySource(source consoleRecoverySource) {
@@ -920,6 +988,62 @@ func (c *ConsoleAPI) Alerts() ([]AlertRecord, error) {
 	return alerts, nil
 }
 
+func (c *ConsoleAPI) ReplayOperations() ([]ConsoleReplayOperation, error) {
+	if c.replayOps == nil {
+		return nil, nil
+	}
+	records, err := c.replayOps.ListReplayOperationRecords()
+	if err != nil {
+		return nil, fmt.Errorf("load console replay operations: %w", err)
+	}
+	items := make([]ConsoleReplayOperation, 0, len(records))
+	for _, record := range records {
+		item := ConsoleReplayOperation{
+			ReplayID:      record.ReplayID,
+			SourceEventID: record.SourceEventID,
+			ReplayEventID: record.ReplayEventID,
+			Status:        record.Status,
+			Reason:        record.Reason,
+			OccurredAt:    nullableConsoleTime(record.OccurredAt),
+			UpdatedAt:     nullableConsoleTime(record.UpdatedAt),
+			StateSource:   "sqlite-replay-operation-records",
+			Persisted:     true,
+		}
+		item.Summary = consoleReplayOperationSummary(item)
+		items = append(items, item)
+	}
+	return items, nil
+}
+
+func (c *ConsoleAPI) RolloutOperations() ([]ConsoleRolloutOperation, error) {
+	if c.rolloutOps == nil {
+		return nil, nil
+	}
+	records, err := c.rolloutOps.ListRolloutOperationRecords()
+	if err != nil {
+		return nil, fmt.Errorf("load console rollout operations: %w", err)
+	}
+	items := make([]ConsoleRolloutOperation, 0, len(records))
+	for _, record := range records {
+		item := ConsoleRolloutOperation{
+			OperationID:      record.OperationID,
+			PluginID:         record.PluginID,
+			Action:           record.Action,
+			CurrentVersion:   record.CurrentVersion,
+			CandidateVersion: record.CandidateVersion,
+			Status:           record.Status,
+			Reason:           record.Reason,
+			OccurredAt:       nullableConsoleTime(record.OccurredAt),
+			UpdatedAt:        nullableConsoleTime(record.UpdatedAt),
+			StateSource:      "sqlite-rollout-operation-records",
+			Persisted:        true,
+		}
+		item.Summary = consoleRolloutOperationSummary(item)
+		items = append(items, item)
+	}
+	return items, nil
+}
+
 func (c *ConsoleAPI) Audits() []pluginsdk.AuditEntry {
 	if c.audits == nil {
 		return nil
@@ -999,6 +1123,14 @@ func (c *ConsoleAPI) renderJSONWithFilters(logQuery, jobQuery, pluginID string) 
 	if err != nil {
 		return "", err
 	}
+	replayOps, err := c.ReplayOperations()
+	if err != nil {
+		return "", err
+	}
+	rolloutOps, err := c.RolloutOperations()
+	if err != nil {
+		return "", err
+	}
 	jobs, err := c.FilteredJobs(jobQuery)
 	if err != nil {
 		return "", err
@@ -1014,6 +1146,8 @@ func (c *ConsoleAPI) renderJSONWithFilters(logQuery, jobQuery, pluginID string) 
 	payload := map[string]any{
 		"adapters":      adapterInstances,
 		"alerts":        alerts,
+		"replayOps":     replayOps,
+		"rolloutOps":    rolloutOps,
 		"plugins":       c.FilteredPlugins(pluginID),
 		"jobs":          jobs,
 		"schedules":     schedules,
@@ -1196,6 +1330,14 @@ func (r sqliteConsoleAlertReader) ListAlerts() ([]AlertRecord, error) {
 	return r.store.ListAlerts(context.Background())
 }
 
+func (r sqliteConsoleReplayOperationReader) ListReplayOperationRecords() ([]ReplayOperationRecord, error) {
+	return r.store.ListReplayOperationRecords(context.Background())
+}
+
+func (r sqliteConsoleRolloutOperationReader) ListRolloutOperationRecords() ([]RolloutOperationRecord, error) {
+	return r.store.ListRolloutOperationRecords(context.Background())
+}
+
 func nullableConsoleTime(value time.Time) *time.Time {
 	if value.IsZero() {
 		return nil
@@ -1305,6 +1447,31 @@ func consoleObservabilitySummary(obs ConsoleObservability) string {
 	}
 	if obs.TraceStateSource != "" {
 		parts = append(parts, "traces="+obs.TraceStateSource)
+	}
+	return strings.Join(parts, " | ")
+}
+
+func consoleReplayOperationSummary(item ConsoleReplayOperation) string {
+	parts := []string{fmt.Sprintf("replay %s source=%s result=%s", item.Status, item.SourceEventID, item.ReplayEventID)}
+	if item.StateSource != "" {
+		parts = append(parts, "via "+item.StateSource)
+	}
+	if item.Reason != "" {
+		parts = append(parts, "reason="+item.Reason)
+	}
+	return strings.Join(parts, " | ")
+}
+
+func consoleRolloutOperationSummary(item ConsoleRolloutOperation) string {
+	parts := []string{fmt.Sprintf("rollout %s %s for %s", item.Action, item.Status, item.PluginID)}
+	if item.CurrentVersion != "" || item.CandidateVersion != "" {
+		parts = append(parts, fmt.Sprintf("current=%s candidate=%s", item.CurrentVersion, item.CandidateVersion))
+	}
+	if item.StateSource != "" {
+		parts = append(parts, "via "+item.StateSource)
+	}
+	if item.Reason != "" {
+		parts = append(parts, "reason="+item.Reason)
 	}
 	return strings.Join(parts, " | ")
 }
