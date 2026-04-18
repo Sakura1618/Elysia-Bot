@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -13,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	eventmodel "github.com/ohmyopencode/bot-platform/packages/event-model"
 	runtimecore "github.com/ohmyopencode/bot-platform/packages/runtime-core"
 )
 
@@ -155,6 +158,119 @@ func readRuntimeHealthResponse(t *testing.T, app *runtimeApp) (int, runtimeHealt
 	return resp.Code, decodeRuntimeHealthResponse(t, resp.Body.Bytes())
 }
 
+type testRuntimeSmokeStoreSaveAttempt struct {
+	Key     string
+	EventID string
+}
+
+type testRuntimeSmokeStore struct {
+	counts             map[string]int
+	duplicateKeys      map[string]bool
+	hasIdempotencyErr  error
+	recordEventErr     error
+	saveIdempotencyErr error
+	hasCalls           []string
+	recordCalls        []string
+	saveCalls          []testRuntimeSmokeStoreSaveAttempt
+	closeCalls         int
+}
+
+func newTestRuntimeSmokeStore() *testRuntimeSmokeStore {
+	return &testRuntimeSmokeStore{
+		counts: map[string]int{
+			"event_journal":    0,
+			"idempotency_keys": 0,
+		},
+		duplicateKeys: map[string]bool{},
+	}
+}
+
+func (s *testRuntimeSmokeStore) RecordEvent(_ context.Context, event eventmodel.Event) error {
+	s.recordCalls = append(s.recordCalls, event.EventID)
+	if s.recordEventErr != nil {
+		return s.recordEventErr
+	}
+	s.counts["event_journal"]++
+	return nil
+}
+
+func (s *testRuntimeSmokeStore) SaveIdempotencyKey(_ context.Context, key string, eventID string) error {
+	s.saveCalls = append(s.saveCalls, testRuntimeSmokeStoreSaveAttempt{Key: key, EventID: eventID})
+	if s.saveIdempotencyErr != nil {
+		return s.saveIdempotencyErr
+	}
+	s.counts["idempotency_keys"]++
+	s.duplicateKeys[key] = true
+	return nil
+}
+
+func (s *testRuntimeSmokeStore) HasIdempotencyKey(_ context.Context, key string) (bool, error) {
+	s.hasCalls = append(s.hasCalls, key)
+	if s.hasIdempotencyErr != nil {
+		return false, s.hasIdempotencyErr
+	}
+	return s.duplicateKeys[key], nil
+}
+
+func (s *testRuntimeSmokeStore) Counts(_ context.Context) (map[string]int, error) {
+	return map[string]int{
+		"event_journal":    s.counts["event_journal"],
+		"idempotency_keys": s.counts["idempotency_keys"],
+	}, nil
+}
+
+func (s *testRuntimeSmokeStore) Close() error {
+	s.closeCalls++
+	return nil
+}
+
+func runtimeDemoOneBotMessageBody(t *testing.T, messageID int64, rawMessage string) string {
+	t.Helper()
+	encodedRawMessage, err := json.Marshal(rawMessage)
+	if err != nil {
+		t.Fatalf("marshal raw onebot message: %v", err)
+	}
+	return `{"post_type":"message","message_type":"group","time":1712034000,"user_id":10001,"group_id":42,"message_id":` + strconv.FormatInt(messageID, 10) + `,"raw_message":` + string(encodedRawMessage) + `,"sender":{"nickname":"alice"}}`
+}
+
+func performRuntimeOneBotMessageRequest(t *testing.T, app *runtimeApp, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/demo/onebot/message", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	app.ServeHTTP(resp, req)
+	return resp
+}
+
+func assertRuntimeSmokeCounts(t *testing.T, app *runtimeApp, expectedEventJournal int, expectedIdempotencyKeys int) {
+	t.Helper()
+	counts, err := app.runtimeStateCounts(t.Context())
+	if err != nil {
+		t.Fatalf("runtime state counts: %v", err)
+	}
+	if counts["event_journal"] != expectedEventJournal || counts["idempotency_keys"] != expectedIdempotencyKeys {
+		t.Fatalf("expected smoke counts event_journal=%d idempotency_keys=%d, got %+v", expectedEventJournal, expectedIdempotencyKeys, counts)
+	}
+}
+
+func runtimePostgresTestDSN(t *testing.T) string {
+	t.Helper()
+	dsn := strings.TrimSpace(os.Getenv(runtimePostgresTestDSNEnv))
+	if dsn == "" {
+		t.Skipf("set %s to run runtime Postgres smoke test", runtimePostgresTestDSNEnv)
+	}
+	return dsn
+}
+
+func newRuntimePostgresSmokeStoreApp(t *testing.T) *runtimeApp {
+	t.Helper()
+	app, err := newRuntimeApp(writeTestConfigWithPostgresSmokeStoreAt(t, t.TempDir(), runtimePostgresTestDSN(t)))
+	if err != nil {
+		t.Fatalf("new runtime app with postgres smoke store: %v", err)
+	}
+	return app
+}
+
 func waitForSchedulerRunningState(t *testing.T, app *runtimeApp, expected bool) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
@@ -181,6 +297,58 @@ func readRuntimeConsoleResponse(t *testing.T, app *runtimeApp) runtimeConsoleRes
 		t.Fatalf("decode console payload: %v", err)
 	}
 	return payload
+}
+
+func dispatchRuntimeAdminReplay(t *testing.T, app *runtimeApp, actor string, eventID string) error {
+	t.Helper()
+	if strings.TrimSpace(actor) == "" {
+		actor = "replay-user"
+	}
+	return app.runtime.DispatchCommand(t.Context(), eventmodel.CommandInvocation{
+		Name:     "admin",
+		Raw:      "/admin replay " + eventID,
+		Metadata: map[string]any{"actor": actor},
+	}, eventmodel.ExecutionContext{
+		TraceID: "trace-admin-replay-" + eventID,
+		EventID: "evt-admin-replay-" + eventID,
+	})
+}
+
+func runtimeStoredReplayableEvent(eventID string, message string) eventmodel.Event {
+	now := time.Date(2026, 4, 18, 12, 0, 0, 0, time.UTC)
+	return eventmodel.Event{
+		EventID:        eventID,
+		TraceID:        "trace-" + eventID,
+		Source:         "onebot",
+		Type:           "message.received",
+		Timestamp:      now,
+		IdempotencyKey: "stored:" + eventID,
+		Actor:          &eventmodel.Actor{ID: "user-1", Type: "user", DisplayName: "alice"},
+		Channel:        &eventmodel.Channel{ID: "group-42", Type: "group", Title: "group-42"},
+		Message:        &eventmodel.Message{ID: "msg-" + eventID, Text: message},
+		Reply: &eventmodel.ReplyHandle{
+			Capability: "onebot.reply",
+			TargetID:   "group-42",
+			MessageID:  "msg-" + eventID,
+			Metadata: map[string]any{
+				"message_type": "group",
+				"group_id":     42,
+				"user_id":      10001,
+			},
+		},
+	}
+}
+
+type failingReplayJournalSmokeStore struct {
+	runtimeSmokeStore
+	loadErr error
+}
+
+func (s failingReplayJournalSmokeStore) LoadEvent(_ context.Context, _ string) (eventmodel.Event, error) {
+	if s.loadErr != nil {
+		return eventmodel.Event{}, s.loadErr
+	}
+	return eventmodel.Event{}, errors.New("replay load failed")
 }
 
 func consoleMetaString(t *testing.T, meta map[string]any, key string) string {
@@ -299,6 +467,45 @@ func writeWriteActionRBACConfig(t *testing.T) string {
 		t.Fatalf("write config: %v", err)
 	}
 	return path
+}
+
+func writeReplayRBACConfigAt(t *testing.T, dir string, backend string, dsn string) string {
+	t.Helper()
+	var builder strings.Builder
+	builder.WriteString("runtime:\n")
+	builder.WriteString("  environment: test\n")
+	builder.WriteString("  log_level: debug\n")
+	builder.WriteString("  http_port: 18080\n")
+	builder.WriteString("  sqlite_path: " + filepath.ToSlash(filepath.Join(dir, "runtime.sqlite")) + "\n")
+	if strings.TrimSpace(backend) != "" && strings.TrimSpace(backend) != "sqlite" {
+		builder.WriteString("  smoke_store_backend: " + strings.TrimSpace(backend) + "\n")
+	}
+	if strings.TrimSpace(dsn) != "" {
+		builder.WriteString("  postgres_dsn: \"" + strings.ReplaceAll(dsn, "\"", "\\\"") + "\"\n")
+	}
+	builder.WriteString("  scheduler_interval_ms: 20\n")
+	builder.WriteString("rbac:\n")
+	builder.WriteString("  actor_roles:\n")
+	builder.WriteString("    replay-user: [replay-operator]\n")
+	builder.WriteString("  policies:\n")
+	builder.WriteString("    replay-operator:\n")
+	builder.WriteString("      permissions: [plugin:replay]\n")
+	builder.WriteString("      event_scope: ['*']\n")
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte(builder.String()), 0o644); err != nil {
+		t.Fatalf("write replay rbac config: %v", err)
+	}
+	return path
+}
+
+func writeReplayRBACConfig(t *testing.T) string {
+	t.Helper()
+	return writeReplayRBACConfigAt(t, t.TempDir(), "sqlite", "")
+}
+
+func writeReplayRBACConfigWithPostgresSmokeStoreAt(t *testing.T, dir string, dsn string) string {
+	t.Helper()
+	return writeReplayRBACConfigAt(t, dir, "postgres", dsn)
 }
 
 func decodeRuntimeConfigCheckResult(t *testing.T, raw []byte) runtimeConfigCheckResult {
@@ -574,6 +781,114 @@ func TestRuntimeAppDemoOneBotMessage(t *testing.T) {
 	}
 }
 
+func TestRuntimeAppSmokeStoreFailureDuplicateCheckStopsDispatch(t *testing.T) {
+	t.Parallel()
+
+	app, err := newRuntimeApp(writeTestConfig(t))
+	if err != nil {
+		t.Fatalf("new runtime app: %v", err)
+	}
+	defer func() { _ = app.Close() }()
+
+	stub := newTestRuntimeSmokeStore()
+	stub.hasIdempotencyErr = errors.New("duplicate-check failed")
+	app.smokeStore = stub
+
+	resp := performRuntimeOneBotMessageRequest(t, app, runtimeDemoOneBotMessageBody(t, 9201, "duplicate check fails"))
+	if resp.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d: %s", resp.Code, resp.Body.String())
+	}
+	if !strings.Contains(resp.Body.String(), stub.hasIdempotencyErr.Error()) {
+		t.Fatalf("expected duplicate-check error in response, got %s", resp.Body.String())
+	}
+	if app.replies.Count() != 0 {
+		t.Fatalf("expected duplicate-check failure to stop dispatch replies, got %+v", app.replies.Since(0))
+	}
+	if len(app.runtime.DispatchResults()) != 0 {
+		t.Fatalf("expected duplicate-check failure before dispatch, got %+v", app.runtime.DispatchResults())
+	}
+	if len(stub.hasCalls) != 1 {
+		t.Fatalf("expected one duplicate-check attempt, got %+v", stub.hasCalls)
+	}
+	if len(stub.recordCalls) != 0 || len(stub.saveCalls) != 0 {
+		t.Fatalf("expected duplicate-check failure to avoid writes, recordCalls=%+v saveCalls=%+v", stub.recordCalls, stub.saveCalls)
+	}
+	assertRuntimeSmokeCounts(t, app, 0, 0)
+}
+
+func TestRuntimeAppSmokeStoreFailureRecordEventLeavesCountsFlat(t *testing.T) {
+	t.Parallel()
+
+	app, err := newRuntimeApp(writeTestConfig(t))
+	if err != nil {
+		t.Fatalf("new runtime app: %v", err)
+	}
+	defer func() { _ = app.Close() }()
+
+	stub := newTestRuntimeSmokeStore()
+	stub.recordEventErr = errors.New("record-event failed")
+	app.smokeStore = stub
+
+	resp := performRuntimeOneBotMessageRequest(t, app, runtimeDemoOneBotMessageBody(t, 9202, "record event fails"))
+	if resp.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d: %s", resp.Code, resp.Body.String())
+	}
+	if !strings.Contains(resp.Body.String(), stub.recordEventErr.Error()) {
+		t.Fatalf("expected record-event error in response, got %s", resp.Body.String())
+	}
+	if app.replies.Count() != 1 {
+		t.Fatalf("expected dispatch to happen before record-event failure, got replies %+v", app.replies.Since(0))
+	}
+	if len(app.runtime.DispatchResults()) == 0 {
+		t.Fatal("expected dispatch results before record-event failure")
+	}
+	if len(stub.hasCalls) != 1 || len(stub.recordCalls) != 1 {
+		t.Fatalf("expected duplicate check then one record-event attempt, hasCalls=%+v recordCalls=%+v", stub.hasCalls, stub.recordCalls)
+	}
+	if len(stub.saveCalls) != 0 {
+		t.Fatalf("expected record-event failure to stop before idempotency write, got %+v", stub.saveCalls)
+	}
+	assertRuntimeSmokeCounts(t, app, 0, 0)
+}
+
+func TestRuntimeAppSmokeStoreFailureSaveIdempotencyExposesAttempt(t *testing.T) {
+	t.Parallel()
+
+	app, err := newRuntimeApp(writeTestConfig(t))
+	if err != nil {
+		t.Fatalf("new runtime app: %v", err)
+	}
+	defer func() { _ = app.Close() }()
+
+	stub := newTestRuntimeSmokeStore()
+	stub.saveIdempotencyErr = errors.New("save-idempotency failed")
+	app.smokeStore = stub
+
+	resp := performRuntimeOneBotMessageRequest(t, app, runtimeDemoOneBotMessageBody(t, 9203, "save idempotency fails"))
+	if resp.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d: %s", resp.Code, resp.Body.String())
+	}
+	if !strings.Contains(resp.Body.String(), stub.saveIdempotencyErr.Error()) {
+		t.Fatalf("expected save-idempotency error in response, got %s", resp.Body.String())
+	}
+	if app.replies.Count() != 1 {
+		t.Fatalf("expected dispatch to happen before save-idempotency failure, got replies %+v", app.replies.Since(0))
+	}
+	if len(app.runtime.DispatchResults()) == 0 {
+		t.Fatal("expected dispatch results before save-idempotency failure")
+	}
+	if len(stub.hasCalls) != 1 || len(stub.recordCalls) != 1 || len(stub.saveCalls) != 1 {
+		t.Fatalf("expected duplicate check, event record, and one idempotency attempt, hasCalls=%+v recordCalls=%+v saveCalls=%+v", stub.hasCalls, stub.recordCalls, stub.saveCalls)
+	}
+	if stub.saveCalls[0].Key == "" || stub.saveCalls[0].EventID == "" {
+		t.Fatalf("expected idempotency attempt details to be visible, got %+v", stub.saveCalls[0])
+	}
+	if stub.saveCalls[0].EventID != stub.recordCalls[0] {
+		t.Fatalf("expected idempotency attempt to target recorded event %q, got %+v", stub.recordCalls[0], stub.saveCalls[0])
+	}
+	assertRuntimeSmokeCounts(t, app, 1, 0)
+}
+
 func TestRuntimeAppPostgresSmokeStoreStartupFailsLoudlyOnBadDSN(t *testing.T) {
 	t.Parallel()
 
@@ -590,16 +905,7 @@ func TestRuntimeAppPostgresSmokeStoreStartupFailsLoudlyOnBadDSN(t *testing.T) {
 }
 
 func TestRuntimeAppDemoOneBotMessageWithPostgresSmokeStore(t *testing.T) {
-	dsn := strings.TrimSpace(os.Getenv(runtimePostgresTestDSNEnv))
-	if dsn == "" {
-		t.Skipf("set %s to run runtime Postgres smoke test", runtimePostgresTestDSNEnv)
-	}
-
-	configPath := writeTestConfigWithPostgresSmokeStoreAt(t, t.TempDir(), dsn)
-	app, err := newRuntimeApp(configPath)
-	if err != nil {
-		t.Fatalf("new runtime app with postgres smoke store: %v", err)
-	}
+	app := newRuntimePostgresSmokeStoreApp(t)
 	defer func() { _ = app.Close() }()
 
 	beforeCounts, err := app.runtimeStateCounts(t.Context())
@@ -607,13 +913,8 @@ func TestRuntimeAppDemoOneBotMessageWithPostgresSmokeStore(t *testing.T) {
 		t.Fatalf("runtime state counts before request: %v", err)
 	}
 	messageID := time.Now().UnixNano()
-	messageBody := `{"post_type":"message","message_type":"group","time":1712034000,"user_id":10001,"group_id":42,"message_id":` + strconv.FormatInt(messageID, 10) + `,"raw_message":"hello postgres runtime","sender":{"nickname":"alice"}}`
-
-	req := httptest.NewRequest(http.MethodPost, "/demo/onebot/message", strings.NewReader(messageBody))
-	req.Header.Set("Content-Type", "application/json")
-	resp := httptest.NewRecorder()
-
-	app.ServeHTTP(resp, req)
+	messageBody := runtimeDemoOneBotMessageBody(t, messageID, "hello postgres runtime")
+	resp := performRuntimeOneBotMessageRequest(t, app, messageBody)
 
 	if resp.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", resp.Code, resp.Body.String())
@@ -663,6 +964,16 @@ func TestRuntimeAppDemoOneBotMessageWithPostgresSmokeStore(t *testing.T) {
 	if !strings.Contains(dupResp.Body.String(), `"duplicate":true`) && !strings.Contains(dupResp.Body.String(), `"duplicate": true`) {
 		t.Fatalf("expected duplicate response from postgres idempotency store, got %s", dupResp.Body.String())
 	}
+	afterDuplicateCounts, err := app.runtimeStateCounts(t.Context())
+	if err != nil {
+		t.Fatalf("runtime state counts after duplicate request: %v", err)
+	}
+	if afterDuplicateCounts["event_journal"] != afterCounts["event_journal"] {
+		t.Fatalf("expected duplicate request to leave postgres-backed event_journal flat, afterFirst=%+v afterDuplicate=%+v", afterCounts, afterDuplicateCounts)
+	}
+	if afterDuplicateCounts["idempotency_keys"] != afterCounts["idempotency_keys"] {
+		t.Fatalf("expected duplicate request to leave postgres-backed idempotency flat, afterFirst=%+v afterDuplicate=%+v", afterCounts, afterDuplicateCounts)
+	}
 
 	sqliteCounts, err := app.state.Counts(t.Context())
 	if err != nil {
@@ -670,6 +981,56 @@ func TestRuntimeAppDemoOneBotMessageWithPostgresSmokeStore(t *testing.T) {
 	}
 	if sqliteCounts["event_journal"] != 0 || sqliteCounts["idempotency_keys"] != 0 {
 		t.Fatalf("expected sqlite to remain out of smoke persistence path when postgres selected, got %+v", sqliteCounts)
+	}
+}
+
+func TestRuntimeAppPostgresSmokeStoreClosedCountsEndpointFailsLoudly(t *testing.T) {
+	app := newRuntimePostgresSmokeStoreApp(t)
+	defer func() { _ = app.Close() }()
+
+	if err := app.smokeStore.Close(); err != nil {
+		t.Fatalf("close postgres smoke store: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/demo/state/counts", nil)
+	resp := httptest.NewRecorder()
+	app.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusInternalServerError {
+		t.Fatalf("expected counts 500 after closing postgres smoke store, got %d: %s", resp.Code, resp.Body.String())
+	}
+	if !strings.Contains(resp.Body.String(), "load postgres smoke counts") {
+		t.Fatalf("expected counts failure to identify postgres smoke counts path, got %s", resp.Body.String())
+	}
+	if !strings.Contains(strings.ToLower(resp.Body.String()), "closed") {
+		t.Fatalf("expected counts failure to mention closed smoke store, got %s", resp.Body.String())
+	}
+}
+
+func TestRuntimeAppPostgresSmokeStoreClosedHealthzShowsStorageError(t *testing.T) {
+	app := newRuntimePostgresSmokeStoreApp(t)
+	defer func() { _ = app.Close() }()
+
+	waitForSchedulerRunningState(t, app, true)
+	if err := app.smokeStore.Close(); err != nil {
+		t.Fatalf("close postgres smoke store: %v", err)
+	}
+
+	statusCode, payload := readRuntimeHealthResponse(t, app)
+	if statusCode != http.StatusServiceUnavailable {
+		t.Fatalf("expected healthz 503 after closing postgres smoke store, got %d: %+v", statusCode, payload)
+	}
+	if payload.Status != "error" {
+		t.Fatalf("expected overall health error, got %+v", payload)
+	}
+	if payload.Components.Storage.Status != "error" {
+		t.Fatalf("expected storage error after closing postgres smoke store, got %+v", payload)
+	}
+	if !strings.Contains(payload.Components.Storage.Error, "load postgres smoke counts") {
+		t.Fatalf("expected storage error to identify postgres smoke counts path, got %+v", payload)
+	}
+	if payload.Components.Scheduler.Status != "ok" || !payload.Components.Scheduler.Running {
+		t.Fatalf("expected scheduler visibility to remain ok/running during postgres smoke failure, got %+v", payload)
 	}
 }
 
@@ -1102,6 +1463,153 @@ func TestRuntimeAppSkipsDuplicateIdempotencyKey(t *testing.T) {
 	}
 	if counts["event_journal"] != 1 || counts["idempotency_keys"] != 1 {
 		t.Fatalf("expected one persisted event and one idempotency key, got %+v", counts)
+	}
+}
+
+func TestRuntimeAppReplayUsesSQLiteSelectedBackendEventJournal(t *testing.T) {
+	t.Parallel()
+
+	app, err := newRuntimeApp(writeReplayRBACConfig(t))
+	if err != nil {
+		t.Fatalf("new runtime app: %v", err)
+	}
+	defer func() { _ = app.Close() }()
+
+	if app.replay == nil {
+		t.Fatal("expected runtime app to provide non-nil replay service")
+	}
+	stored := runtimeStoredReplayableEvent("evt-runtime-replay-sqlite", "replay from sqlite")
+	if err := app.state.RecordEvent(t.Context(), stored); err != nil {
+		t.Fatalf("record sqlite replay source event: %v", err)
+	}
+	beforeReplies := app.replies.Count()
+	beforeDispatches := len(app.runtime.DispatchResults())
+
+	if err := dispatchRuntimeAdminReplay(t, app, "replay-user", stored.EventID); err != nil {
+		t.Fatalf("dispatch sqlite replay admin command: %v", err)
+	}
+
+	replies := app.replies.Since(beforeReplies)
+	if len(replies) != 1 || replies[0].Payload != "echo: replay from sqlite" {
+		t.Fatalf("expected sqlite replay to redispatch stored event, got %+v", replies)
+	}
+	if len(app.runtime.DispatchResults()) <= beforeDispatches {
+		t.Fatalf("expected replay to add runtime dispatch evidence, got %+v", app.runtime.DispatchResults())
+	}
+	entries := app.audits.AuditEntries()
+	if len(entries) == 0 {
+		t.Fatal("expected replay audit evidence")
+	}
+	lastEntry := entries[len(entries)-1]
+	if lastEntry.Actor != "replay-user" || lastEntry.Action != "replay" || lastEntry.Target != stored.EventID || !lastEntry.Allowed || lastEntry.Permission != "plugin:replay" {
+		t.Fatalf("expected allowed replay audit entry, got %+v", lastEntry)
+	}
+}
+
+func TestRuntimeAppReplayUsesPostgresSelectedBackendEventJournal(t *testing.T) {
+	dir := t.TempDir()
+	app, err := newRuntimeApp(writeReplayRBACConfigWithPostgresSmokeStoreAt(t, dir, runtimePostgresTestDSN(t)))
+	if err != nil {
+		t.Fatalf("new runtime app with postgres replay config: %v", err)
+	}
+	defer func() { _ = app.Close() }()
+
+	stored := runtimeStoredReplayableEvent("evt-runtime-replay-postgres", "replay from postgres")
+	postgresStore, ok := app.smokeStore.(postgresRuntimeSmokeStore)
+	if !ok {
+		t.Fatalf("expected postgres-selected smoke store, got %T", app.smokeStore)
+	}
+	if err := postgresStore.RecordEvent(t.Context(), stored); err != nil {
+		t.Fatalf("record postgres replay source event: %v", err)
+	}
+	beforeReplies := app.replies.Count()
+
+	if err := dispatchRuntimeAdminReplay(t, app, "replay-user", stored.EventID); err != nil {
+		t.Fatalf("dispatch postgres replay admin command: %v", err)
+	}
+
+	replies := app.replies.Since(beforeReplies)
+	if len(replies) != 1 || replies[0].Payload != "echo: replay from postgres" {
+		t.Fatalf("expected postgres replay to redispatch stored event, got %+v", replies)
+	}
+	sqliteCounts, err := app.state.Counts(t.Context())
+	if err != nil {
+		t.Fatalf("sqlite counts: %v", err)
+	}
+	if sqliteCounts["event_journal"] != 0 {
+		t.Fatalf("expected sqlite event journal to remain empty under postgres replay selection, got %+v", sqliteCounts)
+	}
+	loadedFromPostgres, err := postgresStore.LoadEvent(t.Context(), stored.EventID)
+	if err != nil {
+		t.Fatalf("load replay source event from postgres: %v", err)
+	}
+	if loadedFromPostgres.EventID != stored.EventID || loadedFromPostgres.Message == nil || loadedFromPostgres.Message.Text != stored.Message.Text {
+		t.Fatalf("expected replay source event to be loaded from postgres journal, got %+v", loadedFromPostgres)
+	}
+}
+
+func TestRuntimeAppReplayMissingEventSurfacesSelectedBackendNotFound(t *testing.T) {
+	t.Parallel()
+
+	app, err := newRuntimeApp(writeReplayRBACConfig(t))
+	if err != nil {
+		t.Fatalf("new runtime app: %v", err)
+	}
+	defer func() { _ = app.Close() }()
+
+	err = dispatchRuntimeAdminReplay(t, app, "replay-user", "evt-missing-runtime-replay")
+	if err == nil {
+		t.Fatal("expected replay of missing event to fail")
+	}
+	if !strings.Contains(err.Error(), "load event journal") {
+		t.Fatalf("expected selected backend not-found to surface journal read error, got %v", err)
+	}
+	if app.replies.Count() != 0 {
+		t.Fatalf("expected missing replay source not to dispatch replies, got %+v", app.replies.Since(0))
+	}
+	entries := app.audits.AuditEntries()
+	if len(entries) == 0 {
+		t.Fatal("expected replay failure audit evidence")
+	}
+	lastEntry := entries[len(entries)-1]
+	if lastEntry.Action != "replay" || lastEntry.Target != "evt-missing-runtime-replay" || !lastEntry.Allowed || lastEntry.Reason != "replay_failed" {
+		t.Fatalf("expected replay missing-event audit entry, got %+v", lastEntry)
+	}
+}
+
+func TestRuntimeAppReplayBackendFailureSurfacesRuntimeAdminError(t *testing.T) {
+	t.Parallel()
+
+	app, err := newRuntimeApp(writeReplayRBACConfig(t))
+	if err != nil {
+		t.Fatalf("new runtime app: %v", err)
+	}
+	defer func() { _ = app.Close() }()
+
+	failingStore := failingReplayJournalSmokeStore{
+		runtimeSmokeStore: app.smokeStore,
+		loadErr:           errors.New("backend replay reader unavailable"),
+	}
+	app.smokeStore = failingStore
+	app.replay.journal = failingStore
+
+	err = dispatchRuntimeAdminReplay(t, app, "replay-user", "evt-runtime-replay-backend-fail")
+	if err == nil {
+		t.Fatal("expected replay backend failure to bubble through runtime admin path")
+	}
+	if !strings.Contains(err.Error(), "backend replay reader unavailable") {
+		t.Fatalf("expected replay backend failure in command error, got %v", err)
+	}
+	if app.replies.Count() != 0 {
+		t.Fatalf("expected replay backend failure not to dispatch replies, got %+v", app.replies.Since(0))
+	}
+	entries := app.audits.AuditEntries()
+	if len(entries) == 0 {
+		t.Fatal("expected replay backend failure audit evidence")
+	}
+	lastEntry := entries[len(entries)-1]
+	if lastEntry.Action != "replay" || lastEntry.Target != "evt-runtime-replay-backend-fail" || !lastEntry.Allowed || lastEntry.Reason != "replay_failed" {
+		t.Fatalf("expected replay backend failure audit entry, got %+v", lastEntry)
 	}
 }
 

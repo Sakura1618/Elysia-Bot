@@ -39,6 +39,7 @@ type runtimeApp struct {
 	audits          *runtimecore.InMemoryAuditLog
 	state           *runtimecore.SQLiteStateStore
 	smokeStore      runtimeSmokeStore
+	replay          *runtimeAppReplayService
 	pluginConfigs   appPluginConfigRegistry
 	lifecycle       *runtimecore.PluginLifecycleService
 	queue           *runtimecore.JobQueue
@@ -110,6 +111,10 @@ func (s sqliteRuntimeSmokeStore) RecordEvent(ctx context.Context, event eventmod
 	return s.store.RecordEvent(ctx, event)
 }
 
+func (s sqliteRuntimeSmokeStore) LoadEvent(ctx context.Context, eventID string) (eventmodel.Event, error) {
+	return s.store.LoadEvent(ctx, eventID)
+}
+
 func (s sqliteRuntimeSmokeStore) SaveIdempotencyKey(ctx context.Context, key string, eventID string) error {
 	return s.store.SaveIdempotencyKey(ctx, key, eventID)
 }
@@ -134,6 +139,10 @@ func (s postgresRuntimeSmokeStore) RecordEvent(ctx context.Context, event eventm
 	return s.store.SaveEvent(ctx, event)
 }
 
+func (s postgresRuntimeSmokeStore) LoadEvent(ctx context.Context, eventID string) (eventmodel.Event, error) {
+	return s.store.LoadEvent(ctx, eventID)
+}
+
 func (s postgresRuntimeSmokeStore) SaveIdempotencyKey(ctx context.Context, key string, eventID string) error {
 	return s.store.SaveIdempotencyKey(ctx, key, eventID)
 }
@@ -153,6 +162,18 @@ func (s postgresRuntimeSmokeStore) Counts(ctx context.Context) (map[string]int, 
 func (s postgresRuntimeSmokeStore) Close() error {
 	s.store.Close()
 	return nil
+}
+
+type runtimeAppReplayService struct {
+	journal runtimecore.EventJournalReader
+	runtime *runtimecore.InMemoryRuntime
+}
+
+func (s *runtimeAppReplayService) ReplayEvent(eventID string) (eventmodel.Event, error) {
+	if s == nil {
+		return eventmodel.Event{}, fmt.Errorf("replay service is required")
+	}
+	return runtimecore.NewEventReplayer(s.journal, s.runtime).ReplayEvent(context.Background(), eventID)
 }
 
 const (
@@ -411,6 +432,13 @@ func newRuntimeAppWithOutput(configPath string, output io.Writer) (*runtimeApp, 
 	if config.RBAC != nil {
 		runtime.SetCommandAuthorizer(runtimecore.NewAdminCommandAuthorizer(config.RBAC))
 	}
+	replayJournal, ok := smokeStore.(runtimecore.EventJournalReader)
+	if !ok {
+		_ = smokeStore.Close()
+		_ = state.Close()
+		return nil, fmt.Errorf("selected smoke store backend %q does not implement event journal reader", settings.SmokeStoreBackend)
+	}
+	replayService := &runtimeAppReplayService{journal: replayJournal, runtime: runtime}
 
 	echoBinding, ok := pluginConfigs.Lookup("plugin-echo")
 	if !ok {
@@ -457,7 +485,7 @@ func newRuntimeAppWithOutput(configPath string, output io.Writer) (*runtimeApp, 
 		_ = state.Close()
 		return nil, fmt.Errorf("save ai plugin manifest: %w", err)
 	}
-	adminPlugin := pluginadmin.New(lifecycle, nil, nil, actorRoles(config.RBAC), policies(config.RBAC), audits)
+	adminPlugin := pluginadmin.New(lifecycle, nil, replayService, actorRoles(config.RBAC), policies(config.RBAC), audits)
 	adminDefinition := adminPlugin.Definition()
 	if err := runtime.RegisterPlugin(adminDefinition); err != nil {
 		_ = smokeStore.Close()
@@ -511,6 +539,7 @@ func newRuntimeAppWithOutput(configPath string, output io.Writer) (*runtimeApp, 
 		audits:        audits,
 		state:         state,
 		smokeStore:    smokeStore,
+		replay:        replayService,
 		pluginConfigs: pluginConfigs,
 		lifecycle:     lifecycle,
 		queue:         queue,

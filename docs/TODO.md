@@ -14,10 +14,6 @@
 
 ## Backlog
 
-### A5. Postgres 可信度继续补强
-- 目前 Postgres 只进入 smoke/store 路径，不是主存储。
-- 需要补更多真实 runtime 路径覆盖、失败语义和与 SQLite 的能力对齐。
-
 ### A6. 真实 provider / 外部服务集成
 - 当前 AI provider 仍是 demo/mock 风格路径。
 - 需要补真实 provider 接入、配置、故障与可观测链路，而不只是内部演示能力。

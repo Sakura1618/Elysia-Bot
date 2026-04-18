@@ -868,6 +868,7 @@ func (r *InMemoryRuntime) dispatchToPluginsWithFilter(
 	}
 
 	var delivered bool
+	var dispatchErr error
 	for _, manifest := range manifests {
 		plugin, err := r.plugins.Get(manifest.ID)
 		if err != nil {
@@ -886,6 +887,7 @@ func (r *InMemoryRuntime) dispatchToPluginsWithFilter(
 			if err := authorize(plugin, executionContext); err != nil {
 				r.log("error", "runtime dispatch authorization failed", logContextFromExecutionContext(executionContext), mergeFields(fields, map[string]any{"dispatch_kind": dispatchKind, "error": err.Error()}))
 				r.recordDispatch(DispatchResult{PluginID: manifest.ID, Kind: dispatchKind, Success: false, Error: fmt.Sprintf("dispatch authorization %q: %v", manifest.ID, err)})
+				dispatchErr = err
 				continue
 			}
 		}
@@ -900,6 +902,7 @@ func (r *InMemoryRuntime) dispatchToPluginsWithFilter(
 			r.metrics.RecordHandlerLatency(manifest.ID, time.Since(invokeStarted))
 			r.log("error", "plugin dispatch failed", logContextFromExecutionContext(executionContext), mergeFields(fields, map[string]any{"dispatch_kind": dispatchKind, "error": err.Error()}))
 			r.recordDispatch(DispatchResult{PluginID: manifest.ID, Kind: dispatchKind, Success: false, Error: fmt.Sprintf("supervisor ensure plugin %q: %v", manifest.ID, err)})
+			dispatchErr = err
 			continue
 		}
 
@@ -909,6 +912,7 @@ func (r *InMemoryRuntime) dispatchToPluginsWithFilter(
 			r.metrics.RecordHandlerLatency(manifest.ID, time.Since(invokeStarted))
 			r.log("error", "plugin dispatch failed", logContextFromExecutionContext(executionContext), mergeFields(fields, map[string]any{"dispatch_kind": dispatchKind, "error": err.Error()}))
 			r.recordDispatch(DispatchResult{PluginID: manifest.ID, Kind: dispatchKind, Success: false, Error: fmt.Sprintf("plugin host dispatch %q: %v", manifest.ID, err)})
+			dispatchErr = err
 			continue
 		}
 		finishInvokeSpan()
@@ -921,6 +925,9 @@ func (r *InMemoryRuntime) dispatchToPluginsWithFilter(
 
 	if !delivered {
 		r.log("error", "runtime dispatch failed", logContextFromExecutionContext(baseContext), mergeFields(fields, map[string]any{"dispatch_kind": dispatchKind, "error": "dispatch completed with no successful plugin deliveries"}))
+		if dispatchErr != nil {
+			return fmt.Errorf("dispatch completed with no successful plugin deliveries: %w", dispatchErr)
+		}
 		return errors.New("dispatch completed with no successful plugin deliveries")
 	}
 	r.log("info", "runtime dispatch completed", logContextFromExecutionContext(baseContext), mergeFields(fields, map[string]any{"dispatch_kind": dispatchKind}))
