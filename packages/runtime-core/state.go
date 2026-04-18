@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -139,7 +140,22 @@ CREATE TABLE IF NOT EXISTS schedule_plans (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS operator_identities (
+  actor_id TEXT PRIMARY KEY,
+  roles_json TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS rbac_snapshots (
+  snapshot_key TEXT PRIMARY KEY,
+  console_read_permission TEXT NOT NULL,
+  policies_json TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 `
+
+const CurrentRBACSnapshotKey = "current"
 
 type SQLiteStateStore struct {
 	db *sql.DB
@@ -187,6 +203,19 @@ type AdapterInstanceState struct {
 	Health     string
 	Online     bool
 	UpdatedAt  time.Time
+}
+
+type OperatorIdentityState struct {
+	ActorID   string
+	Roles     []string
+	UpdatedAt time.Time
+}
+
+type RBACSnapshotState struct {
+	SnapshotKey           string
+	ConsoleReadPermission string
+	Policies              map[string]pluginsdk.AuthorizationPolicy
+	UpdatedAt             time.Time
 }
 
 type storedSchedulePlan struct {
@@ -1014,6 +1043,8 @@ func (s *SQLiteStateStore) Counts(ctx context.Context) (map[string]int, error) {
 		"jobs":                    `SELECT COUNT(*) FROM jobs`,
 		"alerts":                  `SELECT COUNT(*) FROM alerts`,
 		"schedule_plans":          `SELECT COUNT(*) FROM schedule_plans`,
+		"operator_identities":     `SELECT COUNT(*) FROM operator_identities`,
+		"rbac_snapshots":          `SELECT COUNT(*) FROM rbac_snapshots`,
 	}
 
 	counts := make(map[string]int, len(tables))
@@ -1025,6 +1056,175 @@ func (s *SQLiteStateStore) Counts(ctx context.Context) (map[string]int, error) {
 		counts[name] = count
 	}
 	return counts, nil
+}
+
+func (s *SQLiteStateStore) ReplaceCurrentRBACState(ctx context.Context, identities []OperatorIdentityState, snapshot RBACSnapshotState) error {
+	if s == nil {
+		return fmt.Errorf("replace current rbac state: sqlite state store is required")
+	}
+	if strings.TrimSpace(snapshot.SnapshotKey) == "" {
+		snapshot.SnapshotKey = CurrentRBACSnapshotKey
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin current rbac state transaction: %w", err)
+	}
+	rollback := func(cause error) error {
+		_ = tx.Rollback()
+		return cause
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM operator_identities`); err != nil {
+		return rollback(fmt.Errorf("clear operator identities: %w", err))
+	}
+	for _, identity := range identities {
+		if err := saveOperatorIdentityWithExecutor(ctx, tx, identity); err != nil {
+			return rollback(err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM rbac_snapshots WHERE snapshot_key <> ?`, snapshot.SnapshotKey); err != nil {
+		return rollback(fmt.Errorf("clear stale rbac snapshots: %w", err))
+	}
+	if err := saveRBACSnapshotWithExecutor(ctx, tx, snapshot); err != nil {
+		return rollback(err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit current rbac state transaction: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLiteStateStore) SaveOperatorIdentity(ctx context.Context, state OperatorIdentityState) error {
+	if s == nil {
+		return fmt.Errorf("save operator identity: sqlite state store is required")
+	}
+	return saveOperatorIdentityWithExecutor(ctx, s.db, state)
+}
+
+func saveOperatorIdentityWithExecutor(ctx context.Context, executor sqliteExecContexter, state OperatorIdentityState) error {
+	state.ActorID = strings.TrimSpace(state.ActorID)
+	if state.ActorID == "" {
+		return fmt.Errorf("save operator identity: actor id is required")
+	}
+	normalizedRoles := normalizeStringSlice(state.Roles)
+	rolesJSON, err := json.Marshal(normalizedRoles)
+	if err != nil {
+		return fmt.Errorf("marshal operator identity roles: %w", err)
+	}
+	updatedAt := state.UpdatedAt
+	if updatedAt.IsZero() {
+		updatedAt = time.Now().UTC()
+	}
+	_, err = executor.ExecContext(ctx, `
+INSERT INTO operator_identities (actor_id, roles_json, updated_at)
+VALUES (?, ?, ?)
+ON CONFLICT(actor_id) DO UPDATE SET
+  roles_json=excluded.roles_json,
+  updated_at=excluded.updated_at
+`, state.ActorID, string(rolesJSON), formatSQLiteTimestamp(updatedAt))
+	if err != nil {
+		return fmt.Errorf("upsert operator identity: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLiteStateStore) LoadOperatorIdentity(ctx context.Context, actorID string) (OperatorIdentityState, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT actor_id, roles_json, updated_at
+FROM operator_identities
+WHERE actor_id = ?
+`, strings.TrimSpace(actorID))
+	if err != nil {
+		return OperatorIdentityState{}, fmt.Errorf("load operator identity: %w", err)
+	}
+	defer rows.Close()
+	states, err := scanOperatorIdentities(rows)
+	if err != nil {
+		return OperatorIdentityState{}, err
+	}
+	if len(states) == 0 {
+		return OperatorIdentityState{}, sql.ErrNoRows
+	}
+	return states[0], nil
+}
+
+func (s *SQLiteStateStore) ListOperatorIdentities(ctx context.Context) ([]OperatorIdentityState, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT actor_id, roles_json, updated_at
+FROM operator_identities
+ORDER BY actor_id ASC
+`)
+	if err != nil {
+		return nil, fmt.Errorf("list operator identities: %w", err)
+	}
+	defer rows.Close()
+	return scanOperatorIdentities(rows)
+}
+
+func (s *SQLiteStateStore) SaveRBACSnapshot(ctx context.Context, snapshot RBACSnapshotState) error {
+	if s == nil {
+		return fmt.Errorf("save rbac snapshot: sqlite state store is required")
+	}
+	return saveRBACSnapshotWithExecutor(ctx, s.db, snapshot)
+}
+
+func saveRBACSnapshotWithExecutor(ctx context.Context, executor sqliteExecContexter, snapshot RBACSnapshotState) error {
+	snapshot.SnapshotKey = strings.TrimSpace(snapshot.SnapshotKey)
+	if snapshot.SnapshotKey == "" {
+		snapshot.SnapshotKey = CurrentRBACSnapshotKey
+	}
+	policiesJSON, err := json.Marshal(cloneAuthorizationPolicies(snapshot.Policies))
+	if err != nil {
+		return fmt.Errorf("marshal rbac snapshot policies: %w", err)
+	}
+	updatedAt := snapshot.UpdatedAt
+	if updatedAt.IsZero() {
+		updatedAt = time.Now().UTC()
+	}
+	_, err = executor.ExecContext(ctx, `
+INSERT INTO rbac_snapshots (snapshot_key, console_read_permission, policies_json, updated_at)
+VALUES (?, ?, ?, ?)
+ON CONFLICT(snapshot_key) DO UPDATE SET
+  console_read_permission=excluded.console_read_permission,
+  policies_json=excluded.policies_json,
+  updated_at=excluded.updated_at
+`, snapshot.SnapshotKey, strings.TrimSpace(snapshot.ConsoleReadPermission), string(policiesJSON), formatSQLiteTimestamp(updatedAt))
+	if err != nil {
+		return fmt.Errorf("upsert rbac snapshot: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLiteStateStore) LoadRBACSnapshot(ctx context.Context, snapshotKey string) (RBACSnapshotState, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT snapshot_key, console_read_permission, policies_json, updated_at
+FROM rbac_snapshots
+WHERE snapshot_key = ?
+`, strings.TrimSpace(snapshotKey))
+	if err != nil {
+		return RBACSnapshotState{}, fmt.Errorf("load rbac snapshot: %w", err)
+	}
+	defer rows.Close()
+	states, err := scanRBACSnapshots(rows)
+	if err != nil {
+		return RBACSnapshotState{}, err
+	}
+	if len(states) == 0 {
+		return RBACSnapshotState{}, sql.ErrNoRows
+	}
+	return states[0], nil
+}
+
+func (s *SQLiteStateStore) ListRBACSnapshots(ctx context.Context) ([]RBACSnapshotState, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT snapshot_key, console_read_permission, policies_json, updated_at
+FROM rbac_snapshots
+ORDER BY snapshot_key ASC
+`)
+	if err != nil {
+		return nil, fmt.Errorf("list rbac snapshots: %w", err)
+	}
+	defer rows.Close()
+	return scanRBACSnapshots(rows)
 }
 
 func nextPluginStatusSnapshot(previous *PluginStatusSnapshot, result DispatchResult) PluginStatusSnapshot {
@@ -1154,6 +1354,66 @@ func scanAdapterInstances(rows *sql.Rows) ([]AdapterInstanceState, error) {
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate adapter instances: %w", err)
+	}
+	return states, nil
+}
+
+func scanOperatorIdentities(rows *sql.Rows) ([]OperatorIdentityState, error) {
+	states := make([]OperatorIdentityState, 0)
+	for rows.Next() {
+		var (
+			state        OperatorIdentityState
+			rolesJSON    string
+			updatedAtRaw string
+		)
+		if err := rows.Scan(&state.ActorID, &rolesJSON, &updatedAtRaw); err != nil {
+			return nil, fmt.Errorf("scan operator identity: %w", err)
+		}
+		if rolesJSON != "" && rolesJSON != "null" {
+			if err := json.Unmarshal([]byte(rolesJSON), &state.Roles); err != nil {
+				return nil, fmt.Errorf("unmarshal operator identity roles: %w", err)
+			}
+		}
+		state.Roles = normalizeStringSlice(state.Roles)
+		updatedAt, err := parseSQLiteTimestamp(updatedAtRaw)
+		if err != nil {
+			return nil, fmt.Errorf("parse operator identity updated_at: %w", err)
+		}
+		state.UpdatedAt = updatedAt
+		states = append(states, state)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate operator identities: %w", err)
+	}
+	return states, nil
+}
+
+func scanRBACSnapshots(rows *sql.Rows) ([]RBACSnapshotState, error) {
+	states := make([]RBACSnapshotState, 0)
+	for rows.Next() {
+		var (
+			state        RBACSnapshotState
+			policiesJSON string
+			updatedAtRaw string
+		)
+		if err := rows.Scan(&state.SnapshotKey, &state.ConsoleReadPermission, &policiesJSON, &updatedAtRaw); err != nil {
+			return nil, fmt.Errorf("scan rbac snapshot: %w", err)
+		}
+		if policiesJSON != "" && policiesJSON != "null" {
+			if err := json.Unmarshal([]byte(policiesJSON), &state.Policies); err != nil {
+				return nil, fmt.Errorf("unmarshal rbac snapshot policies: %w", err)
+			}
+		}
+		state.Policies = cloneAuthorizationPolicies(state.Policies)
+		updatedAt, err := parseSQLiteTimestamp(updatedAtRaw)
+		if err != nil {
+			return nil, fmt.Errorf("parse rbac snapshot updated_at: %w", err)
+		}
+		state.UpdatedAt = updatedAt
+		states = append(states, state)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate rbac snapshots: %w", err)
 	}
 	return states, nil
 }
@@ -1429,4 +1689,28 @@ func boolToSQLiteInt(value bool) int {
 		return 1
 	}
 	return 0
+}
+
+func normalizeStringSlice(items []string) []string {
+	if len(items) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(items))
+	normalized := make([]string, 0, len(items))
+	for _, item := range items {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		if _, ok := seen[item]; ok {
+			continue
+		}
+		seen[item] = struct{}{}
+		normalized = append(normalized, item)
+	}
+	if len(normalized) == 0 {
+		return nil
+	}
+	sort.Strings(normalized)
+	return normalized
 }

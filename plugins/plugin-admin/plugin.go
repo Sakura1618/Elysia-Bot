@@ -31,6 +31,10 @@ type AuditRecorder interface {
 	RecordAudit(entry pluginsdk.AuditEntry) error
 }
 
+type CurrentAuthorizerProvider interface {
+	CurrentAuthorizer() *pluginsdk.Authorizer
+}
+
 type RolePolicy = pluginsdk.AuthorizationPolicy
 
 type Plugin struct {
@@ -41,10 +45,12 @@ type Plugin struct {
 	AuditTrail    []pluginsdk.AuditEntry
 	AuditRecorder AuditRecorder
 	Authorizer    *pluginsdk.Authorizer
+	Provider      CurrentAuthorizerProvider
 	CurrentTime   func() time.Time
 }
 
-func New(lifecycle PluginLifecycleService, rollouts RolloutManager, replay ReplayService, actorRoles map[string][]string, policies map[string]RolePolicy, recorder AuditRecorder) *Plugin {
+
+func New(lifecycle PluginLifecycleService, rollouts RolloutManager, replay ReplayService, provider CurrentAuthorizerProvider, actorRoles map[string][]string, policies map[string]RolePolicy, recorder AuditRecorder) *Plugin {
 	return &Plugin{
 		Manifest: pluginsdk.PluginManifest{
 			ID:         "plugin-admin",
@@ -64,6 +70,7 @@ func New(lifecycle PluginLifecycleService, rollouts RolloutManager, replay Repla
 		Rollouts:      rollouts,
 		Replay:        replay,
 		AuditRecorder: recorder,
+		Provider:      provider,
 		Authorizer:    pluginsdk.NewAuthorizer(actorRoles, policies),
 		CurrentTime:   time.Now().UTC,
 	}
@@ -93,7 +100,7 @@ func (p *Plugin) OnCommand(command eventmodel.CommandInvocation, ctx eventmodel.
 	if permission == "" {
 		return p.recordAndJoin(actor, action, target, "", false, fmt.Errorf("unsupported admin action %q", action))
 	}
-	decision := p.Authorizer.Authorize(actor, permission, target)
+	decision := p.currentAuthorizer().Authorize(actor, permission, target)
 	if !decision.Allowed {
 		return p.recordAndJoin(actor, action, target, permission, false, errors.New(decision.Reason))
 	}
@@ -110,7 +117,7 @@ func (p *Plugin) OnCommand(command eventmodel.CommandInvocation, ctx eventmodel.
 
 func (p *Plugin) handleReplay(actor, eventID string) error {
 	permission := permissionForAction("replay")
-	decision := p.Authorizer.AuthorizeTarget(actor, permission, pluginsdk.AuthorizationTargetEvent, eventID)
+	decision := p.currentAuthorizer().AuthorizeTarget(actor, permission, pluginsdk.AuthorizationTargetEvent, eventID)
 	if !decision.Allowed {
 		return p.recordAndJoin(actor, "replay", eventID, permission, false, errors.New(decision.Reason))
 	}
@@ -126,7 +133,7 @@ func (p *Plugin) handleRollout(actor, action, target string) error {
 	if permission == "" {
 		return p.recordAndJoin(actor, action, target, "", false, fmt.Errorf("unsupported admin action %q", action))
 	}
-	decision := p.Authorizer.Authorize(actor, permission, target)
+	decision := p.currentAuthorizer().Authorize(actor, permission, target)
 	if !decision.Allowed {
 		return p.recordAndJoin(actor, action, target, permission, false, errors.New(decision.Reason))
 	}
@@ -258,4 +265,16 @@ func permissionForAction(action string) string {
 	default:
 		return ""
 	}
+}
+
+func (p *Plugin) currentAuthorizer() *pluginsdk.Authorizer {
+	if p != nil && p.Provider != nil {
+		if authorizer := p.Provider.CurrentAuthorizer(); authorizer != nil {
+			return authorizer
+		}
+	}
+	if p == nil || p.Authorizer == nil {
+		return pluginsdk.NewAuthorizer(nil, nil)
+	}
+	return p.Authorizer
 }

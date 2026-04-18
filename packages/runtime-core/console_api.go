@@ -30,6 +30,7 @@ type ConsoleAPI struct {
 	audits           AuditLogReader
 	meta             map[string]any
 	readAuthorizer   ConsoleReadRequestAuthorizer
+	authorizerSource CurrentAuthorizerProvider
 }
 
 type ConsolePluginPublish struct {
@@ -276,7 +277,8 @@ type RuntimeStatus struct {
 }
 
 func NewConsoleAPI(runtime *InMemoryRuntime, queue *JobQueue, config Config, logs []string, audits AuditLogReader) *ConsoleAPI {
-	return &ConsoleAPI{runtime: runtime, queue: queue, config: config, logs: logs, audits: audits, meta: map[string]any{}, pluginConfigMeta: map[string]ConsolePluginConfigBinding{}, readAuthorizer: NewConsoleReadAuthorizer(config.RBAC)}
+	provider := NewCurrentRBACAuthorizerProviderFromConfig(config.RBAC)
+	return &ConsoleAPI{runtime: runtime, queue: queue, config: config, logs: logs, audits: audits, meta: map[string]any{}, pluginConfigMeta: map[string]ConsolePluginConfigBinding{}, authorizerSource: provider, readAuthorizer: NewCurrentConsoleReadAuthorizer(provider)}
 }
 
 func NewSQLiteConsoleJobReader(store *SQLiteStateStore) consoleJobReader {
@@ -374,6 +376,15 @@ func (c *ConsoleAPI) SetRecoverySource(source consoleRecoverySource) {
 
 func (c *ConsoleAPI) SetReadAuthorizer(authorizer ConsoleReadRequestAuthorizer) {
 	c.readAuthorizer = authorizer
+}
+
+func (c *ConsoleAPI) SetCurrentAuthorizerProvider(provider CurrentAuthorizerProvider) {
+	c.authorizerSource = provider
+	if isNilCurrentAuthorizerProvider(provider) {
+		c.readAuthorizer = nil
+		return
+	}
+	c.readAuthorizer = NewCurrentConsoleReadAuthorizer(provider)
 }
 
 func (c *ConsoleAPI) SetMeta(meta map[string]any) {
@@ -916,8 +927,33 @@ func (c *ConsoleAPI) Audits() []pluginsdk.AuditEntry {
 	return c.audits.AuditEntries()
 }
 
+func (c *ConsoleAPI) currentConsoleReadPermission() string {
+	if c == nil || isNilCurrentAuthorizerProvider(c.authorizerSource) {
+		return ""
+	}
+	snapshot := c.authorizerSource.CurrentSnapshot()
+	if snapshot == nil {
+		return ""
+	}
+	return strings.TrimSpace(snapshot.ConsoleReadPermission)
+}
+
 func (c *ConsoleAPI) Config() Config {
-	return c.config
+	config := c.config
+	if !isNilCurrentAuthorizerProvider(c.authorizerSource) {
+		snapshot := c.authorizerSource.CurrentSnapshot()
+		if snapshot == nil {
+			config.RBAC = nil
+			return config
+		}
+		config.RBAC = &RBACConfig{
+			ActorRoles:            cloneActorRoles(snapshot.ActorRoles),
+			Policies:              cloneAuthorizationPolicies(snapshot.Policies),
+			ConsoleReadPermission: strings.TrimSpace(snapshot.ConsoleReadPermission),
+		}
+		return config
+	}
+	return config
 }
 
 func (c *ConsoleAPI) Schedules() ([]ConsoleSchedule, error) {
@@ -1560,10 +1596,7 @@ func (c *ConsoleAPI) recordConsoleReadDenied(r *http.Request, err error) {
 	if !ok || recorder == nil {
 		return
 	}
-	permission := ""
-	if c.config.RBAC != nil {
-		permission = strings.TrimSpace(c.config.RBAC.ConsoleReadPermission)
-	}
+	permission := c.currentConsoleReadPermission()
 	entry := pluginsdk.AuditEntry{
 		Actor:      strings.TrimSpace(r.Header.Get(ConsoleReadActorHeader)),
 		Permission: permission,

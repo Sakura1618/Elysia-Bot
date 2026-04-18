@@ -372,6 +372,132 @@ func TestSQLiteStateStorePersistsPluginStatusSnapshotsAcrossReopen(t *testing.T)
 	}
 }
 
+func TestSQLiteStateStorePersistsOperatorIdentitiesAndRBACSnapshotAcrossReopen(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "state.db")
+	ctx := context.Background()
+
+	store, err := OpenSQLiteStateStore(path)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	if err := store.ReplaceCurrentRBACState(ctx, []OperatorIdentityState{
+		{ActorID: "viewer-user", Roles: []string{"viewer"}},
+		{ActorID: "job-operator", Roles: []string{"job-operator"}},
+	}, RBACSnapshotState{
+		SnapshotKey:           CurrentRBACSnapshotKey,
+		ConsoleReadPermission: "console:read",
+		Policies: map[string]pluginsdk.AuthorizationPolicy{
+			"viewer":       {Permissions: []string{"console:read"}, PluginScope: []string{"console"}},
+			"job-operator": {Permissions: []string{"job:retry"}, PluginScope: []string{"*"}},
+		},
+	}); err != nil {
+		t.Fatalf("replace current rbac state: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	reopened, err := OpenSQLiteStateStore(path)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer func() { _ = reopened.Close() }()
+
+	viewer, err := reopened.LoadOperatorIdentity(ctx, "viewer-user")
+	if err != nil {
+		t.Fatalf("load viewer operator identity: %v", err)
+	}
+	if viewer.ActorID != "viewer-user" || len(viewer.Roles) != 1 || viewer.Roles[0] != "viewer" {
+		t.Fatalf("expected persisted viewer identity after reopen, got %+v", viewer)
+	}
+	identities, err := reopened.ListOperatorIdentities(ctx)
+	if err != nil {
+		t.Fatalf("list operator identities: %v", err)
+	}
+	if len(identities) != 2 {
+		t.Fatalf("expected two persisted operator identities, got %+v", identities)
+	}
+	snapshot, err := reopened.LoadRBACSnapshot(ctx, CurrentRBACSnapshotKey)
+	if err != nil {
+		t.Fatalf("load rbac snapshot: %v", err)
+	}
+	if snapshot.ConsoleReadPermission != "console:read" {
+		t.Fatalf("expected persisted console read permission, got %+v", snapshot)
+	}
+	if snapshot.Policies["viewer"].Permissions[0] != "console:read" || snapshot.Policies["job-operator"].Permissions[0] != "job:retry" {
+		t.Fatalf("expected persisted rbac policies after reopen, got %+v", snapshot.Policies)
+	}
+	provider, err := NewCurrentRBACAuthorizerProviderFromStore(ctx, reopened)
+	if err != nil {
+		t.Fatalf("provider from store: %v", err)
+	}
+	if err := AuthorizeRBACActionWithProvider(provider, "job-operator", "job:retry", "job-1"); err != nil {
+		t.Fatalf("expected provider loaded from persisted snapshot to authorize job operator, got %v", err)
+	}
+	if err := AuthorizeRBACActionWithProvider(provider, "", "console:read", "console"); err == nil || err.Error() != "permission denied" {
+		t.Fatalf("expected persisted provider to fail closed without actor header, got %v", err)
+	}
+	counts, err := reopened.Counts(ctx)
+	if err != nil {
+		t.Fatalf("counts after reopen: %v", err)
+	}
+	if counts["operator_identities"] != 2 || counts["rbac_snapshots"] != 1 {
+		t.Fatalf("expected persisted rbac counts after reopen, got %+v", counts)
+	}
+}
+
+func TestCurrentRBACAuthorizerProviderReloadFromStoreUpdatesDecisionsWithoutReconstruction(t *testing.T) {
+	t.Parallel()
+
+	store := openTempSQLiteStore(t)
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	if err := store.ReplaceCurrentRBACState(ctx, []OperatorIdentityState{{ActorID: "config-operator", Roles: []string{"config-operator"}}}, RBACSnapshotState{
+		SnapshotKey: CurrentRBACSnapshotKey,
+		Policies: map[string]pluginsdk.AuthorizationPolicy{
+			"config-operator": {Permissions: []string{"plugin:config"}, PluginScope: []string{"plugin-echo"}},
+		},
+	}); err != nil {
+		t.Fatalf("seed current rbac state: %v", err)
+	}
+
+	provider, err := NewCurrentRBACAuthorizerProviderFromStore(ctx, store)
+	if err != nil {
+		t.Fatalf("provider from store: %v", err)
+	}
+	initialAuthorizer := provider.CurrentAuthorizer()
+	if initialAuthorizer == nil {
+		t.Fatal("expected provider to expose initial authorizer")
+	}
+	if err := AuthorizeRBACActionWithProvider(provider, "config-operator", "plugin:config", "plugin-echo"); err != nil {
+		t.Fatalf("expected initial persisted snapshot to allow plugin config action, got %v", err)
+	}
+
+	if err := store.ReplaceCurrentRBACState(ctx, []OperatorIdentityState{{ActorID: "config-operator", Roles: []string{"config-viewer"}}}, RBACSnapshotState{
+		SnapshotKey: CurrentRBACSnapshotKey,
+		Policies: map[string]pluginsdk.AuthorizationPolicy{
+			"config-viewer": {Permissions: []string{"console:read"}, PluginScope: []string{"console"}},
+		},
+	}); err != nil {
+		t.Fatalf("replace current rbac state: %v", err)
+	}
+	if err := provider.ReloadFromStore(ctx, store); err != nil {
+		t.Fatalf("reload provider from store: %v", err)
+	}
+	if provider.CurrentAuthorizer() == nil {
+		t.Fatal("expected provider to expose reloaded authorizer")
+	}
+	if provider.CurrentAuthorizer() == initialAuthorizer {
+		t.Fatal("expected reload to update decisions through a refreshed snapshot")
+	}
+	if err := AuthorizeRBACActionWithProvider(provider, "config-operator", "plugin:config", "plugin-echo"); err == nil || err.Error() != "permission denied" {
+		t.Fatalf("expected same provider object to deny plugin config after reload, got %v", err)
+	}
+}
+
 func TestSQLiteStateStorePersistsSchedulePlansRoundTrip(t *testing.T) {
 	t.Parallel()
 

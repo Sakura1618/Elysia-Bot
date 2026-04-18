@@ -16,6 +16,7 @@ import (
 	"time"
 
 	eventmodel "github.com/ohmyopencode/bot-platform/packages/event-model"
+	pluginsdk "github.com/ohmyopencode/bot-platform/packages/plugin-sdk"
 	runtimecore "github.com/ohmyopencode/bot-platform/packages/runtime-core"
 )
 
@@ -66,7 +67,7 @@ func waitForAIJobStatus(t *testing.T, app *runtimeApp, jobID string, expected ru
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		app.queue.DispatchReady(t.Context(), time.Now().UTC())
+        app.queue.DispatchReady(t.Context(), time.Now().UTC())
 		stored, err := app.queue.Inspect(t.Context(), jobID)
 		if err == nil && stored.Status == expected {
 			return stored
@@ -504,13 +505,30 @@ func writeScheduleCancelRBACConfig(t *testing.T) string {
 
 func writeWriteActionRBACConfig(t *testing.T) string {
 	t.Helper()
-	dir := t.TempDir()
+	return writeWriteActionRBACConfigAt(t, t.TempDir())
+}
+
+func writeWriteActionRBACConfigAt(t *testing.T, dir string) string {
+	t.Helper()
 	path := filepath.Join(dir, "config.yaml")
-	content := "runtime:\n  environment: test\n  log_level: debug\n  http_port: 18080\n  sqlite_path: " + filepath.ToSlash(filepath.Join(dir, "runtime.sqlite")) + "\n  scheduler_interval_ms: 20\nrbac:\n  actor_roles:\n    job-operator: [job-operator]\n    config-operator: [config-operator]\n    viewer-user: [viewer]\n  policies:\n    job-operator:\n      permissions: [job:retry]\n      plugin_scope: ['*']\n    config-operator:\n      permissions: [plugin:config]\n      plugin_scope: ['plugin-echo']\n    viewer:\n      permissions: [console:read]\n      plugin_scope: ['console']\n"
+	content := "runtime:\n  environment: test\n  log_level: debug\n  http_port: 18080\n  sqlite_path: " + filepath.ToSlash(filepath.Join(dir, "runtime.sqlite")) + "\n  scheduler_interval_ms: 20\nrbac:\n  actor_roles:\n    job-operator: [job-operator]\n    config-operator: [config-operator]\n    runtime-job-runner: [runtime-job-runner]\n    viewer-user: [viewer]\n  policies:\n    job-operator:\n      permissions: [job:retry]\n      plugin_scope: ['*']\n    config-operator:\n      permissions: [plugin:config]\n      plugin_scope: ['plugin-echo']\n    runtime-job-runner:\n      permissions: [job:run]\n      plugin_scope: ['plugin-ai-chat']\n    viewer:\n      permissions: [console:read]\n      plugin_scope: ['console']\n"
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
 	return path
+}
+
+func consoleRequestWithViewer(path string) *http.Request {
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	req.Header.Set(runtimecore.ConsoleReadActorHeader, "viewer-user")
+	return req
+}
+
+func replaceRuntimeCurrentRBACState(t *testing.T, app *runtimeApp, identities []runtimecore.OperatorIdentityState, snapshot runtimecore.RBACSnapshotState) {
+	t.Helper()
+	if err := app.state.ReplaceCurrentRBACState(t.Context(), identities, snapshot); err != nil {
+		t.Fatalf("replace current rbac state: %v", err)
+	}
 }
 
 func writeReplayRBACConfigAt(t *testing.T, dir string, backend string, dsn string) string {
@@ -1197,12 +1215,12 @@ func TestRuntimeAppConsoleReflectsRuntimeState(t *testing.T) {
 	if !strings.Contains(resp.Body.String(), `"plugin_dispatch_source": "sqlite-plugin-status-snapshot+runtime-dispatch-results"`) {
 		t.Fatalf("expected console payload to include plugin_dispatch_source=sqlite-plugin-status-snapshot+runtime-dispatch-results, got %s", resp.Body.String())
 	}
-	for _, expected := range []string{`"plugin_status_source": "runtime-registry+sqlite-plugin-status-snapshot+runtime-dispatch-results"`, `"plugin_status_evidence_model": "manifest-static-or-last-persisted-plugin-snapshot-with-live-overlay"`, `"plugin_dispatch_kind_visibility": "last-persisted-or-live-dispatch-kind"`, `"plugin_recovery_visibility": "last-dispatch-failed|last-dispatch-succeeded|recovered-after-failure|no-runtime-evidence"`, `"plugin_status_staleness": "static-registration|persisted-snapshot|persisted-snapshot+live-overlay|process-local-volatile"`, `"plugin_status_staleness_reason": "persisted plugin snapshots survive restart while current-process live overlay remains explicitly distinguished from the stored snapshot"`, `"plugin_runtime_state_live": true`, `"rbac_capability_surface": "read-only declaration of current authorization and adjacent dispatch-boundary facts"`, `"rbac_read_model_scope": "current runtime authorizer entrypoints, adjacent dispatch contract/filter boundaries, deny audit taxonomy, and known system gaps"`, `"rbac_current_state": "partial-runtime-local-read-model"`, `"rbac_system_model_state": "not-complete-global-rbac-authn-or-audit-system"`, `"rbac_current_authorization_paths_count": 6`, `"rbac_deny_audit_scope": "authorizer deny paths only"`, `"rbac_manifest_permission_gate_audited": false`, `"rbac_manifest_permission_gate_boundary": "independent dispatch contract check; not part of deny audit taxonomy"`, `"rbac_job_target_plugin_filter_boundary": "dispatch filter only; not an authorizer entrypoint or deny audit taxonomy item"`, `"rbac_console_read_permission": false`, `"rbac_console_read_actor_header": "X-Bot-Platform-Actor"`, `"secrets_provider": "env"`, `"secrets_runtime_owned_ref_prefix": "BOT_PLATFORM_"`, `"rollout_record_store": "in-memory-per-runtime-process"`} {
+	for _, expected := range []string{`"plugin_status_source": "runtime-registry+sqlite-plugin-status-snapshot+runtime-dispatch-results"`, `"plugin_status_evidence_model": "manifest-static-or-last-persisted-plugin-snapshot-with-live-overlay"`, `"plugin_dispatch_kind_visibility": "last-persisted-or-live-dispatch-kind"`, `"plugin_recovery_visibility": "last-dispatch-failed|last-dispatch-succeeded|recovered-after-failure|no-runtime-evidence"`, `"plugin_status_staleness": "static-registration|persisted-snapshot|persisted-snapshot+live-overlay|process-local-volatile"`, `"plugin_status_staleness_reason": "persisted plugin snapshots survive restart while current-process live overlay remains explicitly distinguished from the stored snapshot"`, `"plugin_runtime_state_live": true`, `"rbac_capability_surface": "read-only declaration of current authorization and adjacent dispatch-boundary facts"`, `"rbac_read_model_scope": "current runtime authorizer entrypoints, adjacent dispatch contract/filter boundaries, deny audit taxonomy, and known system gaps"`, `"rbac_current_state": "persisted-runtime-current-snapshot"`, `"rbac_system_model_state": "not-complete-global-rbac-authn-or-audit-system"`, `"rbac_current_authorization_paths_count": 9`, `"rbac_deny_audit_scope": "authorizer deny paths only"`, `"rbac_manifest_permission_gate_audited": false`, `"rbac_manifest_permission_gate_boundary": "independent dispatch contract check; not part of deny audit taxonomy"`, `"rbac_job_target_plugin_filter_boundary": "dispatch filter only; not an authorizer entrypoint or deny audit taxonomy item"`, `"rbac_console_read_permission": false`, `"rbac_console_read_actor_header": "X-Bot-Platform-Actor"`, `"secrets_provider": "env"`, `"secrets_runtime_owned_ref_prefix": "BOT_PLATFORM_"`, `"rollout_record_store": "in-memory-per-runtime-process"`} {
 		if !strings.Contains(resp.Body.String(), expected) {
 			t.Fatalf("expected console payload to include %s, got %s", expected, resp.Body.String())
 		}
 	}
-	for _, expected := range []string{`"admin-command-runtime-authorizer"`, `"event-metadata-runtime-authorizer"`, `"job-metadata-runtime-authorizer"`, `"schedule-metadata-runtime-authorizer"`, `"schedule-operator-runtime-authorizer"`, `"dispatch-manifest-permission-gate"`, `"job-target-plugin-filter"`, `"console-read-authorizer"`, `"permission_denied"`, `"plugin_scope_denied"`, `"persistent-policy-store"`, `"policy-hot-reload"`, `"unified-authentication"`, `"unified-resource-model"`, `"independent-authorization-read-model"`, `"actor"`, `"permission"`, `"target_plugin_id"`, `"console read authorization is optional and only enforced when rbac.console_read_permission is configured"`, `"console read authorization currently reads actor only from the X-Bot-Platform-Actor header"`, `"manifest permission gate remains a separate dispatch contract check and does not emit deny audit entries"`, `"target_plugin_id remains a dispatch filter, not a global RBAC resource kind"`, `"Q8 currently remains a partial runtime-local closure rather than a complete global RBAC, authn, or audit system"`} {
+	for _, expected := range []string{`"admin-command-runtime-authorizer"`, `"event-metadata-runtime-authorizer"`, `"job-metadata-runtime-authorizer"`, `"schedule-metadata-runtime-authorizer"`, `"schedule-operator-runtime-authorizer"`, `"job-operator-runtime-authorizer"`, `"plugin-config-runtime-authorizer"`, `"plugin-admin-current-authorizer-provider"`, `"dispatch-manifest-permission-gate"`, `"job-target-plugin-filter"`, `"console-read-authorizer"`, `"permission_denied"`, `"plugin_scope_denied"`, `"unified-authentication"`, `"unified-resource-model"`, `"independent-authorization-read-model"`, `"actor"`, `"permission"`, `"target_plugin_id"`, `"console read authorization is optional and only enforced when rbac.console_read_permission is configured"`, `"console read authorization currently reads actor only from the X-Bot-Platform-Actor header"`, `"manifest permission gate remains a separate dispatch contract check and does not emit deny audit entries"`, `"target_plugin_id remains a dispatch filter, not a global RBAC resource kind"`, `"current slice persists and reloads a single runtime snapshot but does not add login/authn UX or a global resource hierarchy"`} {
 		if !strings.Contains(resp.Body.String(), expected) {
 			t.Fatalf("expected console payload to include RBAC declaration detail %s, got %s", expected, resp.Body.String())
 		}
@@ -1220,8 +1238,8 @@ func TestRuntimeAppConsoleReflectsRuntimeState(t *testing.T) {
 	if !strings.Contains(resp.Body.String(), `"mixed_read_model": true`) {
 		t.Fatalf("expected console payload to include mixed_read_model=true, got %s", resp.Body.String())
 	}
-	if !strings.Contains(resp.Body.String(), `"snapshot_atomic": false`) {
-		t.Fatalf("expected console payload to include snapshot_atomic=false, got %s", resp.Body.String())
+	if !strings.Contains(resp.Body.String(), `"snapshot_atomic": true`) {
+		t.Fatalf("expected console payload to include snapshot_atomic=true, got %s", resp.Body.String())
 	}
 	if !strings.Contains(resp.Body.String(), `"generated_at":`) {
 		t.Fatalf("expected console payload to include generated_at timestamp, got %s", resp.Body.String())
@@ -1249,6 +1267,7 @@ func TestRuntimeAppOperatorDisablePersistsOverlaySkipsDispatchAndReEnables(t *te
 	defer func() { _ = app.Close() }()
 
 	disableReq := httptest.NewRequest(http.MethodPost, "/demo/plugins/plugin-echo/disable", nil)
+	disableReq.Header.Set(runtimecore.ConsoleReadActorHeader, "admin-user")
 	disableResp := httptest.NewRecorder()
 	app.ServeHTTP(disableResp, disableReq)
 	if disableResp.Code != http.StatusOK {
@@ -1303,6 +1322,7 @@ func TestRuntimeAppOperatorDisablePersistsOverlaySkipsDispatchAndReEnables(t *te
 	}
 
 	enableReq := httptest.NewRequest(http.MethodPost, "/demo/plugins/plugin-echo/enable", nil)
+	enableReq.Header.Set(runtimecore.ConsoleReadActorHeader, "admin-user")
 	enableResp := httptest.NewRecorder()
 	app.ServeHTTP(enableResp, enableReq)
 	if enableResp.Code != http.StatusOK {
@@ -1369,7 +1389,7 @@ func TestRuntimeAppReloadsPersistedPluginEchoConfigAfterRestart(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	configPath := writeTestConfigAt(t, dir)
+	configPath := writeWriteActionRBACConfigAt(t, dir)
 
 	app, err := newRuntimeApp(configPath)
 	if err != nil {
@@ -1378,6 +1398,7 @@ func TestRuntimeAppReloadsPersistedPluginEchoConfigAfterRestart(t *testing.T) {
 
 	configReq := httptest.NewRequest(http.MethodPost, "/demo/plugins/plugin-echo/config", strings.NewReader(`{"prefix":"persisted: "}`))
 	configReq.Header.Set("Content-Type", "application/json")
+	configReq.Header.Set(runtimecore.ConsoleReadActorHeader, "config-operator")
 	configResp := httptest.NewRecorder()
 	app.ServeHTTP(configResp, configReq)
 	if configResp.Code != http.StatusOK {
@@ -1412,7 +1433,7 @@ func TestRuntimeAppReloadsPersistedPluginEchoConfigAfterRestart(t *testing.T) {
 		t.Fatalf("expected restarted runtime to use persisted echo prefix, got %s", messageResp.Body.String())
 	}
 
-	consoleReq := httptest.NewRequest(http.MethodGet, "/api/console?plugin_id=plugin-echo", nil)
+	consoleReq := consoleRequestWithViewer("/api/console?plugin_id=plugin-echo")
 	consoleResp := httptest.NewRecorder()
 	restarted.ServeHTTP(consoleResp, consoleReq)
 	if consoleResp.Code != http.StatusOK {
@@ -1437,7 +1458,16 @@ func TestRuntimeAppReloadsPersistedPluginEchoConfigAfterRestart(t *testing.T) {
 	if !strings.Contains(consoleResp.Body.String(), `"configUpdatedAt":`) {
 		t.Fatalf("expected restarted console payload to include configUpdatedAt, got %s", consoleResp.Body.String())
 	}
-	console := readRuntimeConsoleResponse(t, restarted)
+    consoleReq = consoleRequestWithViewer("/api/console")
+    consoleResp = httptest.NewRecorder()
+	restarted.ServeHTTP(consoleResp, consoleReq)
+	if consoleResp.Code != http.StatusOK {
+		t.Fatalf("expected console 200 after restart, got %d: %s", consoleResp.Code, consoleResp.Body.String())
+	}
+	var console runtimeConsoleResponse
+	if err := json.Unmarshal(consoleResp.Body.Bytes(), &console); err != nil {
+		t.Fatalf("decode console payload: %v", err)
+	}
 	var pluginFound bool
 	for _, plugin := range console.Plugins {
 		if plugin.ID != "plugin-echo" {
@@ -1511,6 +1541,398 @@ func TestRuntimeAppConsoleAllowsConfiguredActorHeader(t *testing.T) {
 	}
 	if !strings.Contains(resp.Body.String(), "plugin-echo") {
 		t.Fatalf("expected allowed console response to include plugin-echo, got %s", resp.Body.String())
+	}
+}
+
+func TestRuntimeAppConsoleReadHotReloadsPersistedRBACSnapshotWithoutRestart(t *testing.T) {
+	t.Parallel()
+
+	app, err := newRuntimeApp(writeConsoleRBACConfig(t))
+	if err != nil {
+		t.Fatalf("new runtime app: %v", err)
+	}
+	defer func() { _ = app.Close() }()
+
+	allowedReq := consoleRequestWithViewer("/api/console")
+	allowedResp := httptest.NewRecorder()
+	app.ServeHTTP(allowedResp, allowedReq)
+	if allowedResp.Code != http.StatusOK {
+		t.Fatalf("expected hot-reload seed console read 200, got %d: %s", allowedResp.Code, allowedResp.Body.String())
+	}
+
+	replaceRuntimeCurrentRBACState(t, app, []runtimecore.OperatorIdentityState{{ActorID: "viewer-user", Roles: []string{"viewer-no-console"}}}, runtimecore.RBACSnapshotState{
+		SnapshotKey:           runtimecore.CurrentRBACSnapshotKey,
+		ConsoleReadPermission: "console:read",
+		Policies: map[string]pluginsdk.AuthorizationPolicy{
+			"viewer-no-console": {Permissions: []string{"job:retry"}, PluginScope: []string{"*"}},
+		},
+	})
+
+	deniedReq := consoleRequestWithViewer("/api/console")
+	deniedResp := httptest.NewRecorder()
+	app.ServeHTTP(deniedResp, deniedReq)
+	if deniedResp.Code != http.StatusForbidden {
+		t.Fatalf("expected same-process hot-reloaded console read 403, got %d: %s", deniedResp.Code, deniedResp.Body.String())
+	}
+	if !strings.Contains(deniedResp.Body.String(), "permission denied") {
+		t.Fatalf("expected hot-reloaded console denial to mention permission denied, got %s", deniedResp.Body.String())
+	}
+	entries := app.audits.AuditEntries()
+	if len(entries) != 1 || entries[0].Actor != "viewer-user" || entries[0].Action != "console.read" || entries[0].Permission != "console:read" || entries[0].Target != "console" || entries[0].Allowed || entries[0].Reason != "permission_denied" {
+		t.Fatalf("expected console hot-reload deny audit entry, got %+v", entries)
+	}
+}
+
+func TestRuntimeAppPluginConfigHotReloadsPersistedRBACSnapshotWithoutRestart(t *testing.T) {
+	t.Parallel()
+
+	app, err := newRuntimeApp(writeWriteActionRBACConfig(t))
+	if err != nil {
+		t.Fatalf("new runtime app: %v", err)
+	}
+	defer func() { _ = app.Close() }()
+
+	allowedReq := httptest.NewRequest(http.MethodPost, "/demo/plugins/plugin-echo/config", strings.NewReader(`{"prefix":"allowed before reload: "}`))
+	allowedReq.Header.Set("Content-Type", "application/json")
+	allowedReq.Header.Set(runtimecore.ConsoleReadActorHeader, "config-operator")
+	allowedResp := httptest.NewRecorder()
+	app.ServeHTTP(allowedResp, allowedReq)
+	if allowedResp.Code != http.StatusOK {
+		t.Fatalf("expected hot-reload seed config update 200, got %d: %s", allowedResp.Code, allowedResp.Body.String())
+	}
+
+	replaceRuntimeCurrentRBACState(t, app, []runtimecore.OperatorIdentityState{{ActorID: "config-operator", Roles: []string{"viewer"}}}, runtimecore.RBACSnapshotState{
+		SnapshotKey:           runtimecore.CurrentRBACSnapshotKey,
+		ConsoleReadPermission: "console:read",
+		Policies: map[string]pluginsdk.AuthorizationPolicy{
+			"viewer": {Permissions: []string{"console:read"}, PluginScope: []string{"console"}},
+		},
+	})
+
+	deniedReq := httptest.NewRequest(http.MethodPost, "/demo/plugins/plugin-echo/config", strings.NewReader(`{"prefix":"denied after reload: "}`))
+	deniedReq.Header.Set("Content-Type", "application/json")
+	deniedReq.Header.Set(runtimecore.ConsoleReadActorHeader, "config-operator")
+	deniedResp := httptest.NewRecorder()
+	app.ServeHTTP(deniedResp, deniedReq)
+	if deniedResp.Code != http.StatusForbidden {
+		t.Fatalf("expected same-process hot-reloaded config update 403, got %d: %s", deniedResp.Code, deniedResp.Body.String())
+	}
+	if !strings.Contains(deniedResp.Body.String(), "permission denied") {
+		t.Fatalf("expected hot-reloaded config denial to mention permission denied, got %s", deniedResp.Body.String())
+	}
+	stored, err := app.state.LoadPluginConfig(t.Context(), "plugin-echo")
+	if err != nil {
+		t.Fatalf("load persisted plugin config after hot reload: %v", err)
+	}
+	if string(stored.RawConfig) != `{"prefix":"allowed before reload: "}` {
+		t.Fatalf("expected denied hot-reload config update not to overwrite persisted config, got %s", string(stored.RawConfig))
+	}
+	entries := app.audits.AuditEntries()
+	if len(entries) != 2 {
+		t.Fatalf("expected allow+deny config audit entries, got %+v", entries)
+	}
+	last := entries[len(entries)-1]
+	if last.Actor != "config-operator" || last.Action != "plugin.config" || last.Permission != "plugin:config" || last.Target != "plugin-echo" || last.Allowed || last.Reason != "permission_denied" {
+		t.Fatalf("expected hot-reload denied config audit entry, got %+v", last)
+	}
+}
+
+func TestRuntimeAppRetryHotReloadsPersistedRBACSnapshotWithoutRestart(t *testing.T) {
+	t.Parallel()
+
+	app, err := newRuntimeApp(writeWriteActionRBACConfig(t))
+	if err != nil {
+		t.Fatalf("new runtime app: %v", err)
+	}
+	defer func() { _ = app.Close() }()
+
+	jobAllowed := runtimecore.NewJob("job-dead-retry-hot-reload-allowed", "ai.chat", 0, 30*time.Second)
+	jobAllowed.TraceID = "trace-job-dead-retry-hot-reload-allowed"
+	jobAllowed.EventID = "evt-job-dead-retry-hot-reload-allowed"
+	jobAllowed.Correlation = "runtime-ai:user-hot-reload-allowed:retry"
+	if err := applyDemoAIJobContract(&jobAllowed, "retry hot reload allowed", "user-hot-reload-allowed"); err != nil {
+		t.Fatalf("apply allowed demo ai job contract: %v", err)
+	}
+	if err := app.queue.Enqueue(t.Context(), jobAllowed); err != nil {
+		t.Fatalf("enqueue allowed ai retry seed job: %v", err)
+	}
+	timeoutAllowedReq := httptest.NewRequest(http.MethodPost, "/demo/jobs/timeout?id="+jobAllowed.ID, nil)
+	timeoutAllowedResp := httptest.NewRecorder()
+	app.ServeHTTP(timeoutAllowedResp, timeoutAllowedReq)
+	if timeoutAllowedResp.Code != http.StatusOK {
+		t.Fatalf("expected allowed seed timeout 200, got %d: %s", timeoutAllowedResp.Code, timeoutAllowedResp.Body.String())
+	}
+
+	retryAllowedReq := httptest.NewRequest(http.MethodPost, "/demo/jobs/"+jobAllowed.ID+"/retry", nil)
+	retryAllowedReq.Header.Set(runtimecore.ConsoleReadActorHeader, "job-operator")
+	retryAllowedResp := httptest.NewRecorder()
+	app.ServeHTTP(retryAllowedResp, retryAllowedReq)
+	if retryAllowedResp.Code != http.StatusOK {
+		t.Fatalf("expected hot-reload seed retry 200, got %d: %s", retryAllowedResp.Code, retryAllowedResp.Body.String())
+	}
+
+	replaceRuntimeCurrentRBACState(t, app, []runtimecore.OperatorIdentityState{{ActorID: "job-operator", Roles: []string{"viewer"}}}, runtimecore.RBACSnapshotState{
+		SnapshotKey:           runtimecore.CurrentRBACSnapshotKey,
+		ConsoleReadPermission: "console:read",
+		Policies: map[string]pluginsdk.AuthorizationPolicy{
+			"viewer": {Permissions: []string{"console:read"}, PluginScope: []string{"console"}},
+		},
+	})
+
+	jobDenied := runtimecore.NewJob("job-dead-retry-hot-reload-denied", "ai.chat", 0, 30*time.Second)
+	jobDenied.TraceID = "trace-job-dead-retry-hot-reload-denied"
+	jobDenied.EventID = "evt-job-dead-retry-hot-reload-denied"
+	jobDenied.Correlation = "runtime-ai:user-hot-reload-denied:retry"
+	if err := applyDemoAIJobContract(&jobDenied, "retry hot reload denied", "user-hot-reload-denied"); err != nil {
+		t.Fatalf("apply denied demo ai job contract: %v", err)
+	}
+	if err := app.queue.Enqueue(t.Context(), jobDenied); err != nil {
+		t.Fatalf("enqueue denied ai retry seed job: %v", err)
+	}
+	timeoutDeniedReq := httptest.NewRequest(http.MethodPost, "/demo/jobs/timeout?id="+jobDenied.ID, nil)
+	timeoutDeniedResp := httptest.NewRecorder()
+	app.ServeHTTP(timeoutDeniedResp, timeoutDeniedReq)
+	if timeoutDeniedResp.Code != http.StatusOK {
+		t.Fatalf("expected denied seed timeout 200, got %d: %s", timeoutDeniedResp.Code, timeoutDeniedResp.Body.String())
+	}
+
+	retryDeniedReq := httptest.NewRequest(http.MethodPost, "/demo/jobs/"+jobDenied.ID+"/retry", nil)
+	retryDeniedReq.Header.Set(runtimecore.ConsoleReadActorHeader, "job-operator")
+	retryDeniedResp := httptest.NewRecorder()
+	app.ServeHTTP(retryDeniedResp, retryDeniedReq)
+	if retryDeniedResp.Code != http.StatusForbidden {
+		t.Fatalf("expected same-process hot-reloaded retry 403, got %d: %s", retryDeniedResp.Code, retryDeniedResp.Body.String())
+	}
+	if !strings.Contains(retryDeniedResp.Body.String(), "permission denied") {
+		t.Fatalf("expected hot-reloaded retry denial to mention permission denied, got %s", retryDeniedResp.Body.String())
+	}
+	storedDeniedJob, err := app.queue.Inspect(t.Context(), jobDenied.ID)
+	if err != nil {
+		t.Fatalf("inspect denied hot-reload retry job: %v", err)
+	}
+	if storedDeniedJob.Status != runtimecore.JobStatusDead || !storedDeniedJob.DeadLetter {
+		t.Fatalf("expected hot-reloaded denied retry to preserve dead-letter state, got %+v", storedDeniedJob)
+	}
+	entries := app.audits.AuditEntries()
+	if len(entries) < 2 {
+		t.Fatalf("expected allow+deny retry audit entries, got %+v", entries)
+	}
+	last := entries[len(entries)-1]
+	if last.Actor != "job-operator" || last.Action != "job.retry" || last.Permission != "job:retry" || last.Target != jobDenied.ID || last.Allowed || last.Reason != "permission_denied" {
+		t.Fatalf("expected hot-reload denied retry audit entry, got %+v", last)
+	}
+}
+
+func TestRuntimeAppScheduleCancelHotReloadsPersistedRBACSnapshotWithoutRestart(t *testing.T) {
+	t.Parallel()
+
+	app, err := newRuntimeApp(writeScheduleCancelRBACConfig(t))
+	if err != nil {
+		t.Fatalf("new runtime app: %v", err)
+	}
+	defer func() { _ = app.Close() }()
+
+	createAllowedReq := httptest.NewRequest(http.MethodPost, "/demo/schedules/echo-delay", strings.NewReader(`{"id":"schedule-hot-reload-allowed","delay_ms":500,"message":"cancel allowed"}`))
+	createAllowedReq.Header.Set("Content-Type", "application/json")
+	createAllowedResp := httptest.NewRecorder()
+	app.ServeHTTP(createAllowedResp, createAllowedReq)
+	if createAllowedResp.Code != http.StatusOK {
+		t.Fatalf("expected allowed seed schedule create 200, got %d: %s", createAllowedResp.Code, createAllowedResp.Body.String())
+	}
+
+	cancelAllowedReq := httptest.NewRequest(http.MethodPost, "/demo/schedules/schedule-hot-reload-allowed/cancel", nil)
+	cancelAllowedReq.Header.Set(runtimecore.ConsoleReadActorHeader, "schedule-admin")
+	cancelAllowedResp := httptest.NewRecorder()
+	app.ServeHTTP(cancelAllowedResp, cancelAllowedReq)
+	if cancelAllowedResp.Code != http.StatusOK {
+		t.Fatalf("expected hot-reload seed schedule cancel 200, got %d: %s", cancelAllowedResp.Code, cancelAllowedResp.Body.String())
+	}
+
+	replaceRuntimeCurrentRBACState(t, app, []runtimecore.OperatorIdentityState{{ActorID: "schedule-admin", Roles: []string{"schedule-viewer"}}}, runtimecore.RBACSnapshotState{
+		SnapshotKey: runtimecore.CurrentRBACSnapshotKey,
+		Policies: map[string]pluginsdk.AuthorizationPolicy{
+			"schedule-viewer": {Permissions: []string{"schedule:view"}, PluginScope: []string{"*"}},
+		},
+	})
+
+	createDeniedReq := httptest.NewRequest(http.MethodPost, "/demo/schedules/echo-delay", strings.NewReader(`{"id":"schedule-hot-reload-denied","delay_ms":500,"message":"cancel denied"}`))
+	createDeniedReq.Header.Set("Content-Type", "application/json")
+	createDeniedResp := httptest.NewRecorder()
+	app.ServeHTTP(createDeniedResp, createDeniedReq)
+	if createDeniedResp.Code != http.StatusOK {
+		t.Fatalf("expected denied seed schedule create 200, got %d: %s", createDeniedResp.Code, createDeniedResp.Body.String())
+	}
+
+	cancelDeniedReq := httptest.NewRequest(http.MethodPost, "/demo/schedules/schedule-hot-reload-denied/cancel", nil)
+	cancelDeniedReq.Header.Set(runtimecore.ConsoleReadActorHeader, "schedule-admin")
+	cancelDeniedResp := httptest.NewRecorder()
+	app.ServeHTTP(cancelDeniedResp, cancelDeniedReq)
+	if cancelDeniedResp.Code != http.StatusForbidden {
+		t.Fatalf("expected same-process hot-reloaded schedule cancel 403, got %d: %s", cancelDeniedResp.Code, cancelDeniedResp.Body.String())
+	}
+	if !strings.Contains(cancelDeniedResp.Body.String(), "permission denied") {
+		t.Fatalf("expected hot-reloaded schedule cancel denial to mention permission denied, got %s", cancelDeniedResp.Body.String())
+	}
+	if _, err := app.state.LoadSchedulePlan(t.Context(), "schedule-hot-reload-denied"); err != nil {
+		t.Fatalf("expected denied hot-reload schedule cancel to preserve persisted plan, got %v", err)
+	}
+	entries := app.audits.AuditEntries()
+	if len(entries) < 2 {
+		t.Fatalf("expected allow+deny schedule cancel audit entries, got %+v", entries)
+	}
+	last := entries[len(entries)-1]
+	if last.Actor != "schedule-admin" || last.Action != "schedule.cancel" || last.Permission != "schedule:cancel" || last.Target != "schedule-hot-reload-denied" || last.Allowed || last.Reason != "permission_denied" {
+		t.Fatalf("expected hot-reload denied schedule cancel audit entry, got %+v", last)
+	}
+}
+
+func TestRuntimeAppPluginOperatorHotReloadsPersistedRBACSnapshotWithoutRestart(t *testing.T) {
+	t.Parallel()
+
+	app, err := newRuntimeApp(writeWriteActionRBACConfig(t))
+	if err != nil {
+		t.Fatalf("new runtime app: %v", err)
+	}
+	defer func() { _ = app.Close() }()
+
+	replaceRuntimeCurrentRBACState(t, app, []runtimecore.OperatorIdentityState{{ActorID: "admin-user", Roles: []string{"admin"}}}, runtimecore.RBACSnapshotState{
+		SnapshotKey: runtimecore.CurrentRBACSnapshotKey,
+		Policies: map[string]pluginsdk.AuthorizationPolicy{
+			"admin": {Permissions: []string{"plugin:enable", "plugin:disable"}, PluginScope: []string{"*"}},
+		},
+	})
+
+	disableReq := httptest.NewRequest(http.MethodPost, "/demo/plugins/plugin-echo/disable", nil)
+	disableReq.Header.Set(runtimecore.ConsoleReadActorHeader, "admin-user")
+	disableResp := httptest.NewRecorder()
+	app.ServeHTTP(disableResp, disableReq)
+	if disableResp.Code != http.StatusOK {
+		t.Fatalf("expected hot-reload seed plugin disable 200, got %d: %s", disableResp.Code, disableResp.Body.String())
+	}
+	state, err := app.state.LoadPluginEnabledState(t.Context(), "plugin-echo")
+	if err != nil {
+		t.Fatalf("load disabled plugin state after hot-reload seed: %v", err)
+	}
+	if state.Enabled {
+		t.Fatalf("expected plugin to be disabled by hot-reload seed request, got %+v", state)
+	}
+
+	replaceRuntimeCurrentRBACState(t, app, []runtimecore.OperatorIdentityState{{ActorID: "admin-user", Roles: []string{"viewer"}}}, runtimecore.RBACSnapshotState{
+		SnapshotKey:           runtimecore.CurrentRBACSnapshotKey,
+		ConsoleReadPermission: "console:read",
+		Policies: map[string]pluginsdk.AuthorizationPolicy{
+			"viewer": {Permissions: []string{"console:read"}, PluginScope: []string{"console"}},
+		},
+	})
+
+	enableReq := httptest.NewRequest(http.MethodPost, "/demo/plugins/plugin-echo/enable", nil)
+	enableReq.Header.Set(runtimecore.ConsoleReadActorHeader, "admin-user")
+	enableResp := httptest.NewRecorder()
+	app.ServeHTTP(enableResp, enableReq)
+	if enableResp.Code != http.StatusForbidden {
+		t.Fatalf("expected same-process hot-reloaded plugin enable 403, got %d: %s", enableResp.Code, enableResp.Body.String())
+	}
+	if !strings.Contains(enableResp.Body.String(), "permission denied") {
+		t.Fatalf("expected hot-reloaded plugin enable denial to mention permission denied, got %s", enableResp.Body.String())
+	}
+	state, err = app.state.LoadPluginEnabledState(t.Context(), "plugin-echo")
+	if err != nil {
+		t.Fatalf("load plugin state after hot-reload denied enable: %v", err)
+	}
+	if state.Enabled {
+		t.Fatalf("expected denied hot-reload enable to preserve disabled plugin state, got %+v", state)
+	}
+	entries := app.audits.AuditEntries()
+	if len(entries) < 2 {
+		t.Fatalf("expected allow+deny plugin operator audit entries, got %+v", entries)
+	}
+	last := entries[len(entries)-1]
+	if last.Actor != "admin-user" || last.Action != "plugin.enable" || last.Permission != "plugin:enable" || last.Target != "plugin-echo" || last.Allowed || last.Reason != "permission_denied" {
+		t.Fatalf("expected hot-reload denied plugin enable audit entry, got %+v", last)
+	}
+}
+
+func TestRuntimeAppRestartReloadsPersistedRBACSnapshotAndIdentities(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	configPath := writeWriteActionRBACConfigAt(t, dir)
+
+	app, err := newRuntimeApp(configPath)
+	if err != nil {
+		t.Fatalf("new runtime app: %v", err)
+	}
+	counts, err := app.state.Counts(t.Context())
+	if err != nil {
+		t.Fatalf("state counts before restart: %v", err)
+	}
+	if counts["operator_identities"] == 0 || counts["rbac_snapshots"] != 1 {
+		t.Fatalf("expected persisted rbac state before restart, got %+v", counts)
+	}
+	identity, err := app.state.LoadOperatorIdentity(t.Context(), "config-operator")
+	if err != nil {
+		t.Fatalf("load persisted operator identity: %v", err)
+	}
+	if identity.ActorID != "config-operator" || len(identity.Roles) != 1 || identity.Roles[0] != "config-operator" {
+		t.Fatalf("expected persisted config-operator identity, got %+v", identity)
+	}
+	snapshot, err := app.state.LoadRBACSnapshot(t.Context(), runtimecore.CurrentRBACSnapshotKey)
+	if err != nil {
+		t.Fatalf("load persisted rbac snapshot: %v", err)
+	}
+	if snapshot.Policies["config-operator"].Permissions[0] != "plugin:config" {
+		t.Fatalf("expected persisted config-operator policy, got %+v", snapshot.Policies)
+	}
+	if err := app.Close(); err != nil {
+		t.Fatalf("close first app: %v", err)
+	}
+
+	restarted, err := newRuntimeApp(configPath)
+	if err != nil {
+		t.Fatalf("restart runtime app: %v", err)
+	}
+	defer func() { _ = restarted.Close() }()
+
+	consoleReq := consoleRequestWithViewer("/api/console")
+	consoleResp := httptest.NewRecorder()
+	restarted.ServeHTTP(consoleResp, consoleReq)
+	if consoleResp.Code != http.StatusOK {
+		t.Fatalf("expected restarted console 200, got %d: %s", consoleResp.Code, consoleResp.Body.String())
+	}
+
+	deniedConfigReq := httptest.NewRequest(http.MethodPost, "/demo/plugins/plugin-echo/config", strings.NewReader(`{"prefix":"denied after restart: "}`))
+	deniedConfigReq.Header.Set("Content-Type", "application/json")
+	deniedConfigResp := httptest.NewRecorder()
+	restarted.ServeHTTP(deniedConfigResp, deniedConfigReq)
+	if deniedConfigResp.Code != http.StatusForbidden {
+		t.Fatalf("expected headerless config update 403 after restart, got %d: %s", deniedConfigResp.Code, deniedConfigResp.Body.String())
+	}
+
+	allowedConfigReq := httptest.NewRequest(http.MethodPost, "/demo/plugins/plugin-echo/config", strings.NewReader(`{"prefix":"persisted after restart: "}`))
+	allowedConfigReq.Header.Set("Content-Type", "application/json")
+	allowedConfigReq.Header.Set(runtimecore.ConsoleReadActorHeader, "config-operator")
+	allowedConfigResp := httptest.NewRecorder()
+	restarted.ServeHTTP(allowedConfigResp, allowedConfigReq)
+	if allowedConfigResp.Code != http.StatusOK {
+		t.Fatalf("expected allowed config update after restart, got %d: %s", allowedConfigResp.Code, allowedConfigResp.Body.String())
+	}
+	stored, err := restarted.state.LoadPluginConfig(t.Context(), "plugin-echo")
+	if err != nil {
+		t.Fatalf("load persisted plugin config after restart: %v", err)
+	}
+	if string(stored.RawConfig) != `{"prefix":"persisted after restart: "}` {
+		t.Fatalf("expected restarted runtime to keep using persisted rbac snapshot, got %s", string(stored.RawConfig))
+	}
+	entries := restarted.audits.AuditEntries()
+	if len(entries) < 2 {
+		t.Fatalf("expected deny + allow audit entries after restart, got %+v", entries)
+	}
+	if entries[0].Actor != "" || entries[0].Action != "plugin.config" || entries[0].Permission != "plugin:config" || entries[0].Target != "plugin-echo" || entries[0].Allowed || entries[0].Reason != "permission_denied" {
+		t.Fatalf("expected denied config audit after restart, got %+v", entries[0])
+	}
+	last := entries[len(entries)-1]
+	if last.Actor != "config-operator" || last.Action != "config.update" || last.Permission != "plugin:config" || last.Target != "plugin-echo" || !last.Allowed || last.Reason != "plugin_config_updated" {
+		t.Fatalf("expected allowed config audit after restart, got %+v", last)
 	}
 }
 
@@ -1707,7 +2129,7 @@ func TestRuntimeAppJobQueueAppearsInConsole(t *testing.T) {
 		t.Fatalf("expected 200, got %d: %s", resp.Code, resp.Body.String())
 	}
 
-	consoleReq := httptest.NewRequest(http.MethodGet, "/api/console", nil)
+	consoleReq := consoleRequestWithViewer("/api/console")
 	consoleResp := httptest.NewRecorder()
 	app.ServeHTTP(consoleResp, consoleReq)
 	if !strings.Contains(consoleResp.Body.String(), "job-demo-1") {
@@ -2082,6 +2504,48 @@ func TestRuntimeAppRetryDeadLetterOperatorReturnsForbiddenAndRecordsDeniedAudit(
 	}
 }
 
+func TestRuntimeAppRetryDeadLetterOperatorFailsClosedWithoutActorHeaderUnderConfiguredRBAC(t *testing.T) {
+	t.Parallel()
+
+	app, err := newRuntimeApp(writeWriteActionRBACConfig(t))
+	if err != nil {
+		t.Fatalf("new runtime app: %v", err)
+	}
+	defer func() { _ = app.Close() }()
+
+	job := runtimecore.NewJob("job-dead-retry-missing-actor", "ai.chat", 0, 30*time.Second)
+	job.TraceID = "trace-job-dead-retry-missing-actor"
+	job.EventID = "evt-job-dead-retry-missing-actor"
+	job.Correlation = "runtime-ai:user-retry-missing-actor:deny retry"
+	if err := applyDemoAIJobContract(&job, "deny retry", "user-retry-missing-actor"); err != nil {
+		t.Fatalf("apply demo ai job contract: %v", err)
+	}
+	if err := app.queue.Enqueue(t.Context(), job); err != nil {
+		t.Fatalf("enqueue ai retry seed job: %v", err)
+	}
+
+	timeoutReq := httptest.NewRequest(http.MethodPost, "/demo/jobs/timeout?id=job-dead-retry-missing-actor", nil)
+	timeoutResp := httptest.NewRecorder()
+	app.ServeHTTP(timeoutResp, timeoutReq)
+	if timeoutResp.Code != http.StatusOK {
+		t.Fatalf("expected timeout 200, got %d: %s", timeoutResp.Code, timeoutResp.Body.String())
+	}
+
+	retryReq := httptest.NewRequest(http.MethodPost, "/demo/jobs/job-dead-retry-missing-actor/retry", nil)
+	retryResp := httptest.NewRecorder()
+	app.ServeHTTP(retryResp, retryReq)
+	if retryResp.Code != http.StatusForbidden {
+		t.Fatalf("expected headerless retry 403, got %d: %s", retryResp.Code, retryResp.Body.String())
+	}
+	if !strings.Contains(retryResp.Body.String(), "permission denied") {
+		t.Fatalf("expected headerless retry response to mention permission denied, got %s", retryResp.Body.String())
+	}
+	entries := app.audits.AuditEntries()
+	if len(entries) != 1 || entries[0].Actor != "" || entries[0].Action != "job.retry" || entries[0].Permission != "job:retry" || entries[0].Target != "job-dead-retry-missing-actor" || entries[0].Allowed || entries[0].Reason != "permission_denied" {
+		t.Fatalf("expected headerless retry deny audit entry, got %+v", entries)
+	}
+}
+
 func TestRuntimeAppPluginEchoConfigOperatorPersistsConfigWithStableEnvelopeAndAllowAudit(t *testing.T) {
 	t.Parallel()
 
@@ -2388,6 +2852,38 @@ func TestRuntimeAppCancelScheduleOperatorReturnsForbiddenAndRecordsDeniedAudit(t
 	}
 }
 
+func TestRuntimeAppCancelScheduleOperatorFailsClosedWithoutActorHeaderUnderConfiguredRBAC(t *testing.T) {
+	t.Parallel()
+
+	app, err := newRuntimeApp(writeScheduleCancelRBACConfig(t))
+	if err != nil {
+		t.Fatalf("new runtime app: %v", err)
+	}
+	defer func() { _ = app.Close() }()
+
+	createReq := httptest.NewRequest(http.MethodPost, "/demo/schedules/echo-delay", strings.NewReader(`{"id":"schedule-cancel-missing-actor","delay_ms":500,"message":"deny me"}`))
+	createReq.Header.Set("Content-Type", "application/json")
+	createResp := httptest.NewRecorder()
+	app.ServeHTTP(createResp, createReq)
+	if createResp.Code != http.StatusOK {
+		t.Fatalf("expected create schedule 200, got %d: %s", createResp.Code, createResp.Body.String())
+	}
+
+	cancelReq := httptest.NewRequest(http.MethodPost, "/demo/schedules/schedule-cancel-missing-actor/cancel", nil)
+	cancelResp := httptest.NewRecorder()
+	app.ServeHTTP(cancelResp, cancelReq)
+	if cancelResp.Code != http.StatusForbidden {
+		t.Fatalf("expected headerless cancel 403, got %d: %s", cancelResp.Code, cancelResp.Body.String())
+	}
+	if !strings.Contains(cancelResp.Body.String(), "permission denied") {
+		t.Fatalf("expected headerless cancel response to mention permission denied, got %s", cancelResp.Body.String())
+	}
+	entries := app.audits.AuditEntries()
+	if len(entries) != 1 || entries[0].Actor != "" || entries[0].Action != "schedule.cancel" || entries[0].Permission != "schedule:cancel" || entries[0].Target != "schedule-cancel-missing-actor" || entries[0].Allowed || entries[0].Reason != "permission_denied" {
+		t.Fatalf("expected headerless cancel deny audit entry, got %+v", entries)
+	}
+}
+
 func TestRuntimeAppCancelScheduleOperatorDeletionSurvivesRestart(t *testing.T) {
 	t.Parallel()
 
@@ -2408,6 +2904,7 @@ func TestRuntimeAppCancelScheduleOperatorDeletionSurvivesRestart(t *testing.T) {
 	}
 
 	cancelReq := httptest.NewRequest(http.MethodPost, "/demo/schedules/schedule-cancel-restart/cancel", nil)
+	cancelReq.Header.Set(runtimecore.ConsoleReadActorHeader, "schedule-admin")
 	cancelResp := httptest.NewRecorder()
 	app.ServeHTTP(cancelResp, cancelReq)
 	if cancelResp.Code != http.StatusOK {
@@ -2426,7 +2923,16 @@ func TestRuntimeAppCancelScheduleOperatorDeletionSurvivesRestart(t *testing.T) {
 	if _, err := restarted.state.LoadSchedulePlan(t.Context(), "schedule-cancel-restart"); err == nil {
 		t.Fatal("expected cancelled schedule to stay deleted after restart")
 	}
-	console := readRuntimeConsoleResponse(t, restarted)
+	consoleReq := consoleRequestWithViewer("/api/console")
+	consoleResp := httptest.NewRecorder()
+	restarted.ServeHTTP(consoleResp, consoleReq)
+	if consoleResp.Code != http.StatusOK {
+		t.Fatalf("expected restarted console 200, got %d: %s", consoleResp.Code, consoleResp.Body.String())
+	}
+	var console runtimeConsoleResponse
+	if err := json.Unmarshal(consoleResp.Body.Bytes(), &console); err != nil {
+		t.Fatalf("decode console payload: %v", err)
+	}
 	if console.Status.Schedules != 0 || hasConsoleSchedule(console, "schedule-cancel-restart") {
 		t.Fatalf("expected restarted console to stay clear of deleted schedule, got %+v", console)
 	}
@@ -2460,7 +2966,7 @@ func TestRuntimeAppConsoleJobsComeFromPersistedState(t *testing.T) {
 	}
 	defer func() { _ = restarted.Close() }()
 
-	consoleReq := httptest.NewRequest(http.MethodGet, "/api/console", nil)
+	consoleReq := consoleRequestWithViewer("/api/console")
 	consoleResp := httptest.NewRecorder()
 	restarted.ServeHTTP(consoleResp, consoleReq)
 	for _, expected := range []string{"job-console-persisted-runtime", `"jobs": 1`, "corr-console-runtime", `"recoveredJobs": 0`, `"job_recovery_total_jobs": 1`} {
@@ -2574,7 +3080,16 @@ func TestRuntimeAppConsoleReadsPersistedAdapterInstanceAfterRestart(t *testing.T
 	}
 	defer func() { _ = restarted.Close() }()
 
-	console := readRuntimeConsoleResponse(t, restarted)
+	consoleReq := consoleRequestWithViewer("/api/console")
+	consoleResp := httptest.NewRecorder()
+	restarted.ServeHTTP(consoleResp, consoleReq)
+	if consoleResp.Code != http.StatusOK {
+		t.Fatalf("expected console 200, got %d: %s", consoleResp.Code, consoleResp.Body.String())
+	}
+	var console runtimeConsoleResponse
+	if err := json.Unmarshal(consoleResp.Body.Bytes(), &console); err != nil {
+		t.Fatalf("decode console payload: %v", err)
+	}
 	if console.Status.Adapters != 1 || !hasConsoleAdapter(console, "adapter-onebot-demo") {
 		t.Fatalf("expected restarted console to expose persisted adapter instance, got %+v", console)
 	}
@@ -2582,8 +3097,8 @@ func TestRuntimeAppConsoleReadsPersistedAdapterInstanceAfterRestart(t *testing.T
 	if adapter.Adapter != "onebot" || adapter.Source != "onebot" || adapter.Status != "registered" || adapter.Health != "ready" || !adapter.Online || !adapter.StatePersisted {
 		t.Fatalf("expected restarted console adapter facts, got %+v", adapter)
 	}
-	consoleReq := httptest.NewRequest(http.MethodGet, "/api/console", nil)
-	consoleResp := httptest.NewRecorder()
+    consoleReq = consoleRequestWithViewer("/api/console")
+    consoleResp = httptest.NewRecorder()
 	restarted.ServeHTTP(consoleResp, consoleReq)
 	for _, expected := range []string{`"id": "adapter-onebot-demo"`, `"adapter": "onebot"`, `"status": "registered"`, `"health": "ready"`, `"online": true`, `"statePersisted": true`, `"adapter_read_model": "sqlite-adapter-instances"`} {
 		if !strings.Contains(consoleResp.Body.String(), expected) {
@@ -2633,7 +3148,16 @@ func TestRuntimeAppLoadsConfiguredBotInstancesAndExposesThemAfterRestart(t *test
 	}
 	defer func() { _ = restarted.Close() }()
 
-	console := readRuntimeConsoleResponse(t, restarted)
+	consoleReq := consoleRequestWithViewer("/api/console")
+	consoleResp := httptest.NewRecorder()
+	restarted.ServeHTTP(consoleResp, consoleReq)
+	if consoleResp.Code != http.StatusOK {
+		t.Fatalf("expected console 200, got %d: %s", consoleResp.Code, consoleResp.Body.String())
+	}
+	var console runtimeConsoleResponse
+	if err := json.Unmarshal(consoleResp.Body.Bytes(), &console); err != nil {
+		t.Fatalf("decode console payload: %v", err)
+	}
 	if console.Status.Adapters != 2 || !hasConsoleAdapter(console, "adapter-onebot-alpha") || !hasConsoleAdapter(console, "adapter-onebot-beta") {
 		t.Fatalf("expected restarted console to expose both configured adapter instances, got %+v", console)
 	}
@@ -2663,8 +3187,8 @@ func TestRuntimeAppLoadsConfiguredBotInstancesAndExposesThemAfterRestart(t *test
 	if _, exists := beta.Config["self_id"]; exists {
 		t.Fatalf("expected beta config to omit optional self_id, got %+v", beta.Config)
 	}
-	consoleReq := httptest.NewRequest(http.MethodGet, "/api/console", nil)
-	consoleResp := httptest.NewRecorder()
+    consoleReq = consoleRequestWithViewer("/api/console")
+    consoleResp = httptest.NewRecorder()
 	restarted.ServeHTTP(consoleResp, consoleReq)
 	for _, expected := range []string{`"id": "adapter-onebot-alpha"`, `"id": "adapter-onebot-beta"`, `"source": "onebot-alpha"`, `"source": "onebot-beta"`, `"demo_path": "/demo/onebot/message"`, `"demo_path": "/demo/onebot/message-beta"`, `"self_id": 10001`, `"adapter_read_model": "sqlite-adapter-instances"`} {
 		if !strings.Contains(consoleResp.Body.String(), expected) {
@@ -2706,7 +3230,7 @@ func TestRuntimeAppRestoresPersistedDelayScheduleAfterRestart(t *testing.T) {
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		app.queue.DispatchReady(t.Context(), time.Now().UTC())
+        restarted.queue.DispatchReady(t.Context(), time.Now().UTC())
 		repliesReq := httptest.NewRequest(http.MethodGet, "/demo/replies", nil)
 		repliesResp := httptest.NewRecorder()
 		restarted.ServeHTTP(repliesResp, repliesReq)
@@ -2765,7 +3289,7 @@ func TestRuntimeAppConsoleAndMetricsExposeScheduleRecoveryAfterRestart(t *testin
 		t.Fatalf("expected restored schedule dueAt to persist as %s, got %+v", wantDueAt, stored)
 	}
 
-	consoleReq := httptest.NewRequest(http.MethodGet, "/api/console", nil)
+	consoleReq := consoleRequestWithViewer("/api/console")
 	consoleResp := httptest.NewRecorder()
 	restarted.ServeHTTP(consoleResp, consoleReq)
 	for _, expected := range []string{
@@ -3100,7 +3624,7 @@ func TestRuntimeAppAIQueueDispatcherUsesRuntimeDispatchPath(t *testing.T) {
 	jobID := extractAIJobID(resp.Body.String())
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		app.queue.DispatchReady(t.Context(), time.Now().UTC())
+        app.queue.DispatchReady(t.Context(), time.Now().UTC())
 		stored, inspectErr := app.queue.Inspect(t.Context(), jobID)
 		if inspectErr == nil && stored.Status == runtimecore.JobStatusDone {
 			entries := app.logs.Lines()
@@ -3133,7 +3657,7 @@ func TestRuntimeAppInvalidAIReplyHandleTransitionsJobOutOfPending(t *testing.T) 
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		app.queue.DispatchReady(t.Context(), time.Now().UTC())
+        app.queue.DispatchReady(t.Context(), time.Now().UTC())
 		stored, inspectErr := app.queue.Inspect(t.Context(), job.ID)
 		if inspectErr != nil {
 			t.Fatalf("inspect ai job: %v", inspectErr)
@@ -3176,7 +3700,7 @@ func TestRuntimeAppDispatchFailureTransitionsAIJobOutOfPending(t *testing.T) {
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		app.queue.DispatchReady(t.Context(), time.Now().UTC())
+        app.queue.DispatchReady(t.Context(), time.Now().UTC())
 		stored, inspectErr := app.queue.Inspect(t.Context(), job.ID)
 		if inspectErr != nil {
 			t.Fatalf("inspect ai job: %v", inspectErr)
@@ -3335,7 +3859,7 @@ func TestRuntimeAppAIMessageFailureFeedback(t *testing.T) {
 	jobID := extractAIJobID(resp.Body.String())
 	deadline := time.Now().Add(2500 * time.Millisecond)
 	for time.Now().Before(deadline) {
-		app.queue.DispatchReady(t.Context(), time.Now().UTC())
+        app.queue.DispatchReady(t.Context(), time.Now().UTC())
 		repliesReq := httptest.NewRequest(http.MethodGet, "/demo/replies", nil)
 		repliesResp := httptest.NewRecorder()
 		app.ServeHTTP(repliesResp, repliesReq)
@@ -3584,7 +4108,16 @@ func TestRuntimeAppRestartRecoversRunningJobState(t *testing.T) {
 	if restored.ReasonCode != runtimecore.JobReasonCodeWorkerAbandoned || !strings.Contains(restored.LastError, "lease abandoned") {
 		t.Fatalf("expected restart recovery reason, got %+v", restored)
 	}
-	payload := readRuntimeConsoleResponse(t, restarted)
+	consoleReq := consoleRequestWithViewer("/api/console")
+	consoleResp := httptest.NewRecorder()
+	restarted.ServeHTTP(consoleResp, consoleReq)
+	if consoleResp.Code != http.StatusOK {
+		t.Fatalf("expected console 200, got %d: %s", consoleResp.Code, consoleResp.Body.String())
+	}
+	var payload runtimeConsoleResponse
+	if err := json.Unmarshal(consoleResp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode console payload: %v", err)
+	}
 	jobVisible := false
 	for _, consoleJob := range payload.Jobs {
 		if consoleJob.ID == "job-restart-running" {
@@ -3710,3 +4243,5 @@ func extractAIJobID(raw string) string {
 	_ = json.Unmarshal([]byte(raw), &payload)
 	return payload.JobID
 }
+
+

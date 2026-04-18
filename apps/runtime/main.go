@@ -45,6 +45,7 @@ type runtimeApp struct {
 	queue           *runtimecore.JobQueue
 	scheduler       *runtimecore.Scheduler
 	schedulerCancel context.CancelFunc
+	authorizer      *runtimecore.CurrentRBACAuthorizerProvider
 	consoleMeta     map[string]any
 	mux             *http.ServeMux
 }
@@ -407,6 +408,18 @@ func newRuntimeAppWithOutput(configPath string, output io.Writer) (*runtimeApp, 
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite state store: %w", err)
 	}
+	var authorizerProvider *runtimecore.CurrentRBACAuthorizerProvider
+	if config.RBAC != nil {
+		if err := runtimecore.PersistConfiguredRBACState(context.Background(), state, config.RBAC); err != nil {
+			_ = state.Close()
+			return nil, fmt.Errorf("persist configured rbac state: %w", err)
+		}
+		authorizerProvider, err = runtimecore.NewCurrentRBACAuthorizerProviderFromStore(context.Background(), state)
+		if err != nil {
+			_ = state.Close()
+			return nil, fmt.Errorf("load current rbac snapshot: %w", err)
+		}
+	}
 	pluginConfigs := newAppPluginConfigRegistry()
 	queue.SetStore(state)
 	queue.SetAlertSink(state)
@@ -429,8 +442,11 @@ func newRuntimeAppWithOutput(configPath string, output io.Writer) (*runtimeApp, 
 	runtime.SetDispatchRecorder(state)
 	lifecycle := runtimecore.NewPluginLifecycleService(state)
 	runtime.SetPluginEnabledStateSource(lifecycle)
-	if config.RBAC != nil {
-		runtime.SetCommandAuthorizer(runtimecore.NewAdminCommandAuthorizer(config.RBAC))
+	if authorizerProvider != nil {
+		runtime.SetCommandAuthorizer(runtimecore.NewAdminCommandAuthorizerFromProvider(authorizerProvider))
+		runtime.SetEventAuthorizer(runtimecore.NewMetadataEventAuthorizerFromProvider(authorizerProvider))
+		runtime.SetJobAuthorizer(runtimecore.NewMetadataJobAuthorizerFromProvider(authorizerProvider))
+		runtime.SetScheduleAuthorizer(runtimecore.NewMetadataScheduleAuthorizerFromProvider(authorizerProvider))
 	}
 	replayJournal, ok := smokeStore.(runtimecore.EventJournalReader)
 	if !ok {
@@ -491,7 +507,7 @@ func newRuntimeAppWithOutput(configPath string, output io.Writer) (*runtimeApp, 
 		_ = state.Close()
 		return nil, fmt.Errorf("save ai plugin manifest: %w", err)
 	}
-	adminPlugin := pluginadmin.New(lifecycle, nil, replayService, actorRoles(config.RBAC), policies(config.RBAC), audits)
+	adminPlugin := pluginadmin.New(lifecycle, nil, replayService, authorizerProvider, actorRoles(config.RBAC), policies(config.RBAC), audits)
 	adminDefinition := adminPlugin.Definition()
 	if err := runtime.RegisterPlugin(adminDefinition); err != nil {
 		_ = smokeStore.Close()
@@ -550,6 +566,7 @@ func newRuntimeAppWithOutput(configPath string, output io.Writer) (*runtimeApp, 
 		lifecycle:     lifecycle,
 		queue:         queue,
 		scheduler:     scheduler,
+		authorizer:    authorizerProvider,
 		consoleMeta: map[string]any{
 			"runtime_entry": "apps/runtime",
 			"demo_paths": []string{
@@ -616,6 +633,33 @@ func (a *runtimeApp) Close() error {
 	return nil
 }
 
+func (a *runtimeApp) reloadCurrentRBACAuthorizer(ctx context.Context) error {
+	if a == nil || a.authorizer == nil {
+		return nil
+	}
+	if a.state == nil {
+		return fmt.Errorf("reload current rbac snapshot: sqlite state store is required")
+	}
+	if err := a.authorizer.ReloadFromStore(ctx, a.state); err != nil {
+		return fmt.Errorf("reload current rbac snapshot: %w", err)
+	}
+	return nil
+}
+
+func (a *runtimeApp) consoleReadPermissionConfigured() bool {
+	if a == nil {
+		return false
+	}
+	if a.authorizer != nil {
+		snapshot := a.authorizer.CurrentSnapshot()
+		if snapshot == nil {
+			return false
+		}
+		return strings.TrimSpace(snapshot.ConsoleReadPermission) != ""
+	}
+	return a.config.RBAC != nil && strings.TrimSpace(a.config.RBAC.ConsoleReadPermission) != ""
+}
+
 func (a *runtimeApp) routes() {
 	a.mux.HandleFunc("/healthz", a.handleHealth)
 	a.mux.HandleFunc("/demo/onebot/message", a.handleOneBotMessage)
@@ -679,7 +723,12 @@ func (a *runtimeApp) runtimeHealth(ctx context.Context) (int, runtimeHealthRespo
 }
 
 func (a *runtimeApp) handleConsole(w http.ResponseWriter, r *http.Request) {
+	if err := a.reloadCurrentRBACAuthorizer(r.Context()); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	console := runtimecore.NewConsoleAPI(a.runtimeRaw, a.queue, a.config, a.logs.Lines(), a.audits)
+	console.SetCurrentAuthorizerProvider(a.authorizer)
 	console.SetJobReader(runtimecore.NewSQLiteConsoleJobReader(a.state))
 	console.SetAlertReader(runtimecore.NewSQLiteConsoleAlertReader(a.state))
 	console.SetScheduleReader(runtimecore.NewSQLiteConsoleScheduleReader(a.state))
@@ -722,14 +771,15 @@ func (a *runtimeApp) handleConsole(w http.ResponseWriter, r *http.Request) {
 	meta["plugin_runtime_state_live"] = true
 	meta["rbac_capability_surface"] = "read-only declaration of current authorization and adjacent dispatch-boundary facts"
 	meta["rbac_read_model_scope"] = "current runtime authorizer entrypoints, adjacent dispatch contract/filter boundaries, deny audit taxonomy, and known system gaps"
-	meta["rbac_current_state"] = "partial-runtime-local-read-model"
+	meta["rbac_current_state"] = "persisted-runtime-current-snapshot"
 	meta["rbac_system_model_state"] = "not-complete-global-rbac-authn-or-audit-system"
-	meta["rbac_current_authorization_paths"] = []string{"admin-command-runtime-authorizer", "event-metadata-runtime-authorizer", "job-metadata-runtime-authorizer", "schedule-metadata-runtime-authorizer", "console-read-authorizer", "schedule-operator-runtime-authorizer"}
+	meta["rbac_current_authorization_paths"] = []string{"admin-command-runtime-authorizer", "event-metadata-runtime-authorizer", "job-metadata-runtime-authorizer", "schedule-metadata-runtime-authorizer", "console-read-authorizer", "job-operator-runtime-authorizer", "schedule-operator-runtime-authorizer", "plugin-config-runtime-authorizer", "plugin-admin-current-authorizer-provider"}
 	meta["rbac_current_authorization_paths_count"] = 6
-	meta["rbac_authorization_boundaries"] = []string{"admin-command-runtime-authorizer", "event-metadata-runtime-authorizer", "job-metadata-runtime-authorizer", "schedule-metadata-runtime-authorizer", "console-read-authorizer", "schedule-operator-runtime-authorizer"}
-	meta["rbac_authorizer_entrypoints"] = []string{"admin-command-runtime-authorizer", "event-metadata-runtime-authorizer", "job-metadata-runtime-authorizer", "schedule-metadata-runtime-authorizer", "console-read-authorizer", "schedule-operator-runtime-authorizer"}
+	meta["rbac_current_authorization_paths_count"] = 9
+	meta["rbac_authorization_boundaries"] = []string{"admin-command-runtime-authorizer", "event-metadata-runtime-authorizer", "job-metadata-runtime-authorizer", "schedule-metadata-runtime-authorizer", "console-read-authorizer", "job-operator-runtime-authorizer", "schedule-operator-runtime-authorizer", "plugin-config-runtime-authorizer", "plugin-admin-current-authorizer-provider"}
+	meta["rbac_authorizer_entrypoints"] = []string{"admin-command-runtime-authorizer", "event-metadata-runtime-authorizer", "job-metadata-runtime-authorizer", "schedule-metadata-runtime-authorizer", "console-read-authorizer", "job-operator-runtime-authorizer", "schedule-operator-runtime-authorizer", "plugin-config-runtime-authorizer", "plugin-admin-current-authorizer-provider"}
 	meta["rbac_non_authorizer_runtime_boundaries"] = []string{"dispatch-manifest-permission-gate", "job-target-plugin-filter"}
-	meta["rbac_deny_audit_covered_paths"] = []string{"admin-command-runtime-authorizer", "event-metadata-runtime-authorizer", "job-metadata-runtime-authorizer", "schedule-metadata-runtime-authorizer", "console-read-authorizer", "schedule-operator-runtime-authorizer"}
+	meta["rbac_deny_audit_covered_paths"] = []string{"admin-command-runtime-authorizer", "event-metadata-runtime-authorizer", "job-metadata-runtime-authorizer", "schedule-metadata-runtime-authorizer", "console-read-authorizer", "job-operator-runtime-authorizer", "schedule-operator-runtime-authorizer", "plugin-config-runtime-authorizer", "plugin-admin-current-authorizer-provider"}
 	meta["rbac_deny_audit_taxonomy"] = []string{"permission_denied", "plugin_scope_denied"}
 	meta["rbac_deny_audit_scope"] = "authorizer deny paths only"
 	meta["rbac_contract_checks"] = []string{"dispatch-manifest-permission-gate"}
@@ -737,12 +787,16 @@ func (a *runtimeApp) handleConsole(w http.ResponseWriter, r *http.Request) {
 	meta["rbac_manifest_permission_gate_audited"] = false
 	meta["rbac_manifest_permission_gate_boundary"] = "independent dispatch contract check; not part of deny audit taxonomy"
 	meta["rbac_job_target_plugin_filter_boundary"] = "dispatch filter only; not an authorizer entrypoint or deny audit taxonomy item"
-	meta["rbac_known_system_gaps"] = []string{"persistent-policy-store", "policy-hot-reload", "unified-authentication", "unified-resource-model", "independent-authorization-read-model"}
-	meta["rbac_non_goals"] = []string{"console-login-auth", "console-write-authorization", "persistent-policy-store", "new-target-kinds"}
+	meta["rbac_snapshot_source"] = "sqlite-rbac-snapshot+sqlite-operator-identities"
+	meta["rbac_snapshot_persisted"] = true
+	meta["rbac_operator_identities_persisted"] = true
+	meta["rbac_snapshot_activation"] = "startup-persist-and-pre-authorize-reload-single-current-snapshot"
+	meta["rbac_known_system_gaps"] = []string{"unified-authentication", "unified-resource-model", "independent-authorization-read-model"}
+	meta["rbac_non_goals"] = []string{"console-login-auth", "console-write-authorization", "new-target-kinds"}
 	meta["rbac_job_dispatch_fields"] = []string{"actor", "permission", "target_plugin_id"}
-	meta["rbac_console_read_permission"] = a.config.RBAC != nil && a.config.RBAC.ConsoleReadPermission != ""
+	meta["rbac_console_read_permission"] = a.consoleReadPermissionConfigured()
 	meta["rbac_console_read_actor_header"] = runtimecore.ConsoleReadActorHeader
-	meta["rbac_console_limitations"] = []string{"console read authorization is optional and only enforced when rbac.console_read_permission is configured", "console read authorization currently reads actor only from the X-Bot-Platform-Actor header", "deny audit taxonomy currently distinguishes only permission_denied and plugin_scope_denied", "manifest permission gate remains a separate dispatch contract check and does not emit deny audit entries", "target_plugin_id remains a dispatch filter, not a global RBAC resource kind", "Q8 currently remains a partial runtime-local closure rather than a complete global RBAC, authn, or audit system"}
+	meta["rbac_console_limitations"] = []string{"console read authorization is optional and only enforced when rbac.console_read_permission is configured", "console read authorization currently reads actor only from the X-Bot-Platform-Actor header", "deny audit taxonomy currently distinguishes only permission_denied and plugin_scope_denied", "manifest permission gate remains a separate dispatch contract check and does not emit deny audit entries", "target_plugin_id remains a dispatch filter, not a global RBAC resource kind", "current slice persists and reloads a single runtime snapshot but does not add login/authn UX or a global resource hierarchy"}
 	meta["replay_policy"] = runtimecore.ReplayPolicy()
 	meta["replay_namespace"] = runtimecore.ReplayPolicy().Namespace
 	meta["replay_console_limitations"] = []string{"replay policy declaration is read-only and mirrors existing runtime behavior only", "replay remains limited to single-event explicit replay via admin command; no batch replay or dry-run"}
@@ -778,7 +832,7 @@ func (a *runtimeApp) handleConsole(w http.ResponseWriter, r *http.Request) {
 	meta["schedule_recovery_recovered_schedules"] = scheduleRecovery.RecoveredSchedules
 	meta["schedule_recovery_invalid_schedules"] = scheduleRecovery.InvalidSchedules
 	meta["mixed_read_model"] = true
-	meta["snapshot_atomic"] = false
+	meta["snapshot_atomic"] = true
 	meta["verification_endpoints"] = []string{"GET /api/console", "GET /metrics", "GET /demo/state/counts", "GET /demo/replies", "go test ./packages/runtime-core ./apps/runtime -run Replay"}
 	jobs, _ := console.Jobs()
 	schedules, _ := console.Schedules()
@@ -925,12 +979,13 @@ func (a *runtimeApp) handleJobOperator(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	actor := strings.TrimSpace(r.Header.Get(runtimecore.ConsoleReadActorHeader))
-	if actor == "" {
-		actor = "admin-user"
+	if err := a.reloadCurrentRBACAuthorizer(r.Context()); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
+	actor := strings.TrimSpace(r.Header.Get(runtimecore.ConsoleReadActorHeader))
 	permission := jobOperatorPermission(action)
-	if err := runtimecore.AuthorizeRBACAction(a.config.RBAC, actor, permission, jobID); err != nil {
+	if err := runtimecore.AuthorizeRBACActionWithProvider(a.authorizer, actor, permission, jobID); err != nil {
 		runtimecore.RecordAuthorizationDeniedAudit(a.audits, actor, permission, jobID, err)
 		http.Error(w, err.Error(), http.StatusForbidden)
 		return
@@ -1107,12 +1162,13 @@ func (a *runtimeApp) handleScheduleOperator(w http.ResponseWriter, r *http.Reque
 		http.NotFound(w, r)
 		return
 	}
-	actor := strings.TrimSpace(r.Header.Get(runtimecore.ConsoleReadActorHeader))
-	if actor == "" {
-		actor = "admin-user"
+	if err := a.reloadCurrentRBACAuthorizer(r.Context()); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
+	actor := strings.TrimSpace(r.Header.Get(runtimecore.ConsoleReadActorHeader))
 	permission := scheduleOperatorPermission(action)
-	if err := runtimecore.AuthorizeRBACAction(a.config.RBAC, actor, permission, scheduleID); err != nil {
+	if err := runtimecore.AuthorizeRBACActionWithProvider(a.authorizer, actor, permission, scheduleID); err != nil {
 		runtimecore.RecordAuthorizationDeniedAudit(a.audits, actor, permission, scheduleID, err)
 		http.Error(w, err.Error(), http.StatusForbidden)
 		return
@@ -1194,10 +1250,11 @@ func (a *runtimeApp) handlePluginOperator(w http.ResponseWriter, r *http.Request
 		http.NotFound(w, r)
 		return
 	}
-	actor := strings.TrimSpace(r.Header.Get(runtimecore.ConsoleReadActorHeader))
-	if actor == "" {
-		actor = "admin-user"
+	if err := a.reloadCurrentRBACAuthorizer(r.Context()); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
+	actor := strings.TrimSpace(r.Header.Get(runtimecore.ConsoleReadActorHeader))
 	command := eventmodel.CommandInvocation{
 		Name:      "admin",
 		Arguments: []string{action, pluginID},
@@ -1238,16 +1295,17 @@ func (a *runtimeApp) handlePluginConfigOperator(w http.ResponseWriter, r *http.R
 		http.NotFound(w, r)
 		return
 	}
+	if err := a.reloadCurrentRBACAuthorizer(r.Context()); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	binding, ok := a.pluginConfigs.Lookup(pluginID)
 	if !ok {
 		http.Error(w, fmt.Sprintf("plugin config operator not found for %q", pluginID), http.StatusNotFound)
 		return
 	}
 	actor := strings.TrimSpace(r.Header.Get(runtimecore.ConsoleReadActorHeader))
-	if actor == "" {
-		actor = "admin-user"
-	}
-	if err := runtimecore.AuthorizeRBACAction(a.config.RBAC, actor, pluginConfigPermission, pluginID); err != nil {
+	if err := runtimecore.AuthorizeRBACActionWithProvider(a.authorizer, actor, pluginConfigPermission, pluginID); err != nil {
 		runtimecore.RecordAuthorizationDeniedAudit(a.audits, actor, pluginConfigPermission, pluginID, err)
 		http.Error(w, err.Error(), http.StatusForbidden)
 		return

@@ -14,10 +14,6 @@
 
 ## Backlog
 
-### A7. 更强的鉴权与操作者身份模型
-- 当前 RBAC 已有真实边界，但仍偏 runtime-local。
-- 需要继续补 console/authn、资源模型、策略持久化/热更新等更完整能力。
-
 ### A8. secrets / replay / rollout 继续扩展
 - 当前这些子系统都有局部实现，但还不是完整统一体系。
 - 需要继续补 secret 生命周期、replay 更丰富模式、rollout 历史/回退/阶段化语义。
