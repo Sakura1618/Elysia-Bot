@@ -106,13 +106,21 @@ func writeTestConfigWithBotInstancesAt(t *testing.T, dir string) string {
 		"      adapter: onebot\n" +
 		"      source: onebot-alpha\n" +
 		"      platform: onebot/v11\n" +
+		"      path: /demo/onebot/message\n" +
 		"      demo_path: /demo/onebot/message\n" +
 		"      self_id: 10001\n" +
 		"    - id: adapter-onebot-beta\n" +
 		"      adapter: onebot\n" +
 		"      source: onebot-beta\n" +
 		"      platform: onebot/v11\n" +
-		"      demo_path: /demo/onebot/message-beta\n"
+		"      path: /demo/onebot/message-beta\n" +
+		"      demo_path: /demo/onebot/message-beta\n" +
+		"    - id: adapter-webhook-main\n" +
+		"      adapter: webhook\n" +
+		"      source: webhook-main\n" +
+		"      path: /ingress/webhook/main\n" +
+		"secrets:\n" +
+		"  webhook_token_ref: BOT_PLATFORM_WEBHOOK_TOKEN\n"
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
@@ -291,7 +299,12 @@ func runtimeDemoOneBotMessageBody(t *testing.T, messageID int64, rawMessage stri
 
 func performRuntimeOneBotMessageRequest(t *testing.T, app *runtimeApp, body string) *httptest.ResponseRecorder {
 	t.Helper()
-	req := httptest.NewRequest(http.MethodPost, "/demo/onebot/message", strings.NewReader(body))
+	return performRuntimeOneBotMessageRequestAtPath(t, app, "/demo/onebot/message", body)
+}
+
+func performRuntimeOneBotMessageRequestAtPath(t *testing.T, app *runtimeApp, path string, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	resp := httptest.NewRecorder()
 	app.ServeHTTP(resp, req)
@@ -719,6 +732,32 @@ func TestRuntimeCLIConfigCheckFailsLoudlyWhenOpenAICompatSecretMissing(t *testin
 	}
 }
 
+func TestRuntimeCLIConfigCheckPassesForMixedAdapterInstances(t *testing.T) {
+	t.Setenv("BOT_PLATFORM_WEBHOOK_TOKEN", "test-webhook-token")
+	configPath := writeTestConfigWithBotInstancesAt(t, t.TempDir())
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	served := false
+	exitCode := runRuntimeCLI([]string{"-config", configPath, "-check-config"}, &stdout, &stderr, func(addr string, handler http.Handler) error {
+		served = true
+		return nil
+	})
+	if exitCode != 0 {
+		t.Fatalf("expected mixed-adapter config check exit code 0, got %d, stderr=%s", exitCode, stderr.String())
+	}
+	if served {
+		t.Fatal("expected mixed-adapter config check to exit before starting the HTTP server")
+	}
+	if strings.TrimSpace(stderr.String()) != "" {
+		t.Fatalf("expected empty stderr for mixed-adapter config check success, got %s", stderr.String())
+	}
+	result := decodeRuntimeConfigCheckResult(t, stdout.Bytes())
+	if result.Status != "ok" || result.Mode != "check-config" || result.ConfigPath != configPath || result.HTTPServerStarted {
+		t.Fatalf("expected mixed-adapter config check success payload, got %+v", result)
+	}
+}
+
 func TestRuntimeCLINormalStartupInvokesHTTPServer(t *testing.T) {
 	configPath := writeTestConfig(t)
 
@@ -902,6 +941,180 @@ func TestRuntimeAppDemoOneBotMessage(t *testing.T) {
 	}
 	if !strings.Contains(countsResp.Body.String(), `"schedule_plans":0`) && !strings.Contains(countsResp.Body.String(), `"schedule_plans": 0`) {
 		t.Fatalf("expected sqlite counts to include schedule_plans counter, got %s", countsResp.Body.String())
+	}
+}
+
+func TestRuntimeAppConfiguredOneBotRoutesUseConfiguredSources(t *testing.T) {
+	t.Setenv("BOT_PLATFORM_WEBHOOK_TOKEN", "test-webhook-token")
+	app, err := newRuntimeApp(writeTestConfigWithBotInstancesAt(t, t.TempDir()))
+	if err != nil {
+		t.Fatalf("new runtime app: %v", err)
+	}
+	defer func() { _ = app.Close() }()
+
+	alphaResp := performRuntimeOneBotMessageRequestAtPath(t, app, "/demo/onebot/message", runtimeDemoOneBotMessageBody(t, 9301, "hello alpha"))
+	if alphaResp.Code != http.StatusOK {
+		t.Fatalf("expected alpha route 200, got %d: %s", alphaResp.Code, alphaResp.Body.String())
+	}
+	var alphaPayload struct {
+		Status  string        `json:"status"`
+		Replies []replyRecord `json:"replies"`
+	}
+	if err := json.Unmarshal(alphaResp.Body.Bytes(), &alphaPayload); err != nil {
+		t.Fatalf("decode alpha response: %v", err)
+	}
+	if alphaPayload.Status != "ok" || len(alphaPayload.Replies) != 1 || alphaPayload.Replies[0].Payload != "echo: hello alpha" {
+		t.Fatalf("unexpected alpha response %+v", alphaPayload)
+	}
+
+	betaResp := performRuntimeOneBotMessageRequestAtPath(t, app, "/demo/onebot/message-beta", runtimeDemoOneBotMessageBody(t, 9302, "hello beta"))
+	if betaResp.Code != http.StatusOK {
+		t.Fatalf("expected beta route 200, got %d: %s", betaResp.Code, betaResp.Body.String())
+	}
+	var betaPayload struct {
+		EventID string        `json:"event_id"`
+		Status  string        `json:"status"`
+		Replies []replyRecord `json:"replies"`
+	}
+	if err := json.Unmarshal(betaResp.Body.Bytes(), &betaPayload); err != nil {
+		t.Fatalf("decode beta response: %v", err)
+	}
+	if betaPayload.Status != "ok" || len(betaPayload.Replies) != 1 || betaPayload.Replies[0].Payload != "echo: hello beta" {
+		t.Fatalf("unexpected beta response %+v", betaPayload)
+	}
+	betaEvent, err := app.state.LoadEvent(t.Context(), betaPayload.EventID)
+	if err != nil {
+		t.Fatalf("load persisted beta event: %v", err)
+	}
+	if betaEvent.Source != "onebot-beta" || betaEvent.IdempotencyKey != "onebot:onebot-beta:group:9302" {
+		t.Fatalf("expected persisted beta event to keep configured source/idempotency, got %+v", betaEvent)
+	}
+	if betaEvent.Metadata["adapter_instance_id"] != "adapter-onebot-beta" {
+		t.Fatalf("expected persisted beta event to keep adapter instance id, got %+v", betaEvent.Metadata)
+	}
+	dispatches := app.runtime.DispatchResults()
+	if len(dispatches) < 2 {
+		t.Fatalf("expected dispatch evidence for configured onebot routes, got %+v", dispatches)
+	}
+	counts, err := app.state.Counts(t.Context())
+	if err != nil {
+		t.Fatalf("sqlite counts: %v", err)
+	}
+	if counts["event_journal"] != 2 || counts["idempotency_keys"] != 2 {
+		t.Fatalf("expected two persisted onebot ingress events, got %+v", counts)
+	}
+	console := readRuntimeConsoleResponse(t, app)
+	if got := consoleMetaStringSlice(t, console.Meta, "onebot_ingress_paths"); !reflect.DeepEqual(got, []string{"/demo/onebot/message", "/demo/onebot/message-beta"}) {
+		t.Fatalf("expected onebot ingress paths for configured routes, got %+v", got)
+	}
+	if got := consoleMetaStringSlice(t, console.Meta, "webhook_ingress_paths"); !reflect.DeepEqual(got, []string{"/ingress/webhook/main"}) {
+		t.Fatalf("expected webhook ingress path in mixed config metadata, got %+v", got)
+	}
+	if got := consoleMetaStringSlice(t, console.Meta, "demo_paths"); !reflect.DeepEqual(got, []string{"/demo/onebot/message", "/demo/onebot/message-beta", "/ingress/webhook/main", "/demo/workflows/message", "/demo/ai/message", "/demo/jobs/enqueue", "/demo/jobs/timeout", "/demo/jobs/{job-id}/retry", "/demo/schedules/echo-delay", "/demo/schedules/{schedule-id}/cancel", "/demo/plugins/{plugin-id}/disable", "/demo/plugins/{plugin-id}/enable", "/demo/plugins/{plugin-id}/config", "/demo/replies", "/demo/state/counts"}) {
+		t.Fatalf("expected mixed demo paths, got %+v", got)
+	}
+}
+
+func TestRuntimeAppWebhookInstanceUsesRuntimeIntegratedIngress(t *testing.T) {
+	t.Setenv("BOT_PLATFORM_WEBHOOK_TOKEN", "test-webhook-token")
+	app, err := newRuntimeApp(writeTestConfigWithBotInstancesAt(t, t.TempDir()))
+	if err != nil {
+		t.Fatalf("new runtime app: %v", err)
+	}
+	defer func() { _ = app.Close() }()
+
+	req := httptest.NewRequest(http.MethodPost, "/ingress/webhook/main", strings.NewReader(`{"event_type":"message.received","source":"client-spoofed","actor_id":"svc-1","text":"hello webhook"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Webhook-Token", "test-webhook-token")
+	resp := httptest.NewRecorder()
+	app.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected webhook runtime ingress 200, got %d: %s", resp.Code, resp.Body.String())
+	}
+	var payload struct {
+		Status  string `json:"status"`
+		EventID string `json:"event_id"`
+		TraceID string `json:"trace_id"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode webhook response: %v", err)
+	}
+	if payload.Status != "ok" || payload.EventID == "" || payload.TraceID == "" {
+		t.Fatalf("unexpected webhook response %+v", payload)
+	}
+	event, err := app.state.LoadEvent(t.Context(), payload.EventID)
+	if err != nil {
+		t.Fatalf("load persisted webhook event: %v", err)
+	}
+	if event.Source != "webhook-main" || event.Type != "message.received" {
+		t.Fatalf("expected runtime-integrated webhook source/type, got %+v", event)
+	}
+	if event.Metadata["ingress_source"] != "client-spoofed" || event.Metadata["adapter_instance_id"] != "adapter-webhook-main" {
+		t.Fatalf("expected webhook metadata to preserve ingress source and instance id, got %+v", event.Metadata)
+	}
+	if event.IdempotencyKey == "" || !strings.Contains(event.IdempotencyKey, "webhook:webhook-main:message.received:") {
+		t.Fatalf("expected webhook idempotency key to use configured source, got %+v", event)
+	}
+	if app.replies.Count() != 0 {
+		t.Fatalf("expected webhook ingress without reply handle not to emit demo replies, got %+v", app.replies.Since(0))
+	}
+	dispatches := app.runtime.DispatchResults()
+	if len(dispatches) < 3 {
+		t.Fatalf("expected runtime dispatch evidence for webhook ingress across registered event handlers, got %+v", dispatches)
+	}
+	console := readRuntimeConsoleResponse(t, app)
+	if got := consoleMetaStringSlice(t, console.Meta, "webhook_ingress_paths"); !reflect.DeepEqual(got, []string{"/ingress/webhook/main"}) {
+		t.Fatalf("expected webhook ingress path in console meta, got %+v", got)
+	}
+	if !hasConsoleAdapter(console, "adapter-webhook-main") {
+		t.Fatalf("expected webhook adapter instance in console payload, got %+v", console.Adapters)
+	}
+	adapter := consoleAdapterByID(t, console, "adapter-webhook-main")
+	if adapter.Adapter != "webhook" || adapter.Source != "webhook-main" || !adapter.Online || !adapter.StatePersisted {
+		t.Fatalf("expected webhook adapter console facts, got %+v", adapter)
+	}
+	if adapter.Config["path"] != "/ingress/webhook/main" || adapter.Config["platform"] != "webhook/http" || adapter.Config["source"] != "webhook-main" {
+		t.Fatalf("expected webhook adapter config summary, got %+v", adapter.Config)
+	}
+}
+
+func TestRuntimeAppWebhookInstanceRejectsUnauthorizedRequests(t *testing.T) {
+	t.Setenv("BOT_PLATFORM_WEBHOOK_TOKEN", "test-webhook-token")
+	app, err := newRuntimeApp(writeTestConfigWithBotInstancesAt(t, t.TempDir()))
+	if err != nil {
+		t.Fatalf("new runtime app: %v", err)
+	}
+	defer func() { _ = app.Close() }()
+
+	req := httptest.NewRequest(http.MethodPost, "/ingress/webhook/main", strings.NewReader(`{"event_type":"message.received","source":"client-spoofed","actor_id":"svc-1","text":"hello webhook"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Webhook-Token", "wrong-token")
+	req.RemoteAddr = "127.0.0.1:9999"
+	resp := httptest.NewRecorder()
+	app.ServeHTTP(resp, req)
+	if resp.Code != http.StatusUnauthorized {
+		t.Fatalf("expected webhook runtime ingress 401, got %d: %s", resp.Code, resp.Body.String())
+	}
+	counts, err := app.state.Counts(t.Context())
+	if err != nil {
+		t.Fatalf("sqlite counts: %v", err)
+	}
+	if counts["event_journal"] != 0 || counts["idempotency_keys"] != 0 {
+		t.Fatalf("expected unauthorized webhook ingress not to persist events, got %+v", counts)
+	}
+	if app.replies.Count() != 0 {
+		t.Fatalf("expected unauthorized webhook ingress not to emit replies, got %+v", app.replies.Since(0))
+	}
+	entries := app.audits.AuditEntries()
+	foundUnauthorized := false
+	for _, entry := range entries {
+		if entry.Action == "webhook.reject.unauthorized" && entry.Actor == "127.0.0.1:9999" {
+			foundUnauthorized = true
+			break
+		}
+	}
+	if !foundUnauthorized {
+		t.Fatalf("expected webhook unauthorized audit entry, got %+v", entries)
 	}
 }
 
@@ -1241,6 +1454,12 @@ func TestRuntimeAppConsoleReflectsRuntimeState(t *testing.T) {
 	}
 	if got := consoleMetaStringSlice(t, console.Meta, "demo_paths"); !reflect.DeepEqual(got, expectedDemoPaths) {
 		t.Fatalf("expected exact demo_paths, got %+v", got)
+	}
+	if got := consoleMetaStringSlice(t, console.Meta, "onebot_ingress_paths"); !reflect.DeepEqual(got, []string{"/demo/onebot/message"}) {
+		t.Fatalf("expected onebot ingress paths, got %+v", got)
+	}
+	if got := consoleMetaStringSlice(t, console.Meta, "webhook_ingress_paths"); len(got) != 0 {
+		t.Fatalf("expected no webhook ingress paths in default config, got %+v", got)
 	}
 	if !strings.Contains(resp.Body.String(), `"plugin_dispatch_source": "sqlite-plugin-status-snapshot+runtime-dispatch-results"`) {
 		t.Fatalf("expected console payload to include plugin_dispatch_source=sqlite-plugin-status-snapshot+runtime-dispatch-results, got %s", resp.Body.String())
@@ -3236,8 +3455,8 @@ func TestRuntimeAppLoadsConfiguredBotInstancesAndExposesThemAfterRestart(t *test
 	if err != nil {
 		t.Fatalf("sqlite counts: %v", err)
 	}
-	if counts["adapter_instances"] != 2 {
-		t.Fatalf("expected two persisted adapter instances before restart, got %+v", counts)
+	if counts["adapter_instances"] != 3 {
+		t.Fatalf("expected three persisted adapter instances before restart, got %+v", counts)
 	}
 	alphaState, err := app.state.LoadAdapterInstance(t.Context(), "adapter-onebot-alpha")
 	if err != nil {
@@ -3252,6 +3471,13 @@ func TestRuntimeAppLoadsConfiguredBotInstancesAndExposesThemAfterRestart(t *test
 	}
 	if betaState.Adapter != "onebot" || betaState.Source != "onebot-beta" || betaState.Status != "registered" || betaState.Health != "ready" || !betaState.Online {
 		t.Fatalf("expected persisted beta adapter facts before restart, got %+v", betaState)
+	}
+	webhookState, err := app.state.LoadAdapterInstance(t.Context(), "adapter-webhook-main")
+	if err != nil {
+		t.Fatalf("load webhook adapter instance: %v", err)
+	}
+	if webhookState.Adapter != "webhook" || webhookState.Source != "webhook-main" || webhookState.Status != "registered" || webhookState.Health != "ready" || !webhookState.Online {
+		t.Fatalf("expected persisted webhook adapter facts before restart, got %+v", webhookState)
 	}
 	if err := app.Close(); err != nil {
 		t.Fatalf("close first app: %v", err)
@@ -3273,8 +3499,8 @@ func TestRuntimeAppLoadsConfiguredBotInstancesAndExposesThemAfterRestart(t *test
 	if err := json.Unmarshal(consoleResp.Body.Bytes(), &console); err != nil {
 		t.Fatalf("decode console payload: %v", err)
 	}
-	if console.Status.Adapters != 2 || !hasConsoleAdapter(console, "adapter-onebot-alpha") || !hasConsoleAdapter(console, "adapter-onebot-beta") {
-		t.Fatalf("expected restarted console to expose both configured adapter instances, got %+v", console)
+	if console.Status.Adapters != 3 || !hasConsoleAdapter(console, "adapter-onebot-alpha") || !hasConsoleAdapter(console, "adapter-onebot-beta") || !hasConsoleAdapter(console, "adapter-webhook-main") {
+		t.Fatalf("expected restarted console to expose mixed configured adapter instances, got %+v", console)
 	}
 	alpha := consoleAdapterByID(t, console, "adapter-onebot-alpha")
 	if alpha.Adapter != "onebot" || alpha.Source != "onebot-alpha" || alpha.Status != "registered" || alpha.Health != "ready" || !alpha.Online || !alpha.StatePersisted {
@@ -3302,16 +3528,26 @@ func TestRuntimeAppLoadsConfiguredBotInstancesAndExposesThemAfterRestart(t *test
 	if _, exists := beta.Config["self_id"]; exists {
 		t.Fatalf("expected beta config to omit optional self_id, got %+v", beta.Config)
 	}
+	webhook := consoleAdapterByID(t, console, "adapter-webhook-main")
+	if webhook.Adapter != "webhook" || webhook.Source != "webhook-main" || webhook.Status != "registered" || webhook.Health != "ready" || !webhook.Online || !webhook.StatePersisted {
+		t.Fatalf("expected webhook console adapter facts, got %+v", webhook)
+	}
+	if webhook.StatusSource != "sqlite-adapter-instances" || webhook.ConfigSource != "sqlite-adapter-instances" {
+		t.Fatalf("expected webhook adapter read-model sources, got %+v", webhook)
+	}
+	if webhook.Config["path"] != "/ingress/webhook/main" || webhook.Config["platform"] != "webhook/http" || webhook.Config["source"] != "webhook-main" {
+		t.Fatalf("expected webhook adapter config metadata, got %+v", webhook.Config)
+	}
 	consoleReq = consoleRequestWithViewer("/api/console")
 	consoleResp = httptest.NewRecorder()
 	restarted.ServeHTTP(consoleResp, consoleReq)
-	for _, expected := range []string{`"id": "adapter-onebot-alpha"`, `"id": "adapter-onebot-beta"`, `"source": "onebot-alpha"`, `"source": "onebot-beta"`, `"demo_path": "/demo/onebot/message"`, `"demo_path": "/demo/onebot/message-beta"`, `"self_id": 10001`, `"adapter_read_model": "sqlite-adapter-instances"`} {
+	for _, expected := range []string{`"id": "adapter-onebot-alpha"`, `"id": "adapter-onebot-beta"`, `"id": "adapter-webhook-main"`, `"source": "onebot-alpha"`, `"source": "onebot-beta"`, `"source": "webhook-main"`, `"demo_path": "/demo/onebot/message"`, `"demo_path": "/demo/onebot/message-beta"`, `"path": "/ingress/webhook/main"`, `"self_id": 10001`, `"adapter_read_model": "sqlite-adapter-instances"`} {
 		if !strings.Contains(consoleResp.Body.String(), expected) {
 			t.Fatalf("expected restarted console payload to include %q, got %s", expected, consoleResp.Body.String())
 		}
 	}
-	if got := len(restarted.runtime.RegisteredAdapters()); got != 2 {
-		t.Fatalf("expected two registered adapters after restart, got %d", got)
+	if got := len(restarted.runtime.RegisteredAdapters()); got != 3 {
+		t.Fatalf("expected three registered adapters after restart, got %d", got)
 	}
 }
 

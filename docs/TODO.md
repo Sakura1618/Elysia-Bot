@@ -14,10 +14,6 @@
 
 ## Backlog
 
-### A10. adapter / transport 扩展与实例路由
-- 当前已支持多 bot instance registry，但事件 source、per-instance routing、更多协议适配器仍未真正展开。
-- 需要继续补更多 adapter 覆盖与实例级别的路由/管理边界。
-
 ### A11. Console Web 演进
 - 当前 Console Web 仍是只读优先、单页式控制台。
 - 仍缺真实登录、写操作承载、realtime/refresh 模型、路由化详情页、更多 UX 收口。

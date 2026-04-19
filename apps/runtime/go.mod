@@ -4,6 +4,7 @@ go 1.25.0
 
 require (
 	github.com/ohmyopencode/bot-platform/adapters/adapter-onebot v0.0.0
+	github.com/ohmyopencode/bot-platform/adapters/adapter-webhook v0.0.0
 	github.com/ohmyopencode/bot-platform/packages/event-model v0.0.0
 	github.com/ohmyopencode/bot-platform/packages/plugin-sdk v0.0.0
 	github.com/ohmyopencode/bot-platform/packages/runtime-core v0.0.0
@@ -35,6 +36,8 @@ require (
 )
 
 replace github.com/ohmyopencode/bot-platform/adapters/adapter-onebot => ../../adapters/adapter-onebot
+
+replace github.com/ohmyopencode/bot-platform/adapters/adapter-webhook => ../../adapters/adapter-webhook
 
 replace github.com/ohmyopencode/bot-platform/packages/event-model => ../../packages/event-model
 

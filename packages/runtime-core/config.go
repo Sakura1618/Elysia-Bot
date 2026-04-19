@@ -36,6 +36,7 @@ type RuntimeBotInstance struct {
 	Adapter  string `yaml:"adapter,omitempty"`
 	Source   string `yaml:"source,omitempty"`
 	Platform string `yaml:"platform,omitempty"`
+	Path     string `yaml:"path,omitempty"`
 	DemoPath string `yaml:"demo_path,omitempty"`
 	SelfID   int64  `yaml:"self_id,omitempty"`
 }
@@ -124,7 +125,7 @@ func LoadConfig(path string) (Config, error) {
 	if err := validateAIChatConfig(cfg.AIChat); err != nil {
 		return Config{}, err
 	}
-	if err := validateRuntimeBotInstances(cfg.Runtime.BotInstances); err != nil {
+	if err := validateRuntimeBotInstances(cfg.Runtime.BotInstances, cfg.Secrets); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
@@ -187,16 +188,41 @@ func applyRuntimeDefaults(cfg *Config) {
 		}
 		cfg.Runtime.BotInstances[index].Source = strings.TrimSpace(cfg.Runtime.BotInstances[index].Source)
 		if cfg.Runtime.BotInstances[index].Source == "" {
-			cfg.Runtime.BotInstances[index].Source = "onebot"
+			cfg.Runtime.BotInstances[index].Source = cfg.Runtime.BotInstances[index].Adapter
 		}
 		cfg.Runtime.BotInstances[index].Platform = strings.TrimSpace(cfg.Runtime.BotInstances[index].Platform)
 		if cfg.Runtime.BotInstances[index].Platform == "" {
-			cfg.Runtime.BotInstances[index].Platform = "onebot/v11"
+			cfg.Runtime.BotInstances[index].Platform = defaultRuntimeBotInstancePlatform(cfg.Runtime.BotInstances[index].Adapter)
 		}
+		cfg.Runtime.BotInstances[index].Path = strings.TrimSpace(cfg.Runtime.BotInstances[index].Path)
 		cfg.Runtime.BotInstances[index].DemoPath = strings.TrimSpace(cfg.Runtime.BotInstances[index].DemoPath)
-		if cfg.Runtime.BotInstances[index].DemoPath == "" {
-			cfg.Runtime.BotInstances[index].DemoPath = "/demo/onebot/message"
+		if cfg.Runtime.BotInstances[index].Path == "" {
+			cfg.Runtime.BotInstances[index].Path = cfg.Runtime.BotInstances[index].DemoPath
 		}
+		if cfg.Runtime.BotInstances[index].Path == "" {
+			cfg.Runtime.BotInstances[index].Path = defaultRuntimeBotInstancePath(cfg.Runtime.BotInstances[index].Adapter)
+		}
+		if cfg.Runtime.BotInstances[index].Adapter == "onebot" && cfg.Runtime.BotInstances[index].DemoPath == "" {
+			cfg.Runtime.BotInstances[index].DemoPath = cfg.Runtime.BotInstances[index].Path
+		}
+	}
+}
+
+func defaultRuntimeBotInstancePlatform(adapter string) string {
+	switch strings.ToLower(strings.TrimSpace(adapter)) {
+	case "webhook":
+		return "webhook/http"
+	default:
+		return "onebot/v11"
+	}
+}
+
+func defaultRuntimeBotInstancePath(adapter string) string {
+	switch strings.ToLower(strings.TrimSpace(adapter)) {
+	case "webhook":
+		return "/webhook"
+	default:
+		return "/demo/onebot/message"
 	}
 }
 
@@ -240,19 +266,50 @@ func isLoopbackAIChatEndpoint(parsed *url.URL) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-func validateRuntimeBotInstances(instances []RuntimeBotInstance) error {
-	seen := make(map[string]struct{}, len(instances))
+func validateRuntimeBotInstances(instances []RuntimeBotInstance, secrets SecretsConfig) error {
+	seenIDs := make(map[string]struct{}, len(instances))
+	seenSources := make(map[string]struct{}, len(instances))
+	seenPaths := make(map[string]struct{}, len(instances))
+	hasWebhook := false
 	for index, instance := range instances {
 		if instance.ID == "" {
 			return fmt.Errorf("runtime.bot_instances[%d].id is required", index)
 		}
-		if instance.Adapter != "onebot" {
-			return fmt.Errorf("runtime.bot_instances[%d].adapter %q is unsupported; only \"onebot\" is currently supported", index, instance.Adapter)
+		switch instance.Adapter {
+		case "onebot", "webhook":
+		default:
+			return fmt.Errorf("runtime.bot_instances[%d].adapter %q is unsupported; only \"onebot\" and \"webhook\" are currently supported", index, instance.Adapter)
 		}
-		if _, exists := seen[instance.ID]; exists {
+		if _, exists := seenIDs[instance.ID]; exists {
 			return fmt.Errorf("runtime.bot_instances[%d].id %q must be unique", index, instance.ID)
 		}
-		seen[instance.ID] = struct{}{}
+		seenIDs[instance.ID] = struct{}{}
+		if instance.Source == "" {
+			return fmt.Errorf("runtime.bot_instances[%d].source is required", index)
+		}
+		if _, exists := seenSources[instance.Source]; exists {
+			return fmt.Errorf("runtime.bot_instances[%d].source %q must be unique", index, instance.Source)
+		}
+		seenSources[instance.Source] = struct{}{}
+		if instance.Path == "" {
+			return fmt.Errorf("runtime.bot_instances[%d].path is required", index)
+		}
+		if !strings.HasPrefix(instance.Path, "/") {
+			return fmt.Errorf("runtime.bot_instances[%d].path %q must start with '/'", index, instance.Path)
+		}
+		if _, exists := seenPaths[instance.Path]; exists {
+			return fmt.Errorf("runtime.bot_instances[%d].path %q must be unique", index, instance.Path)
+		}
+		seenPaths[instance.Path] = struct{}{}
+		if instance.Path != "" && instance.DemoPath != "" && instance.Path != instance.DemoPath {
+			return fmt.Errorf("runtime.bot_instances[%d].path %q must match demo_path %q when both are set", index, instance.Path, instance.DemoPath)
+		}
+		if instance.Adapter == "webhook" {
+			hasWebhook = true
+		}
+	}
+	if hasWebhook && strings.TrimSpace(secrets.WebhookTokenRef) == "" {
+		return fmt.Errorf("%s is required when runtime.bot_instances includes adapter \"webhook\"", WebhookSecretMainPathContract().ConfigRef)
 	}
 	return nil
 }

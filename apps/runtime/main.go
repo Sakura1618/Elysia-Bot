@@ -17,6 +17,7 @@ import (
 	"time"
 
 	adapteronebot "github.com/ohmyopencode/bot-platform/adapters/adapter-onebot"
+	adapterwebhook "github.com/ohmyopencode/bot-platform/adapters/adapter-webhook"
 	eventmodel "github.com/ohmyopencode/bot-platform/packages/event-model"
 	pluginsdk "github.com/ohmyopencode/bot-platform/packages/plugin-sdk"
 	runtimecore "github.com/ohmyopencode/bot-platform/packages/runtime-core"
@@ -37,6 +38,8 @@ type runtimeApp struct {
 	logs            *logBuffer
 	replies         *replyBuffer
 	onebotIngress   *adapteronebot.IngressConverter
+	onebotRoutes    map[string]runtimecore.RuntimeBotInstance
+	webhookRoutes   map[string]*adapterwebhook.Adapter
 	audits          *runtimecore.InMemoryAuditLog
 	state           *runtimecore.SQLiteStateStore
 	smokeStore      runtimeSmokeStore
@@ -66,6 +69,10 @@ type runtimeSmokeStore interface {
 	HasIdempotencyKey(context.Context, string) (bool, error)
 	Counts(context.Context) (map[string]int, error)
 	Close() error
+}
+
+type runtimeEventDispatcher interface {
+	DispatchEvent(context.Context, eventmodel.Event) error
 }
 
 type runtimeServeFunc func(string, http.Handler) error
@@ -376,12 +383,28 @@ type registeredAdapter struct {
 func (a registeredAdapter) ID() string     { return a.id }
 func (a registeredAdapter) Source() string { return a.source }
 
+type runtimeIngressSummary struct {
+	OneBotPaths  []string
+	WebhookPaths []string
+}
+
+type runtimeIngressDispatcher struct {
+	runtime    runtimeEventDispatcher
+	smokeStore runtimeSmokeStore
+}
+
+func (d runtimeIngressDispatcher) DispatchEvent(ctx context.Context, event eventmodel.Event) error {
+	_, err := persistRuntimeEvent(ctx, d.runtime, d.smokeStore, event)
+	return err
+}
+
 func demoOneBotAdapterInstance() runtimecore.RuntimeBotInstance {
 	return runtimecore.RuntimeBotInstance{
 		ID:       "adapter-onebot-demo",
 		Adapter:  "onebot",
 		Source:   "onebot",
 		Platform: "onebot/v11",
+		Path:     "/demo/onebot/message",
 		DemoPath: "/demo/onebot/message",
 	}
 }
@@ -393,20 +416,23 @@ func configuredBotInstances(settings appRuntimeSettings) []runtimecore.RuntimeBo
 	return []runtimecore.RuntimeBotInstance{demoOneBotAdapterInstance()}
 }
 
-func oneBotAdapterInstanceState(settings appRuntimeSettings, instance runtimecore.RuntimeBotInstance) (runtimecore.AdapterInstanceState, error) {
+func adapterInstanceState(settings appRuntimeSettings, instance runtimecore.RuntimeBotInstance) (runtimecore.AdapterInstanceState, error) {
 	config := map[string]any{
-		"mode":        "demo-ingress",
+		"mode":        adapterInstanceMode(instance),
 		"sqlite_path": settings.SQLitePath,
-		"demo_path":   instance.DemoPath,
+		"path":        instance.Path,
 		"platform":    instance.Platform,
 		"source":      instance.Source,
+	}
+	if instance.DemoPath != "" {
+		config["demo_path"] = instance.DemoPath
 	}
 	if instance.SelfID != 0 {
 		config["self_id"] = instance.SelfID
 	}
 	configPayload, err := json.Marshal(config)
 	if err != nil {
-		return runtimecore.AdapterInstanceState{}, fmt.Errorf("marshal onebot adapter config for %q: %w", instance.ID, err)
+		return runtimecore.AdapterInstanceState{}, fmt.Errorf("marshal %s adapter config for %q: %w", instance.Adapter, instance.ID, err)
 	}
 	return runtimecore.AdapterInstanceState{
 		InstanceID: instance.ID,
@@ -417,6 +443,87 @@ func oneBotAdapterInstanceState(settings appRuntimeSettings, instance runtimecor
 		Health:     "ready",
 		Online:     true,
 	}, nil
+}
+
+func adapterInstanceMode(instance runtimecore.RuntimeBotInstance) string {
+	switch instance.Adapter {
+	case "webhook":
+		return "runtime-ingress"
+	default:
+		return "demo-ingress"
+	}
+}
+
+func configuredEventIngressSources(settings appRuntimeSettings) []string {
+	instances := configuredOneBotInstances(settings)
+	if len(instances) == 0 {
+		return nil
+	}
+	sources := make([]string, 0, len(instances))
+	for _, instance := range instances {
+		sources = append(sources, instance.Source)
+	}
+	return sources
+}
+
+func configuredOneBotInstances(settings appRuntimeSettings) []runtimecore.RuntimeBotInstance {
+	instances := configuredBotInstances(settings)
+	filtered := make([]runtimecore.RuntimeBotInstance, 0, len(instances))
+	for _, instance := range instances {
+		if instance.Adapter == "onebot" {
+			filtered = append(filtered, instance)
+		}
+	}
+	return filtered
+}
+
+func configuredWebhookInstances(settings appRuntimeSettings) []runtimecore.RuntimeBotInstance {
+	instances := configuredBotInstances(settings)
+	filtered := make([]runtimecore.RuntimeBotInstance, 0, len(instances))
+	for _, instance := range instances {
+		if instance.Adapter == "webhook" {
+			filtered = append(filtered, instance)
+		}
+	}
+	return filtered
+}
+
+func buildIngressSummary(settings appRuntimeSettings) runtimeIngressSummary {
+	onebotInstances := configuredOneBotInstances(settings)
+	webhookInstances := configuredWebhookInstances(settings)
+	summary := runtimeIngressSummary{
+		OneBotPaths:  make([]string, 0, len(onebotInstances)),
+		WebhookPaths: make([]string, 0, len(webhookInstances)),
+	}
+	for _, instance := range onebotInstances {
+		summary.OneBotPaths = append(summary.OneBotPaths, instance.Path)
+	}
+	for _, instance := range webhookInstances {
+		summary.WebhookPaths = append(summary.WebhookPaths, instance.Path)
+	}
+	return summary
+}
+
+func runtimeDemoPaths(settings appRuntimeSettings) []string {
+	summary := buildIngressSummary(settings)
+	paths := make([]string, 0, len(summary.OneBotPaths)+len(summary.WebhookPaths)+12)
+	paths = append(paths, summary.OneBotPaths...)
+	paths = append(paths, summary.WebhookPaths...)
+	paths = append(paths,
+		"/demo/workflows/message",
+		"/demo/ai/message",
+		"/demo/jobs/enqueue",
+		"/demo/jobs/timeout",
+		"/demo/jobs/{job-id}/retry",
+		"/demo/schedules/echo-delay",
+		"/demo/schedules/{schedule-id}/cancel",
+		"/demo/plugins/{plugin-id}/disable",
+		"/demo/plugins/{plugin-id}/enable",
+		"/demo/plugins/{plugin-id}/config",
+		"/demo/replies",
+		"/demo/state/counts",
+	)
+	return paths
 }
 
 func newRuntimeApp(configPath string) (*runtimeApp, error) {
@@ -524,10 +631,11 @@ func newRuntimeAppWithOutput(configPath string, output io.Writer) (*runtimeApp, 
 		_ = state.Close()
 		return nil, fmt.Errorf("plugin config binding %q returned %T, want pluginecho.Config", echoBinding.PluginID, echoConfigState.TypedConfig)
 	}
+	eventIngressSources := configuredEventIngressSources(settings)
 	echoPlugin := pluginecho.New(replies, echoConfig)
 	echoDefinition := echoPlugin.Definition()
 	echoDefinition.InstanceConfig = echoConfigState.InstanceConfig
-	echoDefinition.Handlers.Event = sourceScopedEventHandler{allowed: allowedSources("onebot", "runtime-demo-scheduler"), inner: echoPlugin}
+	echoDefinition.Handlers.Event = sourceScopedEventHandler{allowed: allowedSources(append(eventIngressSources, "runtime-demo-scheduler")...), inner: echoPlugin}
 	if err := runtime.RegisterPlugin(echoDefinition); err != nil {
 		_ = smokeStore.Close()
 		_ = state.Close()
@@ -582,6 +690,15 @@ func newRuntimeAppWithOutput(configPath string, output io.Writer) (*runtimeApp, 
 		return nil, fmt.Errorf("save workflow plugin manifest: %w", err)
 	}
 	botInstances := configuredBotInstances(settings)
+	onebotInstances := configuredOneBotInstances(settings)
+	webhookInstances := configuredWebhookInstances(settings)
+	onebotRoutes := make(map[string]runtimecore.RuntimeBotInstance, len(onebotInstances))
+	for _, instance := range onebotInstances {
+		onebotRoutes[instance.Path] = instance
+	}
+	secretRegistry := runtimecore.NewSecretRegistry(runtimecore.EnvSecretProvider{}, audits)
+	webhookDispatcher := runtimeIngressDispatcher{runtime: runtime, smokeStore: smokeStore}
+	webhookRoutes := make(map[string]*adapterwebhook.Adapter, len(webhookInstances))
 	for _, instance := range botInstances {
 		if err := runtime.RegisterAdapter(runtimecore.AdapterRegistration{
 			ID:      instance.ID,
@@ -592,7 +709,7 @@ func newRuntimeAppWithOutput(configPath string, output io.Writer) (*runtimeApp, 
 			_ = state.Close()
 			return nil, fmt.Errorf("register %s adapter %q: %w", instance.Adapter, instance.ID, err)
 		}
-		adapterInstanceState, err := oneBotAdapterInstanceState(settings, instance)
+		adapterInstanceState, err := adapterInstanceState(settings, instance)
 		if err != nil {
 			_ = smokeStore.Close()
 			_ = state.Close()
@@ -603,11 +720,25 @@ func newRuntimeAppWithOutput(configPath string, output io.Writer) (*runtimeApp, 
 			_ = state.Close()
 			return nil, fmt.Errorf("save %s adapter instance %q: %w", instance.Adapter, instance.ID, err)
 		}
+		if instance.Adapter == "webhook" {
+			webhookAdapter, err := adapterwebhook.NewWithSecretRef(config.Secrets.WebhookTokenRef, secretRegistry, webhookDispatcher, logger, audits)
+			if err != nil {
+				_ = smokeStore.Close()
+				_ = state.Close()
+				return nil, fmt.Errorf("build webhook adapter %q: %w", instance.ID, err)
+			}
+			webhookAdapter.Tracer = tracer
+			webhookAdapter.Source = instance.Source
+			webhookAdapter.Platform = instance.Platform
+			webhookAdapter.InstanceID = instance.ID
+			webhookRoutes[instance.Path] = webhookAdapter
+		}
 	}
 
 	ingressLogs := io.MultiWriter(output, logs)
 	onebotIngress := adapteronebot.NewIngressConverter(ingressLogs)
 	onebotIngress.SetObservability(tracer)
+	ingressSummary := buildIngressSummary(settings)
 
 	app := &runtimeApp{
 		config:          config,
@@ -620,6 +751,8 @@ func newRuntimeAppWithOutput(configPath string, output io.Writer) (*runtimeApp, 
 		logs:            logs,
 		replies:         replies,
 		onebotIngress:   onebotIngress,
+		onebotRoutes:    onebotRoutes,
+		webhookRoutes:   webhookRoutes,
 		audits:          audits,
 		state:           state,
 		smokeStore:      smokeStore,
@@ -631,25 +764,14 @@ func newRuntimeAppWithOutput(configPath string, output io.Writer) (*runtimeApp, 
 		workflowRuntime: workflowRuntime,
 		authorizer:      authorizerProvider,
 		consoleMeta: map[string]any{
-			"runtime_entry": "apps/runtime",
-			"demo_paths": []string{
-				"/demo/onebot/message",
-				"/demo/workflows/message",
-				"/demo/ai/message",
-				"/demo/jobs/enqueue",
-				"/demo/jobs/timeout",
-				"/demo/jobs/{job-id}/retry",
-				"/demo/schedules/echo-delay",
-				"/demo/schedules/{schedule-id}/cancel",
-				"/demo/plugins/{plugin-id}/disable",
-				"/demo/plugins/{plugin-id}/enable",
-				"/demo/plugins/{plugin-id}/config",
-				"/demo/replies",
-				"/demo/state/counts",
-			},
+			"runtime_entry":           "apps/runtime",
+			"demo_paths":              runtimeDemoPaths(settings),
 			"sqlite_path":             settings.SQLitePath,
 			"smoke_store_backend":     settings.SmokeStoreBackend,
 			"smoke_store_debug_scope": "event_journal+idempotency_keys",
+			"onebot_ingress_paths":    ingressSummary.OneBotPaths,
+			"webhook_ingress_paths":   ingressSummary.WebhookPaths,
+			"webhook_runtime_owned":   len(webhookInstances) > 0,
 			"scheduler_interval_ms":   settings.SchedulerIntervalMs,
 			"ai_job_dispatcher":       "runtime-job-queue",
 			"ai_chat_provider":        config.AIChat.Provider,
@@ -726,7 +848,15 @@ func (a *runtimeApp) consoleReadPermissionConfigured() bool {
 
 func (a *runtimeApp) routes() {
 	a.mux.HandleFunc("/healthz", a.handleHealth)
-	a.mux.HandleFunc("/demo/onebot/message", a.handleOneBotMessage)
+	for path := range a.onebotRoutes {
+		a.mux.HandleFunc(path, a.handleOneBotMessage)
+	}
+	for path, adapter := range a.webhookRoutes {
+		if adapter == nil {
+			continue
+		}
+		a.mux.Handle(path, http.HandlerFunc(adapter.HandleWebhook))
+	}
 	a.mux.HandleFunc("/demo/workflows/message", a.handleWorkflowMessage)
 	a.mux.HandleFunc("/demo/ai/message", a.handleAIMessage)
 	a.mux.HandleFunc("/demo/jobs/enqueue", a.handleJobEnqueue)
@@ -972,6 +1102,11 @@ func (a *runtimeApp) handleOneBotMessage(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	instance, ok := a.onebotRoutes[r.URL.Path]
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
 
 	var payload adapteronebot.MessageEventPayload
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
@@ -980,7 +1115,11 @@ func (a *runtimeApp) handleOneBotMessage(w http.ResponseWriter, r *http.Request)
 	}
 
 	before := a.replies.Count()
-	event, err := a.onebotIngress.ConvertMessageEvent(payload)
+	event, err := a.onebotIngress.ConvertMessageEventWithConfig(payload, adapteronebot.IngressConfig{
+		InstanceID: instance.ID,
+		Source:     instance.Source,
+		Platform:   instance.Platform,
+	})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -1581,8 +1720,15 @@ func policies(cfg *runtimecore.RBACConfig) map[string]pluginadmin.RolePolicy {
 }
 
 func (a *runtimeApp) persistAndDispatchEvent(ctx context.Context, event eventmodel.Event) (bool, error) {
-	if a.smokeStore != nil && event.IdempotencyKey != "" {
-		exists, err := a.smokeStore.HasIdempotencyKey(ctx, event.IdempotencyKey)
+	return persistRuntimeEvent(ctx, a.runtime, a.smokeStore, event)
+}
+
+func persistRuntimeEvent(ctx context.Context, runtime runtimeEventDispatcher, smokeStore runtimeSmokeStore, event eventmodel.Event) (bool, error) {
+	if runtime == nil {
+		return false, fmt.Errorf("runtime dispatcher is required")
+	}
+	if smokeStore != nil && event.IdempotencyKey != "" {
+		exists, err := smokeStore.HasIdempotencyKey(ctx, event.IdempotencyKey)
 		if err != nil {
 			return false, err
 		}
@@ -1590,15 +1736,15 @@ func (a *runtimeApp) persistAndDispatchEvent(ctx context.Context, event eventmod
 			return true, nil
 		}
 	}
-	if err := a.runtime.DispatchEvent(ctx, event); err != nil {
+	if err := runtime.DispatchEvent(ctx, event); err != nil {
 		return false, err
 	}
-	if a.smokeStore != nil {
-		if err := a.smokeStore.RecordEvent(ctx, event); err != nil {
+	if smokeStore != nil {
+		if err := smokeStore.RecordEvent(ctx, event); err != nil {
 			return false, err
 		}
 		if event.IdempotencyKey != "" {
-			if err := a.smokeStore.SaveIdempotencyKey(ctx, event.IdempotencyKey, event.EventID); err != nil {
+			if err := smokeStore.SaveIdempotencyKey(ctx, event.IdempotencyKey, event.EventID); err != nil {
 				return false, err
 			}
 		}
@@ -1784,7 +1930,7 @@ func runRuntimeCLI(args []string, stdout io.Writer, stderr io.Writer, serve runt
 		"environment":  app.config.Runtime.Environment,
 		"sqlite_path":  app.settings.SQLitePath,
 		"console_path": "/api/console",
-		"demo_path":    "/demo/onebot/message",
+		"demo_path":    configuredBotInstances(app.settings)[0].Path,
 		"metrics_path": "/metrics",
 	}); err != nil {
 		closeErr := app.Close()

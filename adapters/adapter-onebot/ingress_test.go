@@ -119,3 +119,40 @@ func TestConvertMessageEventRecordsIngressObservability(t *testing.T) {
 		t.Fatalf("expected ingress span, got %s", rendered)
 	}
 }
+
+func TestConvertMessageEventUsesConfiguredInstanceSourceAndIdempotencyBoundary(t *testing.T) {
+	t.Parallel()
+
+	converter := NewIngressConverter(&bytes.Buffer{})
+	converter.now = func() time.Time {
+		return time.Date(2026, 4, 2, 13, 0, 0, 0, time.UTC)
+	}
+
+	event, err := converter.ConvertMessageEventWithConfig(MessageEventPayload{
+		PostType:    "message",
+		MessageType: "group",
+		UserID:      10001,
+		GroupID:     42,
+		MessageID:   9001,
+		RawMessage:  "hello alpha",
+		Sender:      SenderPayload{Nickname: "alice"},
+	}, IngressConfig{InstanceID: "adapter-onebot-alpha", Source: "onebot-alpha", Platform: "onebot/v11"})
+	if err != nil {
+		t.Fatalf("convert configured message event: %v", err)
+	}
+	if event.Source != "onebot-alpha" {
+		t.Fatalf("expected configured source, got %+v", event)
+	}
+	if event.IdempotencyKey != "onebot:onebot-alpha:group:9001" {
+		t.Fatalf("expected source-scoped idempotency key, got %q", event.IdempotencyKey)
+	}
+	if event.Metadata["adapter_instance_id"] != "adapter-onebot-alpha" || event.Metadata["platform"] != "onebot/v11" {
+		t.Fatalf("expected configured instance metadata, got %+v", event.Metadata)
+	}
+	if event.Reply == nil {
+		t.Fatal("expected reply handle")
+	}
+	if event.Reply.Metadata["adapter_instance_id"] != "adapter-onebot-alpha" || event.Reply.Metadata["source"] != "onebot-alpha" {
+		t.Fatalf("expected reply metadata to carry configured instance/source, got %+v", event.Reply.Metadata)
+	}
+}

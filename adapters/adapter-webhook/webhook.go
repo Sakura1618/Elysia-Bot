@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	eventmodel "github.com/ohmyopencode/bot-platform/packages/event-model"
@@ -35,6 +36,9 @@ type WebhookPayload struct {
 type Adapter struct {
 	Token      string
 	TokenRef   string
+	Source     string
+	Platform   string
+	InstanceID string
 	Secrets    SecretResolver
 	Dispatcher Dispatcher
 	Logger     *runtimecore.Logger
@@ -58,14 +62,14 @@ const (
 )
 
 func New(token string, dispatcher Dispatcher, logger *runtimecore.Logger, audits runtimecore.AuditRecorder) *Adapter {
-	return &Adapter{Token: token, Dispatcher: dispatcher, Logger: logger, Tracer: runtimecore.NewTraceRecorder(), Audits: audits, Now: time.Now().UTC}
+	return &Adapter{Token: token, Source: "webhook", Platform: "webhook/http", Dispatcher: dispatcher, Logger: logger, Tracer: runtimecore.NewTraceRecorder(), Audits: audits, Now: time.Now().UTC}
 }
 
 func NewWithSecretRef(tokenRef string, secrets SecretResolver, dispatcher Dispatcher, logger *runtimecore.Logger, audits runtimecore.AuditRecorder) (*Adapter, error) {
 	if err := runtimecore.ValidateSecretRef(tokenRef); err != nil {
 		return nil, err
 	}
-	return &Adapter{TokenRef: tokenRef, Secrets: secrets, Dispatcher: dispatcher, Logger: logger, Tracer: runtimecore.NewTraceRecorder(), Audits: audits, Now: time.Now().UTC}, nil
+	return &Adapter{TokenRef: tokenRef, Source: "webhook", Platform: "webhook/http", Secrets: secrets, Dispatcher: dispatcher, Logger: logger, Tracer: runtimecore.NewTraceRecorder(), Audits: audits, Now: time.Now().UTC}, nil
 }
 
 func (a *Adapter) HandleWebhook(w http.ResponseWriter, r *http.Request) {
@@ -206,23 +210,48 @@ func (a *Adapter) MapPayload(payload WebhookPayload) (eventmodel.Event, error) {
 	if payload.EventType == "" {
 		return eventmodel.Event{}, errors.New("event_type is required")
 	}
-	if payload.Source == "" {
-		return eventmodel.Event{}, errors.New("source is required")
+	source := strings.TrimSpace(a.Source)
+	if source == "" {
+		source = "webhook"
+	}
+	platform := strings.TrimSpace(a.Platform)
+	if platform == "" {
+		platform = "webhook/http"
 	}
 
 	eventID := newWebhookID("evt")
 	event := eventmodel.Event{
 		EventID:        eventID,
 		TraceID:        newWebhookID("trace"),
-		Source:         payload.Source,
+		Source:         source,
 		Type:           payload.EventType,
 		Timestamp:      a.Now(),
 		Actor:          &eventmodel.Actor{ID: payload.ActorID, Type: "service"},
 		Message:        &eventmodel.Message{Text: payload.Text},
-		Metadata:       payload.Metadata,
-		IdempotencyKey: fmt.Sprintf("webhook:%s:%s:%s", payload.Source, payload.EventType, eventID),
+		Metadata:       cloneWebhookMetadata(payload.Metadata),
+		IdempotencyKey: fmt.Sprintf("webhook:%s:%s:%s", source, payload.EventType, eventID),
+	}
+	if event.Metadata == nil {
+		event.Metadata = map[string]any{}
+	}
+	event.Metadata["adapter"] = platform
+	event.Metadata["platform"] = platform
+	event.Metadata["ingress_source"] = payload.Source
+	if a.InstanceID != "" {
+		event.Metadata["adapter_instance_id"] = a.InstanceID
 	}
 	return event, event.Validate()
+}
+
+func cloneWebhookMetadata(metadata map[string]any) map[string]any {
+	if len(metadata) == 0 {
+		return nil
+	}
+	cloned := make(map[string]any, len(metadata))
+	for key, value := range metadata {
+		cloned[key] = value
+	}
+	return cloned
 }
 
 func webhookDispatchFailureReason(err error) string {

@@ -34,6 +34,12 @@ type IngressConverter struct {
 	now    func() time.Time
 }
 
+type IngressConfig struct {
+	InstanceID string
+	Source     string
+	Platform   string
+}
+
 func NewIngressConverter(logWriter io.Writer) *IngressConverter {
 	return &IngressConverter{
 		logger: runtimecore.NewLogger(logWriter),
@@ -53,6 +59,10 @@ func (c *IngressConverter) NowForTest(now func() time.Time) {
 }
 
 func (c *IngressConverter) ConvertMessageEvent(payload MessageEventPayload) (eventmodel.Event, error) {
+	return c.ConvertMessageEventWithConfig(payload, IngressConfig{})
+}
+
+func (c *IngressConverter) ConvertMessageEventWithConfig(payload MessageEventPayload, config IngressConfig) (eventmodel.Event, error) {
 	if payload.PostType != "message" {
 		return eventmodel.Event{}, fmt.Errorf("unsupported post_type %q", payload.PostType)
 	}
@@ -62,10 +72,19 @@ func (c *IngressConverter) ConvertMessageEvent(payload MessageEventPayload) (eve
 		timestamp = c.now()
 	}
 
+	source := config.Source
+	if source == "" {
+		source = "onebot"
+	}
+	platform := config.Platform
+	if platform == "" {
+		platform = "onebot/v11"
+	}
+	messageID := fmt.Sprintf("msg-%d", payload.MessageID)
 	event := eventmodel.Event{
 		EventID:   newID("evt"),
 		TraceID:   newID("trace"),
-		Source:    "onebot",
+		Source:    source,
 		Type:      "message.received",
 		Timestamp: timestamp,
 		Actor: &eventmodel.Actor{
@@ -79,14 +98,30 @@ func (c *IngressConverter) ConvertMessageEvent(payload MessageEventPayload) (eve
 			Title: channelTitle(payload),
 		},
 		Message: &eventmodel.Message{
-			ID:   fmt.Sprintf("msg-%d", payload.MessageID),
+			ID:   messageID,
 			Text: payload.RawMessage,
 		},
 		Reply: ReplyHandleFromMessageEvent(payload),
 		Metadata: map[string]any{
-			"adapter": "onebot/v11",
+			"adapter":  platform,
+			"platform": platform,
 		},
-		IdempotencyKey: fmt.Sprintf("onebot:%s:%d", payload.MessageType, payload.MessageID),
+		IdempotencyKey: fmt.Sprintf("onebot:%s:%s:%d", source, payload.MessageType, payload.MessageID),
+	}
+	if config.InstanceID != "" {
+		event.Metadata["adapter_instance_id"] = config.InstanceID
+	}
+	if event.Reply != nil {
+		metadata := make(map[string]any, len(event.Reply.Metadata)+3)
+		for key, value := range event.Reply.Metadata {
+			metadata[key] = value
+		}
+		metadata["source"] = source
+		metadata["platform"] = platform
+		if config.InstanceID != "" {
+			metadata["adapter_instance_id"] = config.InstanceID
+		}
+		event.Reply.Metadata = metadata
 	}
 
 	if err := event.Validate(); err != nil {

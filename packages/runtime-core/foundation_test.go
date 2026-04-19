@@ -252,7 +252,7 @@ func TestLoadConfigReadsRuntimeBotInstances(t *testing.T) {
 
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")
-	raw := []byte("runtime:\n  environment: development\n  log_level: debug\n  http_port: 8080\n  bot_instances:\n    - id: adapter-onebot-alpha\n      adapter: onebot\n      source: onebot-alpha\n      platform: onebot/v11\n      demo_path: /demo/onebot/message\n      self_id: 10001\n    - id: adapter-onebot-beta\n      adapter: onebot\n      source: onebot-beta\n      demo_path: /demo/onebot/message-beta\n")
+	raw := []byte("runtime:\n  environment: development\n  log_level: debug\n  http_port: 8080\n  bot_instances:\n    - id: adapter-onebot-alpha\n      adapter: onebot\n      source: onebot-alpha\n      platform: onebot/v11\n      path: /demo/onebot/message\n      demo_path: /demo/onebot/message\n      self_id: 10001\n    - id: adapter-onebot-beta\n      adapter: onebot\n      source: onebot-beta\n      path: /demo/onebot/message-beta\n    - id: adapter-webhook-main\n      adapter: webhook\n      source: webhook-main\n      path: /ingress/webhook/main\nsecrets:\n  webhook_token_ref: BOT_PLATFORM_WEBHOOK_TOKEN\n")
 	if err := os.WriteFile(path, raw, 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
@@ -260,16 +260,36 @@ func TestLoadConfigReadsRuntimeBotInstances(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	if len(cfg.Runtime.BotInstances) != 2 {
+	if len(cfg.Runtime.BotInstances) != 3 {
 		t.Fatalf("expected two bot instances, got %+v", cfg.Runtime.BotInstances)
 	}
 	alpha := cfg.Runtime.BotInstances[0]
-	if alpha.ID != "adapter-onebot-alpha" || alpha.Adapter != "onebot" || alpha.Source != "onebot-alpha" || alpha.Platform != "onebot/v11" || alpha.DemoPath != "/demo/onebot/message" || alpha.SelfID != 10001 {
+	if alpha.ID != "adapter-onebot-alpha" || alpha.Adapter != "onebot" || alpha.Source != "onebot-alpha" || alpha.Platform != "onebot/v11" || alpha.Path != "/demo/onebot/message" || alpha.DemoPath != "/demo/onebot/message" || alpha.SelfID != 10001 {
 		t.Fatalf("unexpected alpha bot instance %+v", alpha)
 	}
 	beta := cfg.Runtime.BotInstances[1]
-	if beta.ID != "adapter-onebot-beta" || beta.Adapter != "onebot" || beta.Source != "onebot-beta" || beta.Platform != "onebot/v11" || beta.DemoPath != "/demo/onebot/message-beta" || beta.SelfID != 0 {
+	if beta.ID != "adapter-onebot-beta" || beta.Adapter != "onebot" || beta.Source != "onebot-beta" || beta.Platform != "onebot/v11" || beta.Path != "/demo/onebot/message-beta" || beta.DemoPath != "/demo/onebot/message-beta" || beta.SelfID != 0 {
 		t.Fatalf("unexpected beta bot instance %+v", beta)
+	}
+	webhook := cfg.Runtime.BotInstances[2]
+	if webhook.ID != "adapter-webhook-main" || webhook.Adapter != "webhook" || webhook.Source != "webhook-main" || webhook.Platform != "webhook/http" || webhook.Path != "/ingress/webhook/main" || webhook.DemoPath != "" {
+		t.Fatalf("unexpected webhook bot instance %+v", webhook)
+	}
+}
+
+func TestLoadConfigRejectsWebhookBotInstanceWithoutSecretRef(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	raw := []byte("runtime:\n  environment: development\n  log_level: debug\n  http_port: 8080\n  bot_instances:\n    - id: adapter-webhook-main\n      adapter: webhook\n      source: webhook-main\n      path: /ingress/webhook/main\n")
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	_, err := LoadConfig(path)
+	expected := "secrets.webhook_token_ref is required when runtime.bot_instances includes adapter \"webhook\""
+	if err == nil || err.Error() != expected {
+		t.Fatalf("expected missing webhook secret ref error, got %v", err)
 	}
 }
 

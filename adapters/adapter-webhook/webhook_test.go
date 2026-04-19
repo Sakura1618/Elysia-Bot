@@ -456,6 +456,31 @@ func TestWebhookAdapterResolvesTokenFromSecretRegistry(t *testing.T) {
 	}
 }
 
+func TestWebhookAdapterUsesRuntimeControlledSourceOverride(t *testing.T) {
+	t.Parallel()
+
+	dispatcher := &recordingDispatcher{}
+	adapter := New("secret", dispatcher, runtimecore.NewLogger(&bytes.Buffer{}), nil)
+	adapter.Source = "webhook-main"
+	adapter.Platform = "webhook/http"
+	adapter.InstanceID = "adapter-webhook-main"
+	request := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewBufferString(`{"event_type":"message.received","source":"client-spoofed","actor_id":"svc-1","text":"hello"}`))
+	request.Header.Set("X-Webhook-Token", "secret")
+	recorder := httptest.NewRecorder()
+
+	adapter.HandleWebhook(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", recorder.Code)
+	}
+	if dispatcher.event.Source != "webhook-main" {
+		t.Fatalf("expected runtime-controlled source override, got %+v", dispatcher.event)
+	}
+	if dispatcher.event.Metadata["ingress_source"] != "client-spoofed" || dispatcher.event.Metadata["adapter_instance_id"] != "adapter-webhook-main" {
+		t.Fatalf("expected ingress metadata to preserve client source separately, got %+v", dispatcher.event.Metadata)
+	}
+}
+
 func TestWebhookAdapterReturnsInternalErrorWhenSecretMissing(t *testing.T) {
 	t.Parallel()
 
