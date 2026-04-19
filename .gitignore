@@ -6,6 +6,8 @@ Thumbs.db
 
 # Local OpenCode / Golutra workspace state
 .golutra/
+.sisyphus/
+tmp/
 
 # Node / frontend build artifacts
 node_modules/
@@ -17,6 +19,9 @@ apps/console-web/vite.config.d.ts
 
 # Runtime local state
 data/
+
+# Repo-local plugin packaging output
+plugins/*/dist/
 
 # Environment / local secrets
 .env
