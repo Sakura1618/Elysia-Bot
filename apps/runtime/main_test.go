@@ -347,6 +347,30 @@ func performRuntimeWorkflowMessageRequest(t *testing.T, app *runtimeApp, body st
 	return resp
 }
 
+type runtimeWorkflowObservabilityRow struct {
+	TraceID       string
+	EventID       string
+	RunID         string
+	CorrelationID string
+}
+
+func loadRuntimeWorkflowObservabilityRow(t *testing.T, app *runtimeApp, workflowID string) runtimeWorkflowObservabilityRow {
+	t.Helper()
+	if app == nil || app.state == nil || app.state.DBForTests() == nil {
+		t.Fatal("runtime app sqlite state db is required")
+	}
+	var row runtimeWorkflowObservabilityRow
+	err := app.state.DBForTests().QueryRowContext(t.Context(), `
+SELECT trace_id, event_id, run_id, correlation_id
+FROM workflow_instances
+WHERE workflow_id = ?
+`, workflowID).Scan(&row.TraceID, &row.EventID, &row.RunID, &row.CorrelationID)
+	if err != nil {
+		t.Fatalf("load workflow observability row: %v", err)
+	}
+	return row
+}
+
 func assertRuntimeSmokeCounts(t *testing.T, app *runtimeApp, expectedEventJournal int, expectedIdempotencyKeys int) {
 	t.Helper()
 	counts, err := app.runtimeStateCounts(t.Context())
@@ -2370,6 +2394,25 @@ func TestRuntimeAppWorkflowDemoPersistsAndRecoversAcrossRestart(t *testing.T) {
 	if started.Workflow.WaitingFor != `message.received` || started.Workflow.State[`greeting`] != `start workflow` || started.Workflow.Completed {
 		t.Fatalf(`expected workflow runtime to persist waiting state after first request, got %+v`, started.Workflow)
 	}
+	startedObservability := loadRuntimeWorkflowObservabilityRow(t, app, `workflow-user-1`)
+	if startedObservability.TraceID == `` || startedObservability.EventID == `` || startedObservability.RunID == `` || startedObservability.CorrelationID == `` {
+		t.Fatalf(`expected started workflow to persist observability ids, got %+v`, startedObservability)
+	}
+	startedTraceID := startedObservability.TraceID
+	startedEventID := startedObservability.EventID
+	startedRunID := startedObservability.RunID
+	startedCorrelationID := startedObservability.CorrelationID
+	entries := app.logs.Lines()
+	matchedStartReply := false
+	for _, line := range entries {
+		if strings.Contains(line, `runtime demo reply recorded`) && strings.Contains(line, startedTraceID) && strings.Contains(line, startedEventID) && strings.Contains(line, startedRunID) && strings.Contains(line, startedCorrelationID) && strings.Contains(line, `plugin-workflow-demo`) {
+			matchedStartReply = true
+			break
+		}
+	}
+	if !matchedStartReply {
+		t.Fatalf(`expected workflow start reply log to recover five observability ids, got %+v`, entries)
+	}
 	if err := app.Close(); err != nil {
 		t.Fatalf(`close first app: %v`, err)
 	}
@@ -2396,6 +2439,27 @@ func TestRuntimeAppWorkflowDemoPersistsAndRecoversAcrossRestart(t *testing.T) {
 	}
 	if completed.Status != runtimecore.WorkflowRuntimeStatusCompleted || !completed.Workflow.Completed || !completed.Workflow.Compensated {
 		t.Fatalf(`expected completed persisted workflow after restart resume, got %+v`, completed)
+	}
+	completedObservability := loadRuntimeWorkflowObservabilityRow(t, restarted, `workflow-user-1`)
+	if completedObservability.TraceID != startedTraceID || completedObservability.EventID != startedEventID || completedObservability.RunID != startedRunID || completedObservability.CorrelationID != startedCorrelationID {
+		t.Fatalf(`expected workflow resume to keep origin observability ids stable, got %+v`, completedObservability)
+	}
+	if completed.LastEventID == completedObservability.EventID {
+		t.Fatalf(`expected workflow cursor to track latest trigger while origin event_id stays stable, got %+v`, completed)
+	}
+	restartedEntries := restarted.logs.Lines()
+	matchedResumeReply := false
+	for _, line := range restartedEntries {
+		if strings.Contains(line, `runtime demo reply recorded`) && strings.Contains(line, completedObservability.TraceID) && strings.Contains(line, completedObservability.EventID) && strings.Contains(line, completedObservability.RunID) && strings.Contains(line, completedObservability.CorrelationID) && strings.Contains(line, `plugin-workflow-demo`) {
+			matchedResumeReply = true
+			break
+		}
+	}
+	if !matchedResumeReply {
+		t.Fatalf(`expected workflow resume reply log to correlate back to origin ids, got %+v`, restartedEntries)
+	}
+	if rendered := restarted.tracer.RenderTrace(completedObservability.TraceID); !strings.Contains(rendered, `reply.send`) {
+		t.Fatalf(`expected reply.send span on workflow trace, got %s`, rendered)
 	}
 	consoleReq := httptest.NewRequest(http.MethodGet, "/api/console", nil)
 	consoleResp := httptest.NewRecorder()

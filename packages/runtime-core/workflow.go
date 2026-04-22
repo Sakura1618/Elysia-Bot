@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	eventmodel "github.com/ohmyopencode/bot-platform/packages/event-model"
 	pluginsdk "github.com/ohmyopencode/bot-platform/packages/plugin-sdk"
 )
 
@@ -41,6 +42,10 @@ const (
 type WorkflowInstanceState struct {
 	WorkflowID    string
 	PluginID      string
+	TraceID       string
+	EventID       string
+	RunID         string
+	CorrelationID string
 	Status        WorkflowRuntimeStatus
 	Workflow      Workflow
 	LastEventID   string
@@ -60,6 +65,75 @@ type WorkflowRecoverySnapshot struct {
 	TotalWorkflows     int
 	RecoveredWorkflows int
 	StatusCounts       map[WorkflowRuntimeStatus]int
+}
+
+type WorkflowObservabilityContext struct {
+	TraceID       string
+	EventID       string
+	PluginID      string
+	RunID         string
+	CorrelationID string
+}
+
+type workflowObservabilityContextKey struct{}
+
+func WorkflowObservabilityContextFromExecutionContext(ctx eventmodel.ExecutionContext) WorkflowObservabilityContext {
+	ctx = normalizeExecutionContextObservability(ctx)
+	return WorkflowObservabilityContext{
+		TraceID:       strings.TrimSpace(ctx.TraceID),
+		EventID:       strings.TrimSpace(ctx.EventID),
+		PluginID:      strings.TrimSpace(ctx.PluginID),
+		RunID:         strings.TrimSpace(ctx.RunID),
+		CorrelationID: strings.TrimSpace(ctx.CorrelationID),
+	}
+}
+
+func (c WorkflowObservabilityContext) ExecutionContext() eventmodel.ExecutionContext {
+	ctx := normalizeExecutionContextObservability(eventmodel.ExecutionContext{
+		TraceID:       c.TraceID,
+		EventID:       c.EventID,
+		PluginID:      c.PluginID,
+		RunID:         c.RunID,
+		CorrelationID: c.CorrelationID,
+	})
+	return eventmodel.ExecutionContext{
+		TraceID:       ctx.TraceID,
+		EventID:       ctx.EventID,
+		PluginID:      ctx.PluginID,
+		RunID:         ctx.RunID,
+		CorrelationID: ctx.CorrelationID,
+	}
+}
+
+func (c WorkflowObservabilityContext) normalized() WorkflowObservabilityContext {
+	ctx := c.ExecutionContext()
+	return WorkflowObservabilityContextFromExecutionContext(ctx)
+}
+
+func (s WorkflowInstanceState) ObservabilityContext() WorkflowObservabilityContext {
+	return WorkflowObservabilityContext{
+		TraceID:       s.TraceID,
+		EventID:       s.EventID,
+		PluginID:      s.PluginID,
+		RunID:         s.RunID,
+		CorrelationID: s.CorrelationID,
+	}.normalized()
+}
+
+func WithWorkflowObservabilityContext(ctx context.Context, observability WorkflowObservabilityContext) context.Context {
+	observability = observability.normalized()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, workflowObservabilityContextKey{}, observability)
+}
+
+func workflowObservabilityFromContext(ctx context.Context) WorkflowObservabilityContext {
+	if ctx == nil {
+		return WorkflowObservabilityContext{}
+	}
+	stored, _ := ctx.Value(workflowObservabilityContextKey{}).(WorkflowObservabilityContext)
+	return stored.normalized()
 }
 
 type workflowRuntimeStore interface {
@@ -138,9 +212,19 @@ func (r *WorkflowRuntime) StartOrResume(ctx context.Context, workflowID string, 
 	if workflowID == `` {
 		return WorkflowTransition{}, fmt.Errorf(`workflow id is required`)
 	}
-	pluginID = strings.TrimSpace(pluginID)
+	observability := workflowObservabilityFromContext(ctx)
+	observability.PluginID = firstNonEmptyTrimmed(pluginID, observability.PluginID)
+	observability.EventID = firstNonEmptyTrimmed(eventID, observability.EventID)
+	observability = observability.normalized()
+	pluginID = strings.TrimSpace(observability.PluginID)
 	if pluginID == `` {
 		return WorkflowTransition{}, fmt.Errorf(`plugin id is required`)
+	}
+	if strings.TrimSpace(observability.TraceID) == `` {
+		return WorkflowTransition{}, fmt.Errorf(`trace id is required`)
+	}
+	if strings.TrimSpace(observability.EventID) == `` {
+		return WorkflowTransition{}, fmt.Errorf(`event id is required`)
 	}
 	eventType = strings.TrimSpace(eventType)
 	if eventType == `` {
@@ -152,6 +236,7 @@ func (r *WorkflowRuntime) StartOrResume(ctx context.Context, workflowID string, 
 		return WorkflowTransition{}, fmt.Errorf(`load workflow instance: %w`, err)
 	}
 	if found {
+		current = mergeWorkflowInstanceObservability(current, observability)
 		current.PluginID = strings.TrimSpace(current.PluginID)
 		if current.PluginID == `` {
 			return WorkflowTransition{}, fmt.Errorf(`workflow %q owner plugin is missing`, workflowID)
@@ -172,9 +257,13 @@ func (r *WorkflowRuntime) StartOrResume(ctx context.Context, workflowID string, 
 		instance := WorkflowInstanceState{
 			WorkflowID:    workflowID,
 			PluginID:      pluginID,
+			TraceID:       observability.TraceID,
+			EventID:       observability.EventID,
+			RunID:         observability.RunID,
+			CorrelationID: observability.CorrelationID,
 			Status:        workflowRuntimeStatus(driven),
 			Workflow:      driven,
-			LastEventID:   strings.TrimSpace(eventID),
+			LastEventID:   observability.EventID,
 			LastEventType: eventType,
 			CreatedAt:     now,
 			UpdatedAt:     now,
@@ -186,7 +275,7 @@ func (r *WorkflowRuntime) StartOrResume(ctx context.Context, workflowID string, 
 		return WorkflowTransition{Instance: cloneWorkflowInstanceState(instance), Started: true}, nil
 	}
 
-	updated := cloneWorkflowInstanceState(current)
+	updated := mergeWorkflowInstanceObservability(cloneWorkflowInstanceState(current), observability)
 	workflow := cloneWorkflow(updated.Workflow)
 	if workflow.WaitingFor != `` {
 		workflow, err = workflow.ResumeWithEvent(eventType)
@@ -207,7 +296,7 @@ func (r *WorkflowRuntime) StartOrResume(ctx context.Context, workflowID string, 
 	}
 	updated.Workflow = driven
 	updated.Status = workflowRuntimeStatus(driven)
-	updated.LastEventID = strings.TrimSpace(eventID)
+	updated.LastEventID = observability.EventID
 	updated.LastEventType = eventType
 	updated.UpdatedAt = now
 	if updated.CreatedAt.IsZero() {
@@ -336,6 +425,7 @@ func (r *WorkflowRuntime) restoreInstance(ctx context.Context, instance Workflow
 	restored := cloneWorkflowInstanceState(instance)
 	restored.WorkflowID = strings.TrimSpace(restored.WorkflowID)
 	restored.PluginID = strings.TrimSpace(restored.PluginID)
+	restored = normalizeWorkflowInstanceObservability(restored)
 	if restored.WorkflowID == `` {
 		return WorkflowInstanceState{}, fmt.Errorf(`workflow id is required`)
 	}
@@ -389,6 +479,53 @@ func cloneWorkflowInstanceState(instance WorkflowInstanceState) WorkflowInstance
 	cloned := instance
 	cloned.Workflow = cloneWorkflow(instance.Workflow)
 	return cloned
+}
+
+func normalizeWorkflowInstanceObservability(instance WorkflowInstanceState) WorkflowInstanceState {
+	instance.TraceID = strings.TrimSpace(instance.TraceID)
+	instance.EventID = strings.TrimSpace(instance.EventID)
+	instance.RunID = strings.TrimSpace(instance.RunID)
+	instance.CorrelationID = strings.TrimSpace(instance.CorrelationID)
+	if instance.EventID == `` {
+		instance.EventID = strings.TrimSpace(instance.LastEventID)
+	}
+	observability := instance.ObservabilityContext()
+	instance.TraceID = observability.TraceID
+	instance.EventID = observability.EventID
+	instance.RunID = observability.RunID
+	instance.CorrelationID = observability.CorrelationID
+	return instance
+}
+
+func firstNonEmptyTrimmed(values ...string) string {
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != `` {
+			return value
+		}
+	}
+	return ``
+}
+
+func mergeWorkflowInstanceObservability(instance WorkflowInstanceState, incoming WorkflowObservabilityContext) WorkflowInstanceState {
+	instance = normalizeWorkflowInstanceObservability(instance)
+	incoming = incoming.normalized()
+	if strings.TrimSpace(instance.PluginID) == `` {
+		instance.PluginID = incoming.PluginID
+	}
+	if strings.TrimSpace(instance.TraceID) == `` {
+		instance.TraceID = incoming.TraceID
+	}
+	if strings.TrimSpace(instance.EventID) == `` {
+		instance.EventID = incoming.EventID
+	}
+	if strings.TrimSpace(instance.RunID) == `` {
+		instance.RunID = incoming.RunID
+	}
+	if strings.TrimSpace(instance.CorrelationID) == `` {
+		instance.CorrelationID = incoming.CorrelationID
+	}
+	return normalizeWorkflowInstanceObservability(instance)
 }
 
 func cloneWorkflowRecoverySnapshot(snapshot WorkflowRecoverySnapshot) WorkflowRecoverySnapshot {

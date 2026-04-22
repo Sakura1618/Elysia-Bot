@@ -5,7 +5,24 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	eventmodel "github.com/ohmyopencode/bot-platform/packages/event-model"
 )
+
+func testWorkflowObservabilityContext(pluginID string, suffix string) WorkflowObservabilityContext {
+	ctx := eventmodel.ExecutionContext{
+		TraceID:       `trace-` + suffix,
+		EventID:       `evt-` + suffix,
+		PluginID:      pluginID,
+		RunID:         `run-` + suffix,
+		CorrelationID: `corr-` + suffix,
+	}
+	return WorkflowObservabilityContextFromExecutionContext(ctx)
+}
+
+func testWorkflowContext(ctx context.Context, pluginID string, suffix string) context.Context {
+	return WithWorkflowObservabilityContext(ctx, testWorkflowObservabilityContext(pluginID, suffix))
+}
 
 func TestWorkflowAdvanceResumeAndPersistState(t *testing.T) {
 	t.Parallel()
@@ -148,7 +165,7 @@ func TestWorkflowRuntimeStartOrResumeRejectsOwnerMismatch(t *testing.T) {
 		WorkflowStep{Kind: WorkflowStepKindCompensate, Name: `complete`},
 	)
 
-	started, err := runtime.StartOrResume(ctx, `wf-owner-mismatch`, `plugin-workflow-demo`, `message.received`, `evt-start`, initial)
+	started, err := runtime.StartOrResume(testWorkflowContext(ctx, `plugin-workflow-demo`, `start-owner-mismatch`), `wf-owner-mismatch`, `plugin-workflow-demo`, `message.received`, `evt-start-owner-mismatch`, initial)
 	if err != nil {
 		t.Fatalf(`start workflow: %v`, err)
 	}
@@ -156,7 +173,7 @@ func TestWorkflowRuntimeStartOrResumeRejectsOwnerMismatch(t *testing.T) {
 		t.Fatalf(`expected started workflow to persist original owner, got %+v`, started)
 	}
 
-	_, err = runtime.StartOrResume(ctx, `wf-owner-mismatch`, `plugin-admin`, `message.received`, `evt-collision`, Workflow{})
+	_, err = runtime.StartOrResume(testWorkflowContext(ctx, `plugin-admin`, `collision-owner-mismatch`), `wf-owner-mismatch`, `plugin-admin`, `message.received`, `evt-collision-owner-mismatch`, Workflow{})
 	if err == nil {
 		t.Fatal(`expected owner mismatch to reject resume/start collision`)
 	}
@@ -171,8 +188,11 @@ func TestWorkflowRuntimeStartOrResumeRejectsOwnerMismatch(t *testing.T) {
 	if persisted.PluginID != `plugin-workflow-demo` || persisted.Status != WorkflowRuntimeStatusWaitingEvent {
 		t.Fatalf(`expected workflow owner/status to stay unchanged after mismatch, got %+v`, persisted)
 	}
-	if persisted.LastEventID != `evt-start` || persisted.LastEventType != `message.received` {
+	if persisted.LastEventID != `evt-start-owner-mismatch` || persisted.LastEventType != `message.received` {
 		t.Fatalf(`expected mismatch to leave persisted event cursor unchanged, got %+v`, persisted)
+	}
+	if persisted.TraceID != `trace-start-owner-mismatch` || persisted.EventID != `evt-start-owner-mismatch` || persisted.RunID != `run-start-owner-mismatch` || persisted.CorrelationID != `corr-start-owner-mismatch` {
+		t.Fatalf(`expected workflow origin observability ids to remain stable after mismatch, got %+v`, persisted)
 	}
 }
 
@@ -191,10 +211,10 @@ func TestWorkflowRuntimeStartOrResumeKeepsOwnerOnMatchingResume(t *testing.T) {
 		WorkflowStep{Kind: WorkflowStepKindCompensate, Name: `complete`},
 	)
 
-	if _, err := runtime.StartOrResume(ctx, `wf-owner-stable`, `plugin-workflow-demo`, `message.received`, `evt-start`, initial); err != nil {
+	if _, err := runtime.StartOrResume(testWorkflowContext(ctx, `plugin-workflow-demo`, `start-owner-stable`), `wf-owner-stable`, `plugin-workflow-demo`, `message.received`, `evt-start-owner-stable`, initial); err != nil {
 		t.Fatalf(`start workflow: %v`, err)
 	}
-	resumed, err := runtime.StartOrResume(ctx, `wf-owner-stable`, `plugin-workflow-demo`, `message.received`, `evt-resume`, Workflow{})
+	resumed, err := runtime.StartOrResume(testWorkflowContext(ctx, `plugin-workflow-demo`, `resume-owner-stable`), `wf-owner-stable`, `plugin-workflow-demo`, `message.received`, `evt-resume-owner-stable`, Workflow{})
 	if err != nil {
 		t.Fatalf(`resume workflow: %v`, err)
 	}
@@ -209,8 +229,11 @@ func TestWorkflowRuntimeStartOrResumeKeepsOwnerOnMatchingResume(t *testing.T) {
 	if persisted.PluginID != `plugin-workflow-demo` || persisted.Status != WorkflowRuntimeStatusCompleted || !persisted.Workflow.Completed {
 		t.Fatalf(`expected persisted workflow owner to remain stable after resume, got %+v`, persisted)
 	}
-	if persisted.LastEventID != `evt-resume` || persisted.LastEventType != `message.received` {
+	if persisted.LastEventID != `evt-resume-owner-stable` || persisted.LastEventType != `message.received` {
 		t.Fatalf(`expected persisted workflow to record resume event, got %+v`, persisted)
+	}
+	if persisted.TraceID != `trace-start-owner-stable` || persisted.EventID != `evt-start-owner-stable` || persisted.RunID != `run-start-owner-stable` || persisted.CorrelationID != `corr-start-owner-stable` {
+		t.Fatalf(`expected persisted workflow origin observability ids to stay stable on resume, got %+v`, persisted)
 	}
 }
 
@@ -231,14 +254,14 @@ func TestWorkflowRuntimeStartOrResumeRecordsWave2CMetrics(t *testing.T) {
 		WorkflowStep{Kind: WorkflowStepKindCompensate, Name: `complete`},
 	)
 
-	started, err := runtime.StartOrResume(ctx, `wf-metrics`, `plugin-workflow-demo`, `message.received`, `evt-start`, initial)
+	started, err := runtime.StartOrResume(testWorkflowContext(ctx, `plugin-workflow-demo`, `start-metrics`), `wf-metrics`, `plugin-workflow-demo`, `message.received`, `evt-start-metrics`, initial)
 	if err != nil {
 		t.Fatalf(`start workflow: %v`, err)
 	}
 	if !started.Started || started.Instance.Status != WorkflowRuntimeStatusWaitingEvent {
 		t.Fatalf(`expected waiting workflow after start, got %+v`, started)
 	}
-	resumed, err := runtime.StartOrResume(ctx, `wf-metrics`, `plugin-workflow-demo`, `message.received`, `evt-resume`, Workflow{})
+	resumed, err := runtime.StartOrResume(testWorkflowContext(ctx, `plugin-workflow-demo`, `resume-metrics`), `wf-metrics`, `plugin-workflow-demo`, `message.received`, `evt-resume-metrics`, Workflow{})
 	if err != nil {
 		t.Fatalf(`resume workflow: %v`, err)
 	}
@@ -256,5 +279,47 @@ func TestWorkflowRuntimeStartOrResumeRecordsWave2CMetrics(t *testing.T) {
 		if !strings.Contains(output, expected) {
 			t.Fatalf(`expected workflow metrics output to contain %q, got %s`, expected, output)
 		}
+	}
+	for _, forbidden := range []string{`trace_id=`, `event_id=`, `run_id=`, `correlation_id=`} {
+		if strings.Contains(output, forbidden) {
+			t.Fatalf(`expected workflow metrics labels to remain bounded without %q, got %s`, forbidden, output)
+		}
+	}
+}
+
+func TestWorkflowRuntimeStartOrResumePersistsOriginObservabilityIDs(t *testing.T) {
+	t.Parallel()
+
+	store := openTempSQLiteStore(t)
+	defer func() { _ = store.Close() }()
+	runtime := NewWorkflowRuntime(store)
+	runtime.now = func() time.Time { return time.Date(2026, 4, 23, 10, 0, 0, 0, time.UTC) }
+	ctx := context.Background()
+	observability := testWorkflowObservabilityContext(`plugin-workflow-demo`, `persist-observability`)
+	initial := NewWorkflow(
+		`wf-observability`,
+		WorkflowStep{Kind: WorkflowStepKindWaitEvent, Name: `wait`, Value: `message.received`},
+		WorkflowStep{Kind: WorkflowStepKindCompensate, Name: `complete`},
+	)
+
+	transition, err := runtime.StartOrResume(WithWorkflowObservabilityContext(ctx, observability), `wf-observability`, `plugin-workflow-demo`, `message.received`, observability.EventID, initial)
+	if err != nil {
+		t.Fatalf(`start workflow: %v`, err)
+	}
+	if !transition.Started {
+		t.Fatalf(`expected workflow start transition, got %+v`, transition)
+	}
+	if transition.Instance.TraceID != observability.TraceID || transition.Instance.EventID != observability.EventID || transition.Instance.PluginID != observability.PluginID || transition.Instance.RunID != observability.RunID || transition.Instance.CorrelationID != observability.CorrelationID {
+		t.Fatalf(`expected transition instance to keep origin observability ids, got %+v`, transition.Instance)
+	}
+	persisted, err := store.LoadWorkflowInstance(ctx, `wf-observability`)
+	if err != nil {
+		t.Fatalf(`load workflow instance: %v`, err)
+	}
+	if persisted.TraceID != observability.TraceID || persisted.EventID != observability.EventID || persisted.PluginID != observability.PluginID || persisted.RunID != observability.RunID || persisted.CorrelationID != observability.CorrelationID {
+		t.Fatalf(`expected persisted workflow observability ids, got %+v`, persisted)
+	}
+	if persisted.LastEventID != observability.EventID || persisted.LastEventType != `message.received` {
+		t.Fatalf(`expected last event cursor to still point at triggering event, got %+v`, persisted)
 	}
 }

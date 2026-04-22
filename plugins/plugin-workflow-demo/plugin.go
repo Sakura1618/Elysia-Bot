@@ -49,15 +49,17 @@ func (p *Plugin) OnEvent(event eventmodel.Event, ctx eventmodel.ExecutionContext
 		return errors.New("reply service and workflow runtime are required")
 	}
 	workflowID := workflowSessionID(event)
-	transition, err := p.Workflows.StartOrResume(context.Background(), workflowID, p.Manifest.ID, event.Type, event.EventID, demoWorkflow(workflowID, event.Message.Text))
+	workflowContext := runtimecore.WithWorkflowObservabilityContext(context.Background(), runtimecore.WorkflowObservabilityContextFromExecutionContext(ctx))
+	transition, err := p.Workflows.StartOrResume(workflowContext, workflowID, p.Manifest.ID, event.Type, event.EventID, demoWorkflow(workflowID, event.Message.Text))
 	if err != nil {
 		return err
 	}
+	reply := runtimecore.WithReplyObservabilityMetadata(*ctx.Reply, transition.Instance.ObservabilityContext().ExecutionContext())
 	if transition.Started {
-		return p.ReplyService.ReplyText(*ctx.Reply, "workflow started, please send another message to continue")
+		return p.ReplyService.ReplyText(reply, "workflow started, please send another message to continue")
 	}
 	if transition.Resumed {
-		return p.ReplyService.ReplyText(*ctx.Reply, "workflow resumed and completed")
+		return p.ReplyService.ReplyText(reply, "workflow resumed and completed")
 	}
 	return nil
 }

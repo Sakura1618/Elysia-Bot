@@ -10,10 +10,12 @@ import (
 )
 
 type replyRecorder struct {
+	handle eventmodel.ReplyHandle
 	texts []string
 }
 
 func (r *replyRecorder) ReplyText(handle eventmodel.ReplyHandle, text string) error {
+	r.handle = handle
 	r.texts = append(r.texts, text)
 	return nil
 }
@@ -43,12 +45,23 @@ func TestWorkflowDemoStartsAndResumesWorkflowFromRuntimeOwnedStore(t *testing.T)
 		Actor:          &eventmodel.Actor{ID: `user-1`, Type: `user`},
 		Message:        &eventmodel.Message{Text: `start workflow`},
 	}
-	ctx1 := eventmodel.ExecutionContext{TraceID: `trace-1`, EventID: `evt-1`, Reply: &eventmodel.ReplyHandle{Capability: `onebot.reply`, TargetID: `group-42`}}
+	ctx1 := eventmodel.ExecutionContext{TraceID: `trace-1`, EventID: `evt-1`, RunID: `run-1`, CorrelationID: `corr-1`, Reply: &eventmodel.ReplyHandle{Capability: `onebot.reply`, TargetID: `group-42`}}
 	if err := firstPlugin.OnEvent(first, ctx1); err != nil {
 		t.Fatalf(`start workflow: %v`, err)
 	}
 	if len(firstReplies.texts) != 1 || firstReplies.texts[0] != `workflow started, please send another message to continue` {
 		t.Fatalf(`unexpected first replies %+v`, firstReplies.texts)
+	}
+	for key, expected := range map[string]string{
+		`trace_id`:       `trace-1`,
+		`event_id`:       `evt-1`,
+		`plugin_id`:      `plugin-workflow-demo`,
+		`run_id`:         `run-1`,
+		`correlation_id`: `corr-1`,
+	} {
+		if got, _ := firstReplies.handle.Metadata[key].(string); got != expected {
+			t.Fatalf(`expected first workflow reply metadata %s=%q, got %+v`, key, expected, firstReplies.handle.Metadata)
+		}
 	}
 	stored, err := store.LoadWorkflowInstance(ctx, `workflow-user-1`)
 	if err != nil {
@@ -59,6 +72,9 @@ func TestWorkflowDemoStartsAndResumesWorkflowFromRuntimeOwnedStore(t *testing.T)
 	}
 	if stored.Workflow.WaitingFor != `message.received` || stored.Workflow.State[`greeting`] != `start workflow` || stored.Workflow.Completed {
 		t.Fatalf(`expected persisted workflow waiting state, got %+v`, stored.Workflow)
+	}
+	if stored.TraceID != `trace-1` || stored.EventID != `evt-1` || stored.RunID != `run-1` || stored.CorrelationID != `corr-1` {
+		t.Fatalf(`expected persisted workflow observability ids from first event, got %+v`, stored)
 	}
 
 	restartedRuntime := runtimecore.NewWorkflowRuntime(store)
@@ -80,12 +96,23 @@ func TestWorkflowDemoStartsAndResumesWorkflowFromRuntimeOwnedStore(t *testing.T)
 		Actor:          &eventmodel.Actor{ID: `user-1`, Type: `user`},
 		Message:        &eventmodel.Message{Text: `continue`},
 	}
-	ctx2 := eventmodel.ExecutionContext{TraceID: `trace-2`, EventID: `evt-2`, Reply: &eventmodel.ReplyHandle{Capability: `onebot.reply`, TargetID: `group-42`}}
+	ctx2 := eventmodel.ExecutionContext{TraceID: `trace-2`, EventID: `evt-2`, RunID: `run-2`, CorrelationID: `corr-2`, Reply: &eventmodel.ReplyHandle{Capability: `onebot.reply`, TargetID: `group-42`}}
 	if err := secondPlugin.OnEvent(second, ctx2); err != nil {
 		t.Fatalf(`resume workflow: %v`, err)
 	}
 	if len(secondReplies.texts) != 1 || secondReplies.texts[0] != `workflow resumed and completed` {
 		t.Fatalf(`unexpected second replies %+v`, secondReplies.texts)
+	}
+	for key, expected := range map[string]string{
+		`trace_id`:       `trace-1`,
+		`event_id`:       `evt-1`,
+		`plugin_id`:      `plugin-workflow-demo`,
+		`run_id`:         `run-1`,
+		`correlation_id`: `corr-1`,
+	} {
+		if got, _ := secondReplies.handle.Metadata[key].(string); got != expected {
+			t.Fatalf(`expected resumed workflow reply metadata %s=%q, got %+v`, key, expected, secondReplies.handle.Metadata)
+		}
 	}
 	completed, err := store.LoadWorkflowInstance(ctx, `workflow-user-1`)
 	if err != nil {
@@ -96,5 +123,8 @@ func TestWorkflowDemoStartsAndResumesWorkflowFromRuntimeOwnedStore(t *testing.T)
 	}
 	if completed.LastEventID != `evt-2` || completed.LastEventType != `message.received` {
 		t.Fatalf(`expected last event metadata to update on resume, got %+v`, completed)
+	}
+	if completed.TraceID != `trace-1` || completed.EventID != `evt-1` || completed.RunID != `run-1` || completed.CorrelationID != `corr-1` {
+		t.Fatalf(`expected origin observability ids to remain stable on resume, got %+v`, completed)
 	}
 }

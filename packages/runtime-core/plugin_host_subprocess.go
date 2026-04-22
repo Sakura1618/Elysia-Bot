@@ -85,16 +85,22 @@ type subprocessReplyTextCallback struct {
 type SubprocessWorkflowStartOrResumeRequest struct {
 	WorkflowID string   `json:"workflow_id"`
 	PluginID   string   `json:"plugin_id,omitempty"`
+	TraceID    string   `json:"trace_id,omitempty"`
 	EventType  string   `json:"event_type"`
 	EventID    string   `json:"event_id,omitempty"`
+	RunID      string   `json:"run_id,omitempty"`
+	CorrelationID string `json:"correlation_id,omitempty"`
 	Initial    Workflow `json:"initial"`
 }
 
 type subprocessWorkflowStartOrResumeCallback struct {
 	WorkflowID string   `json:"workflow_id"`
 	PluginID   string   `json:"plugin_id,omitempty"`
+	TraceID    string   `json:"trace_id,omitempty"`
 	EventType  string   `json:"event_type"`
 	EventID    string   `json:"event_id,omitempty"`
+	RunID      string   `json:"run_id,omitempty"`
+	CorrelationID string `json:"correlation_id,omitempty"`
 	Initial    Workflow `json:"initial"`
 }
 
@@ -253,19 +259,29 @@ func (h *SubprocessPluginHost) Close() error {
 	return nil
 }
 
-func (h *SubprocessPluginHost) DispatchEvent(ctx context.Context, plugin pluginsdk.Plugin, event eventmodel.Event, executionContext eventmodel.ExecutionContext) error {
-	if err := validateSubprocessPlugin(plugin.Manifest); err != nil {
+func (h *SubprocessPluginHost) DispatchEvent(ctx context.Context, plugin pluginsdk.Plugin, event eventmodel.Event, executionContext eventmodel.ExecutionContext) (err error) {
+	started := h.now()
+	defer func() {
+		h.recordSubprocessDispatchMetrics(plugin.Manifest.ID, "event", started, err)
+	}()
+	if strings.TrimSpace(executionContext.PluginID) == "" {
+		executionContext.PluginID = plugin.Manifest.ID
+	}
+	executionContext = enrichExecutionContext(executionContext)
+	if err = validateSubprocessPlugin(plugin.Manifest); err != nil {
 		h.observeCompatibilityFailure(plugin.Manifest.ID, executionContext, "event", err)
 		return err
 	}
-	payload, err := json.Marshal(struct {
+	var payload []byte
+	payload, err = json.Marshal(struct {
 		Event eventmodel.Event            `json:"event"`
 		Ctx   eventmodel.ExecutionContext `json:"ctx"`
 	}{Event: event, Ctx: executionContext})
 	if err != nil {
 		return err
 	}
-	request, err := buildSubprocessHostRequest("event", payload, plugin)
+	var request hostRequest
+	request, err = buildSubprocessHostRequest("event", payload, plugin)
 	if err != nil {
 		h.observeInstanceConfigFailure(plugin.Manifest.ID, executionContext, "event", err)
 		return err
@@ -273,19 +289,29 @@ func (h *SubprocessPluginHost) DispatchEvent(ctx context.Context, plugin plugins
 	return h.dispatchRequest(ctx, plugin.Manifest.ID, request, executionContext)
 }
 
-func (h *SubprocessPluginHost) DispatchCommand(ctx context.Context, plugin pluginsdk.Plugin, command eventmodel.CommandInvocation, executionContext eventmodel.ExecutionContext) error {
-	if err := validateSubprocessPlugin(plugin.Manifest); err != nil {
+func (h *SubprocessPluginHost) DispatchCommand(ctx context.Context, plugin pluginsdk.Plugin, command eventmodel.CommandInvocation, executionContext eventmodel.ExecutionContext) (err error) {
+	started := h.now()
+	defer func() {
+		h.recordSubprocessDispatchMetrics(plugin.Manifest.ID, "command", started, err)
+	}()
+	if strings.TrimSpace(executionContext.PluginID) == "" {
+		executionContext.PluginID = plugin.Manifest.ID
+	}
+	executionContext = enrichExecutionContext(executionContext)
+	if err = validateSubprocessPlugin(plugin.Manifest); err != nil {
 		h.observeCompatibilityFailure(plugin.Manifest.ID, executionContext, "command", err)
 		return err
 	}
-	payload, err := json.Marshal(struct {
+	var payload []byte
+	payload, err = json.Marshal(struct {
 		Command eventmodel.CommandInvocation `json:"command"`
 		Ctx     eventmodel.ExecutionContext  `json:"ctx"`
 	}{Command: command, Ctx: executionContext})
 	if err != nil {
 		return err
 	}
-	request, err := buildSubprocessHostRequest("command", payload, plugin)
+	var request hostRequest
+	request, err = buildSubprocessHostRequest("command", payload, plugin)
 	if err != nil {
 		h.observeInstanceConfigFailure(plugin.Manifest.ID, executionContext, "command", err)
 		return err
@@ -293,19 +319,29 @@ func (h *SubprocessPluginHost) DispatchCommand(ctx context.Context, plugin plugi
 	return h.dispatchRequest(ctx, plugin.Manifest.ID, request, executionContext)
 }
 
-func (h *SubprocessPluginHost) DispatchJob(ctx context.Context, plugin pluginsdk.Plugin, job pluginsdk.JobInvocation, executionContext eventmodel.ExecutionContext) error {
-	if err := validateSubprocessPlugin(plugin.Manifest); err != nil {
+func (h *SubprocessPluginHost) DispatchJob(ctx context.Context, plugin pluginsdk.Plugin, job pluginsdk.JobInvocation, executionContext eventmodel.ExecutionContext) (err error) {
+	started := h.now()
+	defer func() {
+		h.recordSubprocessDispatchMetrics(plugin.Manifest.ID, "job", started, err)
+	}()
+	if strings.TrimSpace(executionContext.PluginID) == "" {
+		executionContext.PluginID = plugin.Manifest.ID
+	}
+	executionContext = enrichExecutionContext(executionContext)
+	if err = validateSubprocessPlugin(plugin.Manifest); err != nil {
 		h.observeCompatibilityFailure(plugin.Manifest.ID, executionContext, "job", err)
 		return err
 	}
-	payload, err := json.Marshal(struct {
+	var payload []byte
+	payload, err = json.Marshal(struct {
 		Job pluginsdk.JobInvocation     `json:"job"`
 		Ctx eventmodel.ExecutionContext `json:"ctx"`
 	}{Job: job, Ctx: executionContext})
 	if err != nil {
 		return err
 	}
-	request, err := buildSubprocessHostRequest("job", payload, plugin)
+	var request hostRequest
+	request, err = buildSubprocessHostRequest("job", payload, plugin)
 	if err != nil {
 		h.observeInstanceConfigFailure(plugin.Manifest.ID, executionContext, "job", err)
 		return err
@@ -313,19 +349,29 @@ func (h *SubprocessPluginHost) DispatchJob(ctx context.Context, plugin pluginsdk
 	return h.dispatchRequest(ctx, plugin.Manifest.ID, request, executionContext)
 }
 
-func (h *SubprocessPluginHost) DispatchSchedule(ctx context.Context, plugin pluginsdk.Plugin, trigger pluginsdk.ScheduleTrigger, executionContext eventmodel.ExecutionContext) error {
-	if err := validateSubprocessPlugin(plugin.Manifest); err != nil {
+func (h *SubprocessPluginHost) DispatchSchedule(ctx context.Context, plugin pluginsdk.Plugin, trigger pluginsdk.ScheduleTrigger, executionContext eventmodel.ExecutionContext) (err error) {
+	started := h.now()
+	defer func() {
+		h.recordSubprocessDispatchMetrics(plugin.Manifest.ID, "schedule", started, err)
+	}()
+	if strings.TrimSpace(executionContext.PluginID) == "" {
+		executionContext.PluginID = plugin.Manifest.ID
+	}
+	executionContext = enrichExecutionContext(executionContext)
+	if err = validateSubprocessPlugin(plugin.Manifest); err != nil {
 		h.observeCompatibilityFailure(plugin.Manifest.ID, executionContext, "schedule", err)
 		return err
 	}
-	payload, err := json.Marshal(struct {
+	var payload []byte
+	payload, err = json.Marshal(struct {
 		Trigger pluginsdk.ScheduleTrigger   `json:"schedule_trigger"`
 		Ctx     eventmodel.ExecutionContext `json:"ctx"`
 	}{Trigger: trigger, Ctx: executionContext})
 	if err != nil {
 		return err
 	}
-	request, err := buildSubprocessHostRequest("schedule", payload, plugin)
+	var request hostRequest
+	request, err = buildSubprocessHostRequest("schedule", payload, plugin)
 	if err != nil {
 		h.observeInstanceConfigFailure(plugin.Manifest.ID, executionContext, "schedule", err)
 		return err
@@ -899,12 +945,10 @@ func cloneSubprocessConfigValue(value any) any {
 func (h *SubprocessPluginHost) dispatchRequest(ctx context.Context, pluginID string, request hostRequest, executionContext eventmodel.ExecutionContext) (err error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	started := h.now()
 	finishSpan := h.startSpan(executionContext.TraceID, "plugin_host.dispatch", executionContext.EventID, pluginID, executionContext.RunID, executionContext.CorrelationID, map[string]any{"request_type": request.Type})
 	defer finishSpan()
 	h.log("info", "subprocess host dispatch started", logContextFromExecutionContext(executionContext), BaselineLogFields("plugin_host", "dispatch."+request.Type, map[string]any{"plugin_id": pluginID, "request_type": request.Type}))
 	defer func() {
-		h.recordDispatchMetrics(pluginID, h.now().Sub(started), err)
 		if err != nil {
 			h.log("error", "subprocess host dispatch failed", logContextFromExecutionContext(executionContext), FailureLogFields("plugin_host", "dispatch."+request.Type, err, "plugin_dispatch_failed", map[string]any{"plugin_id": pluginID, "request_type": request.Type}))
 			return
@@ -913,14 +957,14 @@ func (h *SubprocessPluginHost) dispatchRequest(ctx context.Context, pluginID str
 		h.log("info", "subprocess host dispatch completed", logContextFromExecutionContext(executionContext), BaselineLogFields("plugin_host", "dispatch."+request.Type, map[string]any{"plugin_id": pluginID, "request_type": request.Type}))
 	}()
 
-	if err := h.ensureProcess(ctx, pluginID, executionContext); err != nil {
+	if err := h.ensureProcess(ctx, pluginID, request.Type, executionContext); err != nil {
 		h.log("error", "subprocess host ensure process failed", logContextFromExecutionContext(executionContext), FailureLogFields("plugin_host", "dispatch."+request.Type+".ensure_process", err, "ensure_process_failed", map[string]any{"plugin_id": pluginID, "request_type": request.Type}))
 		return err
 	}
 
 	if err := h.writeRequest(pluginID, request); err != nil {
 		h.log("warning", "subprocess host restarting after write failure", logContextFromExecutionContext(executionContext), FailureLogFields("plugin_host", "dispatch."+request.Type+".restart_after_write", err, "write_failed", map[string]any{"plugin_id": pluginID, "request_type": request.Type}))
-		if restartErr := h.restartProcess(ctx, pluginID, executionContext); restartErr != nil {
+		if restartErr := h.restartProcess(ctx, pluginID, request.Type, executionContext); restartErr != nil {
 			err = fmt.Errorf("restart after write failure: %w", restartErr)
 			return err
 		}
@@ -937,7 +981,7 @@ func (h *SubprocessPluginHost) dispatchRequest(ctx context.Context, pluginID str
 			return err
 		}
 		if classifiedErr, observed := h.observeDispatchFailure(executionContext, pluginID, request.Type, err); observed {
-			if restartErr := h.restartProcess(ctx, pluginID, executionContext); restartErr == nil {
+			if restartErr := h.restartProcess(ctx, pluginID, request.Type, executionContext); restartErr == nil {
 				if writeErr := h.writeRequest(pluginID, request); writeErr == nil {
 					if recoveredResponse, recoveredErr := h.readTerminalResponse(ctx, pluginID, executionContext, h.responseTimeout); recoveredErr == nil {
 						response = recoveredResponse
@@ -949,7 +993,7 @@ func (h *SubprocessPluginHost) dispatchRequest(ctx context.Context, pluginID str
 			return err
 		}
 		h.log("warning", "subprocess host restarting after read failure", logContextFromExecutionContext(executionContext), FailureLogFields("plugin_host", "dispatch."+request.Type+".restart_after_read", err, "read_failed", map[string]any{"plugin_id": pluginID, "request_type": request.Type}))
-		if restartErr := h.restartProcess(ctx, pluginID, executionContext); restartErr != nil {
+		if restartErr := h.restartProcess(ctx, pluginID, request.Type, executionContext); restartErr != nil {
 			err = fmt.Errorf("restart after read failure: %w", restartErr)
 			return err
 		}
@@ -977,7 +1021,7 @@ func (h *SubprocessPluginHost) HealthCheck(ctx context.Context) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	if err := h.ensureProcess(ctx, "health", eventmodel.ExecutionContext{}); err != nil {
+	if err := h.ensureProcess(ctx, "health", "health", eventmodel.ExecutionContext{}); err != nil {
 		h.log("error", "subprocess host health ensure failed", LogContext{}, FailureLogFields("plugin_host", "health.ensure_process", err, "ensure_process_failed", nil))
 		return err
 	}
@@ -988,11 +1032,11 @@ func (h *SubprocessPluginHost) HealthCheck(ctx context.Context) error {
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
 			h.log("error", "subprocess host health timed out", LogContext{}, FailureLogFields("plugin_host", "health.read", err, "response_timeout", nil))
-			_ = h.restartProcess(ctx, "health", eventmodel.ExecutionContext{})
+			_ = h.restartProcess(ctx, "health", "health", eventmodel.ExecutionContext{})
 			return err
 		}
 		h.log("warning", "subprocess host restarting after health failure", LogContext{}, FailureLogFields("plugin_host", "health.restart", err, "health_check_failed", nil))
-		_ = h.restartProcess(ctx, "health", eventmodel.ExecutionContext{})
+		_ = h.restartProcess(ctx, "health", "health", eventmodel.ExecutionContext{})
 		return err
 	}
 	if response.Status != "ok" {
@@ -1013,7 +1057,7 @@ func (h *SubprocessPluginHost) StderrLines() []string {
 	return append([]string(nil), h.stderrLines...)
 }
 
-func (h *SubprocessPluginHost) ensureProcess(ctx context.Context, pluginID string, executionContext eventmodel.ExecutionContext) error {
+func (h *SubprocessPluginHost) ensureProcess(ctx context.Context, pluginID string, requestType string, executionContext eventmodel.ExecutionContext) error {
 	process := h.processes[pluginID]
 	if process != nil {
 		if process.cmd.ProcessState == nil && process.cmd.Process != nil {
@@ -1024,31 +1068,31 @@ func (h *SubprocessPluginHost) ensureProcess(ctx context.Context, pluginID strin
 		delete(h.processes, pluginID)
 	}
 	if err := h.checkRestartBudgetLocked(pluginID); err != nil {
-		return h.observeProcessFailure(executionContext, pluginID, subprocessFailureStageStart, fmt.Errorf("subprocess launch guard blocked start: %w", err))
+		return h.observeProcessFailure(executionContext, pluginID, requestType, subprocessFailureStageStart, fmt.Errorf("subprocess launch guard blocked start: %w", err))
 	}
 
 	cmd, err := h.commandFactory(ctx)
 	if err != nil {
-		return h.observeProcessFailure(executionContext, pluginID, subprocessFailureStageStart, err)
+		return h.observeProcessFailure(executionContext, pluginID, requestType, subprocessFailureStageStart, err)
 	}
 	if cmd == nil {
-		return h.observeProcessFailure(executionContext, pluginID, subprocessFailureStageStart, errors.New("subprocess command factory returned nil command"))
+		return h.observeProcessFailure(executionContext, pluginID, requestType, subprocessFailureStageStart, errors.New("subprocess command factory returned nil command"))
 	}
 	h.log("info", "subprocess host starting process", logContextFromExecutionContext(executionContext), BaselineLogFields("plugin_host", "process.start", map[string]any{"plugin_id": pluginID}))
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
-		return h.observeProcessFailure(executionContext, pluginID, subprocessFailureStageStart, err)
+		return h.observeProcessFailure(executionContext, pluginID, requestType, subprocessFailureStageStart, err)
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return h.observeProcessFailure(executionContext, pluginID, subprocessFailureStageStart, err)
+		return h.observeProcessFailure(executionContext, pluginID, requestType, subprocessFailureStageStart, err)
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		return h.observeProcessFailure(executionContext, pluginID, subprocessFailureStageStart, err)
+		return h.observeProcessFailure(executionContext, pluginID, requestType, subprocessFailureStageStart, err)
 	}
 	if err := cmd.Start(); err != nil {
-		return h.observeProcessFailure(executionContext, pluginID, subprocessFailureStageStart, err)
+		return h.observeProcessFailure(executionContext, pluginID, requestType, subprocessFailureStageStart, err)
 	}
 
 	h.processes[pluginID] = &subprocessProcess{cmd: cmd, stdin: stdin, stdout: bufio.NewReader(stdout)}
@@ -1059,7 +1103,7 @@ func (h *SubprocessPluginHost) ensureProcess(ctx context.Context, pluginID strin
 			_, _ = h.processes[pluginID].cmd.Process.Wait()
 		}
 		delete(h.processes, pluginID)
-		return h.observeProcessFailure(executionContext, pluginID, subprocessFailureStageHandshake, err)
+		return h.observeProcessFailure(executionContext, pluginID, requestType, subprocessFailureStageHandshake, err)
 	}
 	return nil
 }
@@ -1079,28 +1123,29 @@ func (h *SubprocessPluginHost) performHandshake(ctx context.Context, pluginID st
 	return nil
 }
 
-func (h *SubprocessPluginHost) restartProcess(ctx context.Context, pluginID string, executionContext eventmodel.ExecutionContext) error {
+func (h *SubprocessPluginHost) restartProcess(ctx context.Context, pluginID string, requestType string, executionContext eventmodel.ExecutionContext) error {
 	h.log("warning", "subprocess host restarting process", logContextFromExecutionContext(executionContext), BaselineLogFields("plugin_host", "process.restart", map[string]any{"plugin_id": pluginID}))
 	if h.processes[pluginID] != nil && h.processes[pluginID].cmd.Process != nil {
 		_ = h.processes[pluginID].cmd.Process.Kill()
 		_, _ = h.processes[pluginID].cmd.Process.Wait()
 	}
 	delete(h.processes, pluginID)
-	return h.ensureProcess(ctx, pluginID, executionContext)
+	return h.ensureProcess(ctx, pluginID, requestType, executionContext)
 }
 
-func (h *SubprocessPluginHost) observeProcessFailure(executionContext eventmodel.ExecutionContext, pluginID string, stage subprocessFailureStage, err error) error {
+func (h *SubprocessPluginHost) observeProcessFailure(executionContext eventmodel.ExecutionContext, pluginID string, requestType string, stage subprocessFailureStage, err error) error {
 	reason := classifyProcessFailureReason(stage, err)
 	ctx := logContextFromExecutionContext(executionContext)
 	fields := map[string]any{
 		"plugin_id":     pluginID,
+		"request_type":  requestType,
 		"failure_stage": string(stage),
 		"error":         err.Error(),
 	}
 	if reason != "" {
 		fields["failure_reason"] = string(reason)
 	}
-	h.observeSubprocessFailure(executionContext, pluginID, stage, reason, "", err, nil)
+	h.observeSubprocessFailure(executionContext, pluginID, stage, reason, requestType, err, nil)
 	if h.logger != nil {
 		h.logger.Log("error", "subprocess host process bootstrap failed", ctx, FailureLogFields("plugin_host", "process.bootstrap", err, string(reason), fields))
 	}
@@ -1154,7 +1199,7 @@ func classifyProcessFailureReason(stage subprocessFailureStage, err error) subpr
 		return subprocessFailureReasonResponseTimeout
 	}
 	if stage == subprocessFailureStageHandshake && strings.Contains(errorText, "invalid handshake response") {
-		return subprocessFailureReasonCrashAfterHandshake
+		return subprocessFailureReasonManifestUnsupportedAPI
 	}
 	return ""
 }
@@ -1173,14 +1218,15 @@ func (h *SubprocessPluginHost) startSpan(traceID, spanName, eventID, pluginID, r
 	return h.tracer.StartSpan(traceID, spanName, eventID, pluginID, runID, correlationID, metadata)
 }
 
-func (h *SubprocessPluginHost) recordDispatchMetrics(pluginID string, duration time.Duration, err error) {
+func (h *SubprocessPluginHost) recordSubprocessDispatchMetrics(pluginID string, operation string, started time.Time, err error) {
 	if h.metrics == nil {
 		return
 	}
-	h.metrics.RecordHandlerLatency(pluginID, duration)
+	outcome := "success"
 	if err != nil {
-		h.metrics.RecordPluginError(pluginID)
+		outcome = "error"
 	}
+	h.metrics.RecordSubprocessDispatch(pluginID, operation, outcome, h.now().Sub(started))
 }
 
 func (h *SubprocessPluginHost) observeSubprocessFailure(executionContext eventmodel.ExecutionContext, pluginID string, stage subprocessFailureStage, reason subprocessFailureReason, requestType string, err error, extraFields map[string]any) {
@@ -1202,7 +1248,7 @@ func (h *SubprocessPluginHost) observeSubprocessFailure(executionContext eventmo
 		fields[key] = value
 	}
 	if h.metrics != nil {
-		h.metrics.RecordSubprocessFailure(pluginID, string(stage), string(reason))
+		h.metrics.RecordSubprocessFailure(pluginID, requestType, string(stage), string(reason))
 	}
 	if stage == subprocessFailureStageDispatch && reason == subprocessFailureReasonResponseTimeout {
 		h.log("error", "subprocess host dispatch timed out", logContextFromExecutionContext(executionContext), FailureLogFields("plugin_host", "dispatch."+requestType+".timeout", err, string(reason), fields))
@@ -1321,13 +1367,32 @@ func (h *SubprocessPluginHost) handleWorkflowStartOrResumeCallback(ctx context.C
 	request := SubprocessWorkflowStartOrResumeRequest{
 		WorkflowID: strings.TrimSpace(response.WorkflowStartOrResume.WorkflowID),
 		PluginID:   pluginID,
+		TraceID:    strings.TrimSpace(response.WorkflowStartOrResume.TraceID),
 		EventType:  strings.TrimSpace(response.WorkflowStartOrResume.EventType),
 		EventID:    strings.TrimSpace(response.WorkflowStartOrResume.EventID),
+		RunID:      strings.TrimSpace(response.WorkflowStartOrResume.RunID),
+		CorrelationID: strings.TrimSpace(response.WorkflowStartOrResume.CorrelationID),
 		Initial:    response.WorkflowStartOrResume.Initial,
 	}
 	if request.EventID == "" {
 		request.EventID = executionContext.EventID
 	}
+	if request.TraceID == "" {
+		request.TraceID = executionContext.TraceID
+	}
+	if request.RunID == "" {
+		request.RunID = executionContext.RunID
+	}
+	if request.CorrelationID == "" {
+		request.CorrelationID = executionContext.CorrelationID
+	}
+	ctx = WithWorkflowObservabilityContext(ctx, WorkflowObservabilityContext{
+		TraceID:       request.TraceID,
+		EventID:       request.EventID,
+		PluginID:      request.PluginID,
+		RunID:         request.RunID,
+		CorrelationID: request.CorrelationID,
+	})
 	var (
 		callbackErr error
 		transition  WorkflowTransition
@@ -2272,7 +2337,7 @@ func (h *SubprocessPluginHost) observeInstanceConfigFailure(pluginID string, exe
 		finish()
 	}
 	if h.metrics != nil {
-		h.metrics.RecordPluginError(pluginID)
+		h.metrics.RecordSubprocessFailure(pluginID, requestType, "instance_config", reason)
 	}
 }
 
@@ -2355,7 +2420,7 @@ func (h *SubprocessPluginHost) observeCompatibilityFailure(pluginID string, exec
 		finish()
 	}
 	if h.metrics != nil {
-		h.metrics.RecordPluginError(pluginID)
+		h.metrics.RecordSubprocessFailure(pluginID, requestType, "compatibility", reason)
 	}
 }
 

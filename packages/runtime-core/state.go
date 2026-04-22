@@ -183,6 +183,10 @@ const sqliteWorkflowInstancesSchema = `
 CREATE TABLE IF NOT EXISTS workflow_instances (
   workflow_id TEXT PRIMARY KEY,
   plugin_id TEXT NOT NULL,
+  trace_id TEXT NOT NULL DEFAULT '',
+  event_id TEXT NOT NULL DEFAULT '',
+  run_id TEXT NOT NULL DEFAULT '',
+  correlation_id TEXT NOT NULL DEFAULT '',
   status TEXT NOT NULL,
   workflow_json TEXT NOT NULL,
   last_event_id TEXT NOT NULL,
@@ -359,6 +363,7 @@ func (s *SQLiteStateStore) SaveWorkflowInstance(ctx context.Context, instance Wo
 	}
 	instance.WorkflowID = strings.TrimSpace(instance.WorkflowID)
 	instance.PluginID = strings.TrimSpace(instance.PluginID)
+	instance = normalizeWorkflowInstanceObservability(instance)
 	if instance.WorkflowID == `` {
 		return fmt.Errorf(`save workflow instance: workflow id is required`)
 	}
@@ -383,10 +388,14 @@ func (s *SQLiteStateStore) SaveWorkflowInstance(ctx context.Context, instance Wo
 	}
 	result, err := s.db.ExecContext(ctx, `
 INSERT INTO workflow_instances (
-  workflow_id, plugin_id, status, workflow_json, last_event_id, last_event_type, created_at, updated_at
+  workflow_id, plugin_id, trace_id, event_id, run_id, correlation_id, status, workflow_json, last_event_id, last_event_type, created_at, updated_at
 )
-VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(workflow_id) DO UPDATE SET
+  trace_id=excluded.trace_id,
+  event_id=excluded.event_id,
+  run_id=excluded.run_id,
+  correlation_id=excluded.correlation_id,
   status=excluded.status,
   workflow_json=excluded.workflow_json,
   last_event_id=excluded.last_event_id,
@@ -394,7 +403,7 @@ ON CONFLICT(workflow_id) DO UPDATE SET
   created_at=excluded.created_at,
   updated_at=excluded.updated_at
 WHERE workflow_instances.plugin_id = excluded.plugin_id
-`, instance.WorkflowID, instance.PluginID, string(instance.Status), string(payload), strings.TrimSpace(instance.LastEventID), strings.TrimSpace(instance.LastEventType), formatSQLiteTimestamp(createdAt), formatSQLiteTimestamp(updatedAt))
+`, instance.WorkflowID, instance.PluginID, instance.TraceID, instance.EventID, instance.RunID, instance.CorrelationID, string(instance.Status), string(payload), strings.TrimSpace(instance.LastEventID), strings.TrimSpace(instance.LastEventType), formatSQLiteTimestamp(createdAt), formatSQLiteTimestamp(updatedAt))
 	if err != nil {
 		return fmt.Errorf(`upsert workflow instance: %w`, err)
 	}
@@ -423,7 +432,7 @@ func (s *SQLiteStateStore) LoadWorkflowInstance(ctx context.Context, workflowID 
 		return WorkflowInstanceState{}, err
 	}
 	rows, err := s.db.QueryContext(ctx, `
-SELECT workflow_id, plugin_id, status, workflow_json, last_event_id, last_event_type, created_at, updated_at
+SELECT workflow_id, plugin_id, trace_id, event_id, run_id, correlation_id, status, workflow_json, last_event_id, last_event_type, created_at, updated_at
 FROM workflow_instances
 WHERE workflow_id = ?
 `, strings.TrimSpace(workflowID))
@@ -449,7 +458,7 @@ func (s *SQLiteStateStore) ListWorkflowInstances(ctx context.Context) ([]Workflo
 		return nil, err
 	}
 	rows, err := s.db.QueryContext(ctx, `
-SELECT workflow_id, plugin_id, status, workflow_json, last_event_id, last_event_type, created_at, updated_at
+SELECT workflow_id, plugin_id, trace_id, event_id, run_id, correlation_id, status, workflow_json, last_event_id, last_event_type, created_at, updated_at
 FROM workflow_instances
 ORDER BY created_at ASC, workflow_id ASC
 `)
@@ -466,6 +475,16 @@ func (s *SQLiteStateStore) ensureWorkflowInstanceTable(ctx context.Context) erro
 	}
 	if _, err := s.db.ExecContext(ctx, sqliteWorkflowInstancesSchema); err != nil {
 		return fmt.Errorf(`ensure workflow instance table: %w`, err)
+	}
+	for _, statement := range []string{
+		`ALTER TABLE workflow_instances ADD COLUMN trace_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE workflow_instances ADD COLUMN event_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE workflow_instances ADD COLUMN run_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE workflow_instances ADD COLUMN correlation_id TEXT NOT NULL DEFAULT ''`,
+	} {
+		if _, err := s.db.ExecContext(ctx, statement); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
+			return fmt.Errorf(`ensure workflow instance table: %w`, err)
+		}
 	}
 	return nil
 }
@@ -2014,19 +2033,28 @@ func scanWorkflowInstances(rows *sql.Rows) ([]WorkflowInstanceState, error) {
 	for rows.Next() {
 		var (
 			instance     WorkflowInstanceState
+			traceID      string
+			eventID      string
+			runID        string
+			correlation  string
 			status       string
 			workflowJSON string
 			createdAtRaw string
 			updatedAtRaw string
 		)
-		if err := rows.Scan(&instance.WorkflowID, &instance.PluginID, &status, &workflowJSON, &instance.LastEventID, &instance.LastEventType, &createdAtRaw, &updatedAtRaw); err != nil {
+		if err := rows.Scan(&instance.WorkflowID, &instance.PluginID, &traceID, &eventID, &runID, &correlation, &status, &workflowJSON, &instance.LastEventID, &instance.LastEventType, &createdAtRaw, &updatedAtRaw); err != nil {
 			return nil, fmt.Errorf(`scan workflow instance: %w`, err)
 		}
+		instance.TraceID = traceID
+		instance.EventID = eventID
+		instance.RunID = runID
+		instance.CorrelationID = correlation
 		instance.Status = WorkflowRuntimeStatus(strings.TrimSpace(status))
 		if err := json.Unmarshal([]byte(workflowJSON), &instance.Workflow); err != nil {
 			return nil, fmt.Errorf(`unmarshal workflow instance: %w`, err)
 		}
 		instance.Workflow.ID = instance.WorkflowID
+		instance = normalizeWorkflowInstanceObservability(instance)
 		if strings.TrimSpace(string(instance.Status)) == `` {
 			instance.Status = workflowRuntimeStatus(instance.Workflow)
 		}

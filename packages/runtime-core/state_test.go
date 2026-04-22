@@ -1072,6 +1072,10 @@ func TestSQLiteStateStorePersistsWorkflowInstancesAcrossReopen(t *testing.T) {
 	if err := store.SaveWorkflowInstance(ctx, WorkflowInstanceState{
 		WorkflowID:    `workflow-user-1`,
 		PluginID:      `plugin-workflow-demo`,
+		TraceID:       `trace-workflow-reopen`,
+		EventID:       `evt-workflow-reopen-origin`,
+		RunID:         `run-workflow-reopen`,
+		CorrelationID: `corr-workflow-reopen`,
 		Status:        WorkflowRuntimeStatusWaitingEvent,
 		Workflow:      workflow,
 		LastEventID:   `evt-1`,
@@ -1101,6 +1105,9 @@ func TestSQLiteStateStorePersistsWorkflowInstancesAcrossReopen(t *testing.T) {
 	if loaded.Workflow.WaitingFor != `message.received` || loaded.Workflow.State[`greeting`] != `hello` || loaded.LastEventID != `evt-1` || loaded.LastEventType != `message.received` {
 		t.Fatalf(`expected persisted workflow fields after reopen, got %+v`, loaded)
 	}
+	if loaded.TraceID != `trace-workflow-reopen` || loaded.EventID != `evt-workflow-reopen-origin` || loaded.RunID != `run-workflow-reopen` || loaded.CorrelationID != `corr-workflow-reopen` {
+		t.Fatalf(`expected persisted workflow observability ids after reopen, got %+v`, loaded)
+	}
 	instances, err := reopened.ListWorkflowInstances(ctx)
 	if err != nil {
 		t.Fatalf(`list workflow instances: %v`, err)
@@ -1127,6 +1134,10 @@ func TestSQLiteStateStoreRejectsWorkflowOwnerOverwriteOnConflict(t *testing.T) {
 	if err := store.SaveWorkflowInstance(ctx, WorkflowInstanceState{
 		WorkflowID:    `workflow-owner-locked`,
 		PluginID:      `plugin-workflow-demo`,
+		TraceID:       `trace-owner-original`,
+		EventID:       `evt-owner-origin`,
+		RunID:         `run-owner-origin`,
+		CorrelationID: `corr-owner-origin`,
 		Status:        WorkflowRuntimeStatusWaitingEvent,
 		Workflow:      originalWorkflow,
 		LastEventID:   `evt-original`,
@@ -1144,6 +1155,10 @@ func TestSQLiteStateStoreRejectsWorkflowOwnerOverwriteOnConflict(t *testing.T) {
 	err := store.SaveWorkflowInstance(ctx, WorkflowInstanceState{
 		WorkflowID:    `workflow-owner-locked`,
 		PluginID:      `plugin-admin`,
+		TraceID:       `trace-owner-overwrite`,
+		EventID:       `evt-owner-overwrite-origin`,
+		RunID:         `run-owner-overwrite`,
+		CorrelationID: `corr-owner-overwrite`,
 		Status:        WorkflowRuntimeStatusCompleted,
 		Workflow:      overwriteAttempt,
 		LastEventID:   `evt-overwrite`,
@@ -1167,5 +1182,8 @@ func TestSQLiteStateStoreRejectsWorkflowOwnerOverwriteOnConflict(t *testing.T) {
 	}
 	if loaded.LastEventID != `evt-original` || loaded.LastEventType != `message.received` || loaded.Workflow.WaitingFor != `message.received` {
 		t.Fatalf(`expected original workflow payload after rejected overwrite, got %+v`, loaded)
+	}
+	if loaded.TraceID != `trace-owner-original` || loaded.EventID != `evt-owner-origin` || loaded.RunID != `run-owner-origin` || loaded.CorrelationID != `corr-owner-origin` {
+		t.Fatalf(`expected original workflow observability ids after rejected overwrite, got %+v`, loaded)
 	}
 }

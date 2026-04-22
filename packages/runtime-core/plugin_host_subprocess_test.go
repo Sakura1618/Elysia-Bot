@@ -198,6 +198,10 @@ func TestSubprocessPluginHostHandlesWorkflowStartOrResumeCallbackBeforeTerminalE
 		transition.Instance = WorkflowInstanceState{
 			WorkflowID:    request.WorkflowID,
 			PluginID:      request.PluginID,
+			TraceID:       request.TraceID,
+			EventID:       request.EventID,
+			RunID:         request.RunID,
+			CorrelationID: request.CorrelationID,
 			Status:        WorkflowRuntimeStatusWaitingEvent,
 			Workflow:      request.Initial,
 			LastEventID:   request.EventID,
@@ -217,11 +221,14 @@ func TestSubprocessPluginHostHandlesWorkflowStartOrResumeCallbackBeforeTerminalE
 		Message:        &eventmodel.Message{ID: "msg-workflow", Text: "start workflow"},
 	}
 
-	if err := host.DispatchEvent(context.Background(), plugin, event, eventmodel.ExecutionContext{TraceID: event.TraceID, EventID: event.EventID}); err != nil {
+	if err := host.DispatchEvent(context.Background(), plugin, event, eventmodel.ExecutionContext{TraceID: event.TraceID, EventID: event.EventID, RunID: `run-host-workflow`, CorrelationID: `corr-host-workflow`}); err != nil {
 		t.Fatalf("dispatch event with workflow_start_or_resume callback: %v", err)
 	}
 	if got.WorkflowID != "workflow-user-1" || got.PluginID != plugin.Manifest.ID || got.EventType != event.Type || got.EventID != event.EventID {
 		t.Fatalf("unexpected workflow callback request %+v", got)
+	}
+	if got.TraceID != event.TraceID || got.RunID != `run-host-workflow` || got.CorrelationID != `corr-host-workflow` {
+		t.Fatalf("expected workflow callback observability ids from execution context, got %+v", got)
 	}
 	if got.PluginID == "plugin-subprocess-demo" {
 		t.Fatalf("expected routed parent plugin identity to override child callback payload, got %+v", got)

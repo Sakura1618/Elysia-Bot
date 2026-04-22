@@ -882,6 +882,7 @@ func (r *InMemoryRuntime) dispatchToPluginsWithFilter(
 
 		executionContext := baseContext
 		executionContext.PluginID = manifest.ID
+		executionContext = enrichExecutionContext(executionContext)
 		if shouldDispatch != nil && !shouldDispatch(plugin, executionContext) {
 			continue
 		}
@@ -1087,12 +1088,47 @@ func mergeFields(base map[string]any, extra map[string]any) map[string]any {
 	return merged
 }
 
-func enrichExecutionContext(ctx eventmodel.ExecutionContext) eventmodel.ExecutionContext {
+func normalizeExecutionContextObservability(ctx eventmodel.ExecutionContext) eventmodel.ExecutionContext {
 	if ctx.RunID == "" && ctx.EventID != "" {
 		ctx.RunID = "run-" + ctx.EventID
 	}
 	if ctx.CorrelationID == "" {
 		ctx.CorrelationID = ctx.EventID
+	}
+	return ctx
+}
+
+func WithReplyObservabilityMetadata(handle eventmodel.ReplyHandle, ctx eventmodel.ExecutionContext) eventmodel.ReplyHandle {
+	ctx = normalizeExecutionContextObservability(ctx)
+	metadata := cloneAnyMap(handle.Metadata)
+	if metadata == nil {
+		metadata = map[string]any{}
+	}
+	setReplyObservabilityMetadata(metadata, "trace_id", ctx.TraceID)
+	setReplyObservabilityMetadata(metadata, "event_id", ctx.EventID)
+	setReplyObservabilityMetadata(metadata, "plugin_id", ctx.PluginID)
+	setReplyObservabilityMetadata(metadata, "run_id", ctx.RunID)
+	setReplyObservabilityMetadata(metadata, "correlation_id", ctx.CorrelationID)
+	handle.Metadata = metadata
+	return handle
+}
+
+func setReplyObservabilityMetadata(metadata map[string]any, key string, value string) {
+	if metadata == nil {
+		return
+	}
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return
+	}
+	metadata[key] = value
+}
+
+func enrichExecutionContext(ctx eventmodel.ExecutionContext) eventmodel.ExecutionContext {
+	ctx = normalizeExecutionContextObservability(ctx)
+	if ctx.Reply != nil {
+		reply := WithReplyObservabilityMetadata(*ctx.Reply, ctx)
+		ctx.Reply = &reply
 	}
 	return ctx
 }

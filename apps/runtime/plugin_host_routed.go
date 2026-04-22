@@ -450,10 +450,32 @@ type runtimePluginEchoReplyTextCallback struct {
 }
 
 type runtimePluginEchoCallbackResult struct {
-	Type                  string                          `json:"type"`
-	Status                string                          `json:"status,omitempty"`
-	Error                 string                          `json:"error,omitempty"`
-	WorkflowStartOrResume *runtimecore.WorkflowTransition `json:"workflow_start_or_resume,omitempty"`
+	Type                  string          `json:"type"`
+	Status                string          `json:"status,omitempty"`
+	Error                 string          `json:"error,omitempty"`
+	WorkflowStartOrResume json.RawMessage `json:"workflow_start_or_resume,omitempty"`
+}
+
+type runtimeWorkflowObservability struct {
+	TraceID       string
+	EventID       string
+	PluginID      string
+	RunID         string
+	CorrelationID string
+}
+
+type runtimePluginEchoWorkflowTransitionSnapshot struct {
+	Started  bool                                      `json:"Started"`
+	Resumed  bool                                      `json:"Resumed"`
+	Instance runtimePluginEchoWorkflowInstanceSnapshot `json:"Instance"`
+}
+
+type runtimePluginEchoWorkflowInstanceSnapshot struct {
+	TraceID       string `json:"TraceID,omitempty"`
+	EventID       string `json:"EventID,omitempty"`
+	PluginID      string `json:"PluginID,omitempty"`
+	RunID         string `json:"RunID,omitempty"`
+	CorrelationID string `json:"CorrelationID,omitempty"`
 }
 
 type runtimePluginEchoReplyBridge struct {
@@ -464,8 +486,11 @@ type runtimePluginEchoReplyBridge struct {
 type runtimePluginEchoWorkflowStartOrResumeCallback struct {
 	WorkflowID string               `json:"workflow_id"`
 	PluginID   string               `json:"plugin_id,omitempty"`
+	TraceID    string               `json:"trace_id,omitempty"`
 	EventType  string               `json:"event_type"`
 	EventID    string               `json:"event_id,omitempty"`
+	RunID      string               `json:"run_id,omitempty"`
+	CorrelationID string            `json:"correlation_id,omitempty"`
 	Initial    runtimecore.Workflow `json:"initial"`
 }
 
@@ -512,45 +537,67 @@ func (runtimePluginEchoReplyBridge) ReplyFile(handle eventmodel.ReplyHandle, fil
 	return fmt.Errorf("reply file not supported in Wave 1: %s %s", handle.TargetID, fileURL)
 }
 
-func (b runtimePluginEchoReplyBridge) WorkflowStartOrResume(workflowID, pluginID, eventType, eventID string, initial runtimecore.Workflow) (runtimecore.WorkflowTransition, error) {
+func (b runtimePluginEchoReplyBridge) WorkflowStartOrResumeDetailed(workflowID, pluginID, traceID, eventType, eventID, runID, correlationID string, initial runtimecore.Workflow) (runtimecore.WorkflowTransition, runtimeWorkflowObservability, error) {
 	encoded, err := json.Marshal(runtimePluginEchoCallbackEnvelope{
 		Type:     "callback",
 		Callback: "workflow_start_or_resume",
 		WorkflowStartOrResume: &runtimePluginEchoWorkflowStartOrResumeCallback{
 			WorkflowID: workflowID,
 			PluginID:   pluginID,
+			TraceID:    traceID,
 			EventType:  eventType,
 			EventID:    eventID,
+			RunID:      runID,
+			CorrelationID: correlationID,
 			Initial:    initial,
 		},
 	})
 	if err != nil {
-		return runtimecore.WorkflowTransition{}, fmt.Errorf("encode workflow_start_or_resume callback: %w", err)
+		return runtimecore.WorkflowTransition{}, runtimeWorkflowObservability{}, fmt.Errorf("encode workflow_start_or_resume callback: %w", err)
 	}
 	if _, err := b.stdout.WriteString(string(encoded) + "\n"); err != nil {
-		return runtimecore.WorkflowTransition{}, fmt.Errorf("write workflow_start_or_resume callback: %w", err)
+		return runtimecore.WorkflowTransition{}, runtimeWorkflowObservability{}, fmt.Errorf("write workflow_start_or_resume callback: %w", err)
 	}
 	line, err := b.reader.ReadString('\n')
 	if err != nil {
-		return runtimecore.WorkflowTransition{}, fmt.Errorf("read workflow_start_or_resume callback result: %w", err)
+		return runtimecore.WorkflowTransition{}, runtimeWorkflowObservability{}, fmt.Errorf("read workflow_start_or_resume callback result: %w", err)
 	}
 	var result runtimePluginEchoCallbackResult
 	if err := json.Unmarshal([]byte(strings.TrimSpace(line)), &result); err != nil {
-		return runtimecore.WorkflowTransition{}, fmt.Errorf("decode workflow_start_or_resume callback result: %w", err)
+		return runtimecore.WorkflowTransition{}, runtimeWorkflowObservability{}, fmt.Errorf("decode workflow_start_or_resume callback result: %w", err)
 	}
 	if result.Type != "callback_result" {
-		return runtimecore.WorkflowTransition{}, fmt.Errorf("unexpected workflow_start_or_resume callback result type %q", result.Type)
+		return runtimecore.WorkflowTransition{}, runtimeWorkflowObservability{}, fmt.Errorf("unexpected workflow_start_or_resume callback result type %q", result.Type)
 	}
 	if result.Status != "ok" {
 		if strings.TrimSpace(result.Error) == "" {
-			return runtimecore.WorkflowTransition{}, fmt.Errorf("workflow_start_or_resume callback failed")
+			return runtimecore.WorkflowTransition{}, runtimeWorkflowObservability{}, fmt.Errorf("workflow_start_or_resume callback failed")
 		}
-		return runtimecore.WorkflowTransition{}, fmt.Errorf("workflow_start_or_resume callback failed: %s", result.Error)
+		return runtimecore.WorkflowTransition{}, runtimeWorkflowObservability{}, fmt.Errorf("workflow_start_or_resume callback failed: %s", result.Error)
 	}
-	if result.WorkflowStartOrResume == nil {
-		return runtimecore.WorkflowTransition{}, fmt.Errorf("workflow_start_or_resume callback missing transition result")
+	if len(result.WorkflowStartOrResume) == 0 {
+		return runtimecore.WorkflowTransition{}, runtimeWorkflowObservability{}, fmt.Errorf("workflow_start_or_resume callback missing transition result")
 	}
-	return *result.WorkflowStartOrResume, nil
+	var transition runtimecore.WorkflowTransition
+	if err := json.Unmarshal(result.WorkflowStartOrResume, &transition); err != nil {
+		return runtimecore.WorkflowTransition{}, runtimeWorkflowObservability{}, fmt.Errorf("decode workflow_start_or_resume transition: %w", err)
+	}
+	var snapshot runtimePluginEchoWorkflowTransitionSnapshot
+	if err := json.Unmarshal(result.WorkflowStartOrResume, &snapshot); err != nil {
+		return runtimecore.WorkflowTransition{}, runtimeWorkflowObservability{}, fmt.Errorf("decode workflow_start_or_resume observability snapshot: %w", err)
+	}
+	return transition, runtimeWorkflowObservability{
+		TraceID:       strings.TrimSpace(snapshot.Instance.TraceID),
+		EventID:       strings.TrimSpace(snapshot.Instance.EventID),
+		PluginID:      strings.TrimSpace(snapshot.Instance.PluginID),
+		RunID:         strings.TrimSpace(snapshot.Instance.RunID),
+		CorrelationID: strings.TrimSpace(snapshot.Instance.CorrelationID),
+	}, nil
+}
+
+func (b runtimePluginEchoReplyBridge) WorkflowStartOrResume(workflowID, pluginID, traceID, eventType, eventID, runID, correlationID string, initial runtimecore.Workflow) (runtimecore.WorkflowTransition, error) {
+	transition, _, err := b.WorkflowStartOrResumeDetailed(workflowID, pluginID, traceID, eventType, eventID, runID, correlationID, initial)
+	return transition, err
 }
 
 func handleRuntimeSubprocessEvent(reader *bufio.Reader, stdout *os.File, pluginID string, rawPayload json.RawMessage, rawInstanceConfig json.RawMessage) error {
@@ -597,11 +644,14 @@ func handleRuntimePluginWorkflowDemoEvent(reader *bufio.Reader, stdout *os.File,
 	if payload.Event.Actor != nil && strings.TrimSpace(payload.Event.Actor.ID) != "" {
 		workflowID = "workflow-" + payload.Event.Actor.ID
 	}
-	transition, err := bridge.WorkflowStartOrResume(
+	transition, observability, err := bridge.WorkflowStartOrResumeDetailed(
 		workflowID,
 		"plugin-workflow-demo",
+		payload.Ctx.TraceID,
 		payload.Event.Type,
 		payload.Event.EventID,
+		payload.Ctx.RunID,
+		payload.Ctx.CorrelationID,
 		runtimecore.NewWorkflow(
 			workflowID,
 			runtimecore.WorkflowStep{Kind: runtimecore.WorkflowStepKindPersist, Name: "greeting", Value: payload.Event.Message.Text},
@@ -620,10 +670,37 @@ func handleRuntimePluginWorkflowDemoEvent(reader *bufio.Reader, stdout *os.File,
 		replyText = "workflow resumed and completed"
 	}
 	if payload.Ctx.Reply != nil {
-		if err := bridge.ReplyText(*payload.Ctx.Reply, replyText); err != nil {
+		reply := withRuntimeReplyObservabilityMetadata(*payload.Ctx.Reply, observability)
+		if err := bridge.ReplyText(reply, replyText); err != nil {
 			return err
 		}
 	}
 	_, _ = stdout.WriteString("{\"type\":\"event\",\"status\":\"ok\",\"message\":\"event-ok\"}\n")
 	return nil
+}
+
+func withRuntimeReplyObservabilityMetadata(handle eventmodel.ReplyHandle, observability runtimeWorkflowObservability) eventmodel.ReplyHandle {
+	if handle.Metadata == nil {
+		handle.Metadata = map[string]any{}
+	} else {
+		metadata := make(map[string]any, len(handle.Metadata)+5)
+		for key, value := range handle.Metadata {
+			metadata[key] = value
+		}
+		handle.Metadata = metadata
+	}
+	setRuntimeReplyObservability(handle.Metadata, `trace_id`, observability.TraceID)
+	setRuntimeReplyObservability(handle.Metadata, `event_id`, observability.EventID)
+	setRuntimeReplyObservability(handle.Metadata, `plugin_id`, observability.PluginID)
+	setRuntimeReplyObservability(handle.Metadata, `run_id`, observability.RunID)
+	setRuntimeReplyObservability(handle.Metadata, `correlation_id`, observability.CorrelationID)
+	return handle
+}
+
+func setRuntimeReplyObservability(metadata map[string]any, key string, value string) {
+	value = strings.TrimSpace(value)
+	if metadata == nil || value == `` {
+		return
+	}
+	metadata[key] = value
 }
