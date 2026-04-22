@@ -111,7 +111,7 @@ func cloneLogFields(fields map[string]any) map[string]any {
 }
 
 func putLogField(fields map[string]any, key, value string) {
-	if len(fields) == 0 || strings.TrimSpace(value) == "" {
+	if fields == nil || strings.TrimSpace(value) == "" {
 		return
 	}
 	if strings.TrimSpace(logFieldString(fields, key)) != "" {

@@ -28,7 +28,7 @@ func TestLoggerWritesStructuredEntryWithDefaultFields(t *testing.T) {
 		PluginID:      "plugin-echo",
 		RunID:         "run-1",
 		CorrelationID: "corr-1",
-	}, map[string]any{"component": "runtime"})
+	}, BaselineLogFields("runtime", "startup", nil))
 	if err != nil {
 		t.Fatalf("log entry: %v", err)
 	}
@@ -41,8 +41,20 @@ func TestLoggerWritesStructuredEntryWithDefaultFields(t *testing.T) {
 	if entry.TraceID != "trace-1" || entry.EventID != "event-1" || entry.PluginID != "plugin-echo" || entry.RunID != "run-1" || entry.CorrelationID != "corr-1" {
 		t.Fatal("expected structured log to include default trace fields")
 	}
-	if entry.Fields["component"] != "runtime" || entry.Fields["operation"] == "" {
+	if entry.Fields["component"] != "runtime" || entry.Fields["operation"] != "startup" {
 		t.Fatalf("expected structured log baseline fields, got %+v", entry.Fields)
+	}
+}
+
+func TestBaselineLogFieldsCreatesBaselineWithoutExistingFields(t *testing.T) {
+	t.Parallel()
+
+	fields := BaselineLogFields("runtime", "startup", nil)
+	if len(fields) == 0 {
+		t.Fatal("expected baseline fields to be created for empty input")
+	}
+	if fields["component"] != "runtime" || fields["operation"] != "startup" {
+		t.Fatalf("expected baseline-only fields, got %+v", fields)
 	}
 }
 

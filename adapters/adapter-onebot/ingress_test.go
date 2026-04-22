@@ -51,8 +51,15 @@ func TestConvertMessageEventMapsToStandardEvent(t *testing.T) {
 	if _, exists := event.Metadata["raw_payload"]; exists {
 		t.Fatal("raw payload must not leak into standard event metadata")
 	}
-	if !strings.Contains(logs.String(), "onebot ingress mapped to standard event") {
-		t.Fatalf("expected ingress log, got %s", logs.String())
+	entries := decodeOneBotIngressLogEntries(t, logs)
+	if len(entries) != 1 {
+		t.Fatalf("expected one ingress log entry, got %+v", entries)
+	}
+	if entries[0].Message != "onebot ingress mapped to standard event" {
+		t.Fatalf("expected ingress message, got %+v", entries[0])
+	}
+	if entries[0].Fields["component"] != "adapter_onebot" || entries[0].Fields["operation"] != "ingress.map_payload" {
+		t.Fatalf("expected onebot ingress baseline fields, got %+v", entries[0])
 	}
 }
 
@@ -112,12 +119,34 @@ func TestConvertMessageEventRecordsIngressObservability(t *testing.T) {
 	if err != nil {
 		t.Fatalf("convert message event: %v", err)
 	}
-	if !strings.Contains(logs.String(), event.IdempotencyKey) {
-		t.Fatalf("expected correlation id in ingress log, got %s", logs.String())
+	entries := decodeOneBotIngressLogEntries(t, logs)
+	if len(entries) != 1 || entries[0].CorrelationID != event.IdempotencyKey {
+		t.Fatalf("expected correlation id in ingress log, got %+v", entries)
 	}
 	if rendered := tracer.RenderTrace(event.TraceID); !strings.Contains(rendered, "adapter.ingress") {
 		t.Fatalf("expected ingress span, got %s", rendered)
 	}
+}
+
+func decodeOneBotIngressLogEntries(t *testing.T, logs *bytes.Buffer) []runtimecore.LogEntry {
+	t.Helper()
+	raw := strings.TrimSpace(logs.String())
+	if raw == "" {
+		return nil
+	}
+	lines := strings.Split(raw, "\n")
+	entries := make([]runtimecore.LogEntry, 0, len(lines))
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var entry runtimecore.LogEntry
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatalf("decode onebot ingress log entry %q: %v", line, err)
+		}
+		entries = append(entries, entry)
+	}
+	return entries
 }
 
 func TestConvertMessageEventUsesConfiguredInstanceSourceAndIdempotencyBoundary(t *testing.T) {

@@ -137,13 +137,13 @@ func (c *IngressConverter) ConvertMessageEventWithConfig(payload MessageEventPay
 		TraceID:       event.TraceID,
 		EventID:       event.EventID,
 		CorrelationID: event.IdempotencyKey,
-	}, map[string]any{
+	}, runtimecore.BaselineLogFields("adapter_onebot", "ingress.map_payload", map[string]any{
 		"source":       event.Source,
 		"type":         event.Type,
 		"message_type": payload.MessageType,
 		"message_id":   payload.MessageID,
 		"user_id":      payload.UserID,
-	}); err != nil {
+	})); err != nil {
 		return eventmodel.Event{}, err
 	}
 	return event, nil
