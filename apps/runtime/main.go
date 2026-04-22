@@ -527,10 +527,18 @@ func runtimeDemoPaths(settings appRuntimeSettings) []string {
 }
 
 func newRuntimeApp(configPath string) (*runtimeApp, error) {
-	return newRuntimeAppWithOutput(configPath, os.Stdout)
+	return newRuntimeAppWithOptions(configPath, runtimeAppBuildOptions{})
 }
 
 func newRuntimeAppWithOutput(configPath string, output io.Writer) (*runtimeApp, error) {
+	return newRuntimeAppWithOutputAndOptions(configPath, output, runtimeAppBuildOptions{})
+}
+
+func newRuntimeAppWithOptions(configPath string, options runtimeAppBuildOptions) (*runtimeApp, error) {
+	return newRuntimeAppWithOutputAndOptions(configPath, os.Stdout, options)
+}
+
+func newRuntimeAppWithOutputAndOptions(configPath string, output io.Writer, options runtimeAppBuildOptions) (*runtimeApp, error) {
 	if output == nil {
 		output = io.Discard
 	}
@@ -587,7 +595,20 @@ func newRuntimeAppWithOutput(configPath string, output io.Writer) (*runtimeApp, 
 		return nil, fmt.Errorf("restore workflow runtime: %w", err)
 	}
 
-	runtime := runtimecore.NewInMemoryRuntime(runtimecore.NoopSupervisor{}, runtimecore.DirectPluginHost{})
+	pluginHostFactory := options.pluginHostFactory
+	if pluginHostFactory == nil {
+		eventScopes := map[string]map[string]struct{}{
+			"plugin-echo":          allowedSources(append(configuredEventIngressSources(settings), "runtime-demo-scheduler")...),
+			"plugin-workflow-demo": allowedSources("runtime-workflow-demo"),
+		}
+		pluginHostFactory = func(replies *replyBuffer, workflowRuntime *runtimecore.WorkflowRuntime) runtimecore.PluginHost {
+			return newRuntimePluginHostWithEventScopes(replies, workflowRuntime, []string{"plugin-echo", "plugin-workflow-demo"}, eventScopes)
+		}
+	}
+	runtime := runtimecore.NewInMemoryRuntime(runtimecore.NoopSupervisor{}, pluginHostFactory(replies, workflowRuntime))
+	if host, ok := runtime.PluginHost().(runtimePluginHostObservabilitySetter); ok {
+		host.SetObservability(logger, tracer, metrics)
+	}
 	runtime.SetObservability(logger, tracer, metrics)
 	runtime.SetAuditRecorder(audits)
 	runtime.SetDispatchRecorder(state)
@@ -635,6 +656,9 @@ func newRuntimeAppWithOutput(configPath string, output io.Writer) (*runtimeApp, 
 	echoPlugin := pluginecho.New(replies, echoConfig)
 	echoDefinition := echoPlugin.Definition()
 	echoDefinition.InstanceConfig = echoConfigState.InstanceConfig
+	if echoDefinition.InstanceConfig == nil && strings.TrimSpace(echoConfig.Prefix) != "" {
+		echoDefinition.InstanceConfig = map[string]any{"prefix": echoConfig.Prefix}
+	}
 	echoDefinition.Handlers.Event = sourceScopedEventHandler{allowed: allowedSources(append(eventIngressSources, "runtime-demo-scheduler")...), inner: echoPlugin}
 	if err := runtime.RegisterPlugin(echoDefinition); err != nil {
 		_ = smokeStore.Close()
@@ -811,6 +835,13 @@ func (a *runtimeApp) Close() error {
 	if a.state != nil {
 		if err := a.state.Close(); err != nil {
 			errs = append(errs, err)
+		}
+	}
+	if a.runtime != nil {
+		if closer, ok := a.runtime.PluginHost().(runtimePluginHostCloser); ok {
+			if err := closer.Close(); err != nil {
+				errs = append(errs, err)
+			}
 		}
 	}
 	if len(errs) > 0 {
@@ -1960,6 +1991,9 @@ func runRuntimeCLI(args []string, stdout io.Writer, stderr io.Writer, serve runt
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "-runtime-plugin-echo-subprocess" {
+		os.Exit(runRuntimePluginEchoSubprocess(os.Stdout, os.Stderr))
+	}
 	os.Exit(runRuntimeCLI(os.Args[1:], os.Stdout, os.Stderr, nil))
 }
 

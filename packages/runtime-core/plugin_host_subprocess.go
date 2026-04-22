@@ -31,19 +31,24 @@ const (
 )
 
 type SubprocessPluginHost struct {
-	commandFactory   func(context.Context) *exec.Cmd
-	mu               sync.Mutex
-	captureMu        sync.Mutex
-	processes        map[string]*subprocessProcess
-	stdoutLines      []string
-	stderrLines      []string
-	now              func() time.Time
-	maxCaptureLines  int
-	handshakeTimeout time.Duration
-	responseTimeout  time.Duration
-	logger           *Logger
-	tracer           *TraceRecorder
-	metrics          *MetricsRegistry
+	commandFactory                func(context.Context) (*exec.Cmd, error)
+	mu                            sync.Mutex
+	captureMu                     sync.Mutex
+	processes                     map[string]*subprocessProcess
+	stdoutLines                   []string
+	stderrLines                   []string
+	replyTextCallback             func(eventmodel.ReplyHandle, string) error
+	workflowStartOrResumeCallback func(context.Context, SubprocessWorkflowStartOrResumeRequest) (WorkflowTransition, error)
+	now                           func() time.Time
+	maxCaptureLines               int
+	handshakeTimeout              time.Duration
+	responseTimeout               time.Duration
+	restartBudgetLimit            int
+	restartBudgetWindow           time.Duration
+	restartFailures               map[string][]time.Time
+	logger                        *Logger
+	tracer                        *TraceRecorder
+	metrics                       *MetricsRegistry
 }
 
 type subprocessProcess struct {
@@ -54,6 +59,7 @@ type subprocessProcess struct {
 
 type hostRequest struct {
 	Type            string          `json:"type"`
+	PluginID        string          `json:"plugin_id,omitempty"`
 	Event           json.RawMessage `json:"event,omitempty"`
 	Command         json.RawMessage `json:"command,omitempty"`
 	Job             json.RawMessage `json:"job,omitempty"`
@@ -62,10 +68,41 @@ type hostRequest struct {
 }
 
 type hostResponse struct {
-	Type    string `json:"type"`
-	Status  string `json:"status,omitempty"`
-	Message string `json:"message,omitempty"`
-	Error   string `json:"error,omitempty"`
+	Type                  string                                   `json:"type"`
+	Status                string                                   `json:"status,omitempty"`
+	Message               string                                   `json:"message,omitempty"`
+	Error                 string                                   `json:"error,omitempty"`
+	Callback              string                                   `json:"callback,omitempty"`
+	ReplyText             *subprocessReplyTextCallback             `json:"reply_text,omitempty"`
+	WorkflowStartOrResume *subprocessWorkflowStartOrResumeCallback `json:"workflow_start_or_resume,omitempty"`
+}
+
+type subprocessReplyTextCallback struct {
+	Handle eventmodel.ReplyHandle `json:"handle"`
+	Text   string                 `json:"text"`
+}
+
+type SubprocessWorkflowStartOrResumeRequest struct {
+	WorkflowID string   `json:"workflow_id"`
+	PluginID   string   `json:"plugin_id,omitempty"`
+	EventType  string   `json:"event_type"`
+	EventID    string   `json:"event_id,omitempty"`
+	Initial    Workflow `json:"initial"`
+}
+
+type subprocessWorkflowStartOrResumeCallback struct {
+	WorkflowID string   `json:"workflow_id"`
+	PluginID   string   `json:"plugin_id,omitempty"`
+	EventType  string   `json:"event_type"`
+	EventID    string   `json:"event_id,omitempty"`
+	Initial    Workflow `json:"initial"`
+}
+
+type hostCallbackResult struct {
+	Type                  string              `json:"type"`
+	Status                string              `json:"status,omitempty"`
+	Error                 string              `json:"error,omitempty"`
+	WorkflowStartOrResume *WorkflowTransition `json:"workflow_start_or_resume,omitempty"`
 }
 
 type subprocessFailureStage string
@@ -90,6 +127,8 @@ const (
 	subprocessFailureReasonInstanceConfigValueTypeMismatch subprocessFailureReason = "instance_config_value_type_mismatch"
 	subprocessFailureReasonInstanceConfigEnumValueOutOfSet subprocessFailureReason = "instance_config_enum_value_out_of_set"
 	subprocessFailureReasonCrashAfterHandshake             subprocessFailureReason = "crash_after_handshake"
+	subprocessFailureReasonResponseTimeout                 subprocessFailureReason = "response_timeout"
+	subprocessFailureReasonLauncherGuardBlocked            subprocessFailureReason = "launcher_guard_blocked"
 )
 
 type subprocessCompatibilityFailure struct {
@@ -123,14 +162,40 @@ func (e *subprocessInstanceConfigFailure) Error() string {
 }
 
 func NewSubprocessPluginHost(commandFactory func(context.Context) *exec.Cmd) *SubprocessPluginHost {
-	return &SubprocessPluginHost{commandFactory: commandFactory, processes: map[string]*subprocessProcess{}, now: time.Now().UTC, maxCaptureLines: 200, handshakeTimeout: defaultHandshakeTimeout, responseTimeout: defaultResponseTimeout}
+	return newSubprocessPluginHost(wrapSubprocessCommandFactory(commandFactory), 200)
 }
 
 func NewSubprocessPluginHostWithCaptureLimit(commandFactory func(context.Context) *exec.Cmd, maxCaptureLines int) (*SubprocessPluginHost, error) {
 	if maxCaptureLines < 1 {
 		return nil, errors.New("max capture lines must be >= 1")
 	}
-	return &SubprocessPluginHost{commandFactory: commandFactory, processes: map[string]*subprocessProcess{}, now: time.Now().UTC, maxCaptureLines: maxCaptureLines, handshakeTimeout: defaultHandshakeTimeout, responseTimeout: defaultResponseTimeout}, nil
+	return newSubprocessPluginHost(wrapSubprocessCommandFactory(commandFactory), maxCaptureLines), nil
+}
+
+func NewSubprocessPluginHostWithErrorFactory(commandFactory func(context.Context) (*exec.Cmd, error)) *SubprocessPluginHost {
+	return newSubprocessPluginHost(commandFactory, 200)
+}
+
+func newSubprocessPluginHost(commandFactory func(context.Context) (*exec.Cmd, error), maxCaptureLines int) *SubprocessPluginHost {
+	return &SubprocessPluginHost{commandFactory: ensureSubprocessCommandFactory(commandFactory), processes: map[string]*subprocessProcess{}, restartFailures: map[string][]time.Time{}, now: time.Now().UTC, maxCaptureLines: maxCaptureLines, handshakeTimeout: defaultHandshakeTimeout, responseTimeout: defaultResponseTimeout}
+}
+
+func wrapSubprocessCommandFactory(commandFactory func(context.Context) *exec.Cmd) func(context.Context) (*exec.Cmd, error) {
+	return func(ctx context.Context) (*exec.Cmd, error) {
+		if commandFactory == nil {
+			return nil, errors.New("subprocess command factory is required")
+		}
+		return commandFactory(ctx), nil
+	}
+}
+
+func ensureSubprocessCommandFactory(commandFactory func(context.Context) (*exec.Cmd, error)) func(context.Context) (*exec.Cmd, error) {
+	if commandFactory != nil {
+		return commandFactory
+	}
+	return func(context.Context) (*exec.Cmd, error) {
+		return nil, errors.New("subprocess command factory is required")
+	}
 }
 
 func (h *SubprocessPluginHost) SetObservability(logger *Logger, tracer *TraceRecorder, metrics *MetricsRegistry) {
@@ -143,6 +208,49 @@ func (h *SubprocessPluginHost) SetObservability(logger *Logger, tracer *TraceRec
 	if metrics != nil {
 		h.metrics = metrics
 	}
+}
+
+func (h *SubprocessPluginHost) SetReplyTextCallback(callback func(eventmodel.ReplyHandle, string) error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.replyTextCallback = callback
+}
+
+func (h *SubprocessPluginHost) SetWorkflowStartOrResumeCallback(callback func(context.Context, SubprocessWorkflowStartOrResumeRequest) (WorkflowTransition, error)) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.workflowStartOrResumeCallback = callback
+}
+
+func (h *SubprocessPluginHost) SetRestartBudget(limit int, window time.Duration) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if limit < 0 {
+		limit = 0
+	}
+	if window < 0 {
+		window = 0
+	}
+	h.restartBudgetLimit = limit
+	h.restartBudgetWindow = window
+	if h.restartFailures == nil {
+		h.restartFailures = map[string][]time.Time{}
+	}
+}
+
+func (h *SubprocessPluginHost) Close() error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for pluginID, process := range h.processes {
+		if process == nil || process.cmd == nil || process.cmd.Process == nil {
+			delete(h.processes, pluginID)
+			continue
+		}
+		_ = process.cmd.Process.Kill()
+		_, _ = process.cmd.Process.Wait()
+		delete(h.processes, pluginID)
+	}
+	return nil
 }
 
 func (h *SubprocessPluginHost) DispatchEvent(ctx context.Context, plugin pluginsdk.Plugin, event eventmodel.Event, executionContext eventmodel.ExecutionContext) error {
@@ -226,7 +334,7 @@ func (h *SubprocessPluginHost) DispatchSchedule(ctx context.Context, plugin plug
 }
 
 func buildSubprocessHostRequest(requestType string, payload json.RawMessage, plugin pluginsdk.Plugin) (hostRequest, error) {
-	request := hostRequest{Type: requestType}
+	request := hostRequest{Type: requestType, PluginID: strings.TrimSpace(plugin.Manifest.ID)}
 	switch requestType {
 	case "event":
 		request.Event = payload
@@ -801,6 +909,7 @@ func (h *SubprocessPluginHost) dispatchRequest(ctx context.Context, pluginID str
 			h.log("error", "subprocess host dispatch failed", logContextFromExecutionContext(executionContext), map[string]any{"plugin_id": pluginID, "request_type": request.Type, "error": err.Error()})
 			return
 		}
+		h.clearRestartFailuresLocked(pluginID)
 		h.log("info", "subprocess host dispatch completed", logContextFromExecutionContext(executionContext), map[string]any{"plugin_id": pluginID, "request_type": request.Type})
 	}()
 
@@ -821,16 +930,16 @@ func (h *SubprocessPluginHost) dispatchRequest(ctx context.Context, pluginID str
 		}
 	}
 
-	response, err := h.readResponse(ctx, pluginID, h.responseTimeout)
+	response, err := h.readTerminalResponse(ctx, pluginID, executionContext, h.responseTimeout)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
-			h.log("error", "subprocess host dispatch timed out", logContextFromExecutionContext(executionContext), map[string]any{"plugin_id": pluginID, "request_type": request.Type, "error": err.Error()})
+			h.observeSubprocessFailure(executionContext, pluginID, subprocessFailureStageDispatch, subprocessFailureReasonResponseTimeout, request.Type, err, nil)
 			return err
 		}
 		if classifiedErr, observed := h.observeDispatchFailure(executionContext, pluginID, request.Type, err); observed {
 			if restartErr := h.restartProcess(ctx, pluginID, executionContext); restartErr == nil {
 				if writeErr := h.writeRequest(pluginID, request); writeErr == nil {
-					if recoveredResponse, recoveredErr := h.readResponse(ctx, pluginID, h.responseTimeout); recoveredErr == nil {
+					if recoveredResponse, recoveredErr := h.readTerminalResponse(ctx, pluginID, executionContext, h.responseTimeout); recoveredErr == nil {
 						response = recoveredResponse
 						return nil
 					}
@@ -848,10 +957,10 @@ func (h *SubprocessPluginHost) dispatchRequest(ctx context.Context, pluginID str
 			err = fmt.Errorf("replay after restart failed: %w", err)
 			return err
 		}
-		response, err = h.readResponse(ctx, pluginID, h.responseTimeout)
+		response, err = h.readTerminalResponse(ctx, pluginID, executionContext, h.responseTimeout)
 		if err != nil {
 			if errors.Is(err, context.DeadlineExceeded) {
-				h.log("error", "subprocess host dispatch timed out after restart", logContextFromExecutionContext(executionContext), map[string]any{"plugin_id": pluginID, "request_type": request.Type, "error": err.Error()})
+				h.observeSubprocessFailure(executionContext, pluginID, subprocessFailureStageDispatch, subprocessFailureReasonResponseTimeout, request.Type, err, map[string]any{"after_restart": true})
 			}
 			return err
 		}
@@ -860,6 +969,7 @@ func (h *SubprocessPluginHost) dispatchRequest(ctx context.Context, pluginID str
 		err = errors.New(response.Error)
 		return err
 	}
+	h.clearRestartFailuresLocked(pluginID)
 	return nil
 }
 
@@ -913,8 +1023,17 @@ func (h *SubprocessPluginHost) ensureProcess(ctx context.Context, pluginID strin
 		}
 		delete(h.processes, pluginID)
 	}
+	if err := h.checkRestartBudgetLocked(pluginID); err != nil {
+		return h.observeProcessFailure(executionContext, pluginID, subprocessFailureStageStart, fmt.Errorf("subprocess launch guard blocked start: %w", err))
+	}
 
-	cmd := h.commandFactory(ctx)
+	cmd, err := h.commandFactory(ctx)
+	if err != nil {
+		return h.observeProcessFailure(executionContext, pluginID, subprocessFailureStageStart, err)
+	}
+	if cmd == nil {
+		return h.observeProcessFailure(executionContext, pluginID, subprocessFailureStageStart, errors.New("subprocess command factory returned nil command"))
+	}
 	h.log("info", "subprocess host starting process", logContextFromExecutionContext(executionContext), map[string]any{"plugin_id": pluginID})
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -971,18 +1090,26 @@ func (h *SubprocessPluginHost) restartProcess(ctx context.Context, pluginID stri
 }
 
 func (h *SubprocessPluginHost) observeProcessFailure(executionContext eventmodel.ExecutionContext, pluginID string, stage subprocessFailureStage, err error) error {
+	reason := classifyProcessFailureReason(stage, err)
 	ctx := logContextFromExecutionContext(executionContext)
 	fields := map[string]any{
 		"plugin_id":     pluginID,
 		"failure_stage": string(stage),
 		"error":         err.Error(),
 	}
+	if reason != "" {
+		fields["failure_reason"] = string(reason)
+	}
+	h.observeSubprocessFailure(executionContext, pluginID, stage, reason, "", err, nil)
 	if h.logger != nil {
 		h.logger.Log("error", "subprocess host process bootstrap failed", ctx, fields)
 	}
 	if h.tracer != nil {
 		finish := h.tracer.StartSpan(ctx.TraceID, "plugin_host.process_bootstrap", ctx.EventID, pluginID, ctx.RunID, ctx.CorrelationID, fields)
 		finish()
+	}
+	if reason != subprocessFailureReasonLauncherGuardBlocked {
+		h.noteRestartFailureLocked(pluginID, reason)
 	}
 	return fmt.Errorf("subprocess %s failed: %w", stage, err)
 }
@@ -1000,9 +1127,11 @@ func (h *SubprocessPluginHost) observeDispatchFailure(executionContext eventmode
 		"failure_reason": string(reason),
 		"error":          err.Error(),
 	}
+	h.observeSubprocessFailure(executionContext, pluginID, subprocessFailureStageDispatch, reason, requestType, err, nil)
 	h.log("error", "subprocess host dispatch failed after handshake", ctx, fields)
 	finish := h.startSpan(ctx.TraceID, "plugin_host.dispatch_failure", ctx.EventID, pluginID, ctx.RunID, ctx.CorrelationID, fields)
 	finish()
+	h.noteRestartFailureLocked(pluginID, reason)
 	return fmt.Errorf("subprocess dispatch failed after handshake: %w", err), true
 }
 
@@ -1011,6 +1140,23 @@ func classifyDispatchFailureReason(err error) (subprocessFailureReason, bool) {
 		return subprocessFailureReasonCrashAfterHandshake, true
 	}
 	return "", false
+}
+
+func classifyProcessFailureReason(stage subprocessFailureStage, err error) subprocessFailureReason {
+	if err == nil {
+		return ""
+	}
+	errorText := strings.ToLower(strings.TrimSpace(err.Error()))
+	if strings.Contains(errorText, "launch guard") {
+		return subprocessFailureReasonLauncherGuardBlocked
+	}
+	if errors.Is(err, context.DeadlineExceeded) || strings.Contains(errorText, "subprocess response timeout") {
+		return subprocessFailureReasonResponseTimeout
+	}
+	if stage == subprocessFailureStageHandshake && strings.Contains(errorText, "invalid handshake response") {
+		return subprocessFailureReasonCrashAfterHandshake
+	}
+	return ""
 }
 
 func (h *SubprocessPluginHost) log(level, message string, ctx LogContext, fields map[string]any) {
@@ -1037,8 +1183,176 @@ func (h *SubprocessPluginHost) recordDispatchMetrics(pluginID string, duration t
 	}
 }
 
+func (h *SubprocessPluginHost) observeSubprocessFailure(executionContext eventmodel.ExecutionContext, pluginID string, stage subprocessFailureStage, reason subprocessFailureReason, requestType string, err error, extraFields map[string]any) {
+	if reason == "" {
+		return
+	}
+	fields := map[string]any{
+		"plugin_id":      pluginID,
+		"failure_stage":  string(stage),
+		"failure_reason": string(reason),
+	}
+	if requestType != "" {
+		fields["request_type"] = requestType
+	}
+	if err != nil {
+		fields["error"] = err.Error()
+	}
+	for key, value := range extraFields {
+		fields[key] = value
+	}
+	if h.metrics != nil {
+		h.metrics.RecordSubprocessFailure(pluginID, string(stage), string(reason))
+	}
+	if stage == subprocessFailureStageDispatch && reason == subprocessFailureReasonResponseTimeout {
+		h.log("error", "subprocess host dispatch timed out", logContextFromExecutionContext(executionContext), fields)
+	}
+}
+
+func (h *SubprocessPluginHost) checkRestartBudgetLocked(pluginID string) error {
+	if h.restartBudgetLimit <= 0 || h.restartBudgetWindow <= 0 {
+		return nil
+	}
+	recent := h.trimRestartFailuresLocked(pluginID)
+	if len(recent) < h.restartBudgetLimit {
+		return nil
+	}
+	return fmt.Errorf("restart budget exhausted for plugin %q: %d failures within %s", pluginID, len(recent), h.restartBudgetWindow)
+}
+
+func (h *SubprocessPluginHost) noteRestartFailureLocked(pluginID string, reason subprocessFailureReason) {
+	if pluginID == "" || h.restartBudgetLimit <= 0 || h.restartBudgetWindow <= 0 {
+		return
+	}
+	if reason == subprocessFailureReasonLauncherGuardBlocked {
+		return
+	}
+	recent := h.trimRestartFailuresLocked(pluginID)
+	recent = append(recent, h.now())
+	h.restartFailures[pluginID] = recent
+}
+
+func (h *SubprocessPluginHost) clearRestartFailuresLocked(pluginID string) {
+	if pluginID == "" || len(h.restartFailures) == 0 {
+		return
+	}
+	delete(h.restartFailures, pluginID)
+}
+
+func (h *SubprocessPluginHost) trimRestartFailuresLocked(pluginID string) []time.Time {
+	if pluginID == "" {
+		return nil
+	}
+	current := h.restartFailures[pluginID]
+	if h.restartBudgetWindow <= 0 {
+		return append([]time.Time(nil), current...)
+	}
+	cutoff := h.now().Add(-h.restartBudgetWindow)
+	recent := current[:0]
+	for _, at := range current {
+		if at.Before(cutoff) {
+			continue
+		}
+		recent = append(recent, at)
+	}
+	if len(recent) == 0 {
+		delete(h.restartFailures, pluginID)
+		return nil
+	}
+	h.restartFailures[pluginID] = recent
+	return append([]time.Time(nil), recent...)
+}
+
 func (h *SubprocessPluginHost) writeRequest(pluginID string, request hostRequest) error {
 	encoded, err := json.Marshal(request)
+	if err != nil {
+		return err
+	}
+	_, err = io.WriteString(h.processes[pluginID].stdin, string(encoded)+"\n")
+	return err
+}
+
+func (h *SubprocessPluginHost) readTerminalResponse(ctx context.Context, pluginID string, executionContext eventmodel.ExecutionContext, timeout time.Duration) (hostResponse, error) {
+	for {
+		response, err := h.readResponse(ctx, pluginID, timeout)
+		if err != nil {
+			return hostResponse{}, err
+		}
+		if response.Type != "callback" {
+			if response.Type == "callback_result" {
+				continue
+			}
+			return response, nil
+		}
+		if err := h.handleCallback(ctx, pluginID, executionContext, response); err != nil {
+			return hostResponse{}, err
+		}
+	}
+}
+
+func (h *SubprocessPluginHost) handleCallback(ctx context.Context, pluginID string, executionContext eventmodel.ExecutionContext, response hostResponse) error {
+	switch response.Callback {
+	case "reply_text":
+		return h.handleReplyTextCallback(pluginID, response)
+	case "workflow_start_or_resume":
+		return h.handleWorkflowStartOrResumeCallback(ctx, pluginID, executionContext, response)
+	default:
+		return fmt.Errorf("unsupported subprocess callback %q", response.Callback)
+	}
+}
+
+func (h *SubprocessPluginHost) handleReplyTextCallback(pluginID string, response hostResponse) error {
+	if response.ReplyText == nil {
+		return fmt.Errorf("subprocess callback %q missing payload", "reply_text")
+	}
+	var callbackErr error
+	if h.replyTextCallback == nil {
+		callbackErr = errors.New("subprocess reply_text callback is not configured")
+	} else {
+		callbackErr = h.replyTextCallback(response.ReplyText.Handle, response.ReplyText.Text)
+	}
+	return h.writeCallbackResult(pluginID, callbackErr, nil)
+}
+
+func (h *SubprocessPluginHost) handleWorkflowStartOrResumeCallback(ctx context.Context, pluginID string, executionContext eventmodel.ExecutionContext, response hostResponse) error {
+	if response.WorkflowStartOrResume == nil {
+		return fmt.Errorf("subprocess callback %q missing payload", "workflow_start_or_resume")
+	}
+	request := SubprocessWorkflowStartOrResumeRequest{
+		WorkflowID: strings.TrimSpace(response.WorkflowStartOrResume.WorkflowID),
+		PluginID:   pluginID,
+		EventType:  strings.TrimSpace(response.WorkflowStartOrResume.EventType),
+		EventID:    strings.TrimSpace(response.WorkflowStartOrResume.EventID),
+		Initial:    response.WorkflowStartOrResume.Initial,
+	}
+	if request.EventID == "" {
+		request.EventID = executionContext.EventID
+	}
+	var (
+		callbackErr error
+		transition  WorkflowTransition
+	)
+	if h.workflowStartOrResumeCallback == nil {
+		callbackErr = errors.New("subprocess workflow_start_or_resume callback is not configured")
+	} else {
+		transition, callbackErr = h.workflowStartOrResumeCallback(ctx, request)
+	}
+	if callbackErr != nil {
+		return h.writeCallbackResult(pluginID, callbackErr, nil)
+	}
+	return h.writeCallbackResult(pluginID, nil, &transition)
+}
+
+func (h *SubprocessPluginHost) writeCallbackResult(pluginID string, callbackErr error, transition *WorkflowTransition) error {
+	result := hostCallbackResult{Type: "callback_result", Status: "ok"}
+	if callbackErr != nil {
+		result.Status = "error"
+		result.Error = callbackErr.Error()
+	} else if transition != nil {
+		cloned := *transition
+		result.WorkflowStartOrResume = &cloned
+	}
+	encoded, err := json.Marshal(result)
 	if err != nil {
 		return err
 	}

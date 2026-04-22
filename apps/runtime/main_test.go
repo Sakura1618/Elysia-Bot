@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strconv"
@@ -36,6 +37,13 @@ func writeTestConfigAt(t *testing.T, dir string) string {
 		t.Fatalf("write config: %v", err)
 	}
 	return path
+}
+
+func TestHelperRuntimePluginEchoSubprocess(t *testing.T) {
+	if os.Getenv("GO_WANT_RUNTIME_PLUGIN_ECHO_SUBPROCESS") != "1" {
+		return
+	}
+	os.Exit(runRuntimePluginEchoSubprocess(os.Stdout, os.Stderr))
 }
 
 func writeAIProviderConfigAt(t *testing.T, dir string, endpoint string, model string, timeoutMs int, secretRef string) string {
@@ -375,6 +383,410 @@ func readRuntimeConsoleResponse(t *testing.T, app *runtimeApp) runtimeConsoleRes
 		t.Fatalf("decode console payload: %v", err)
 	}
 	return payload
+}
+
+func runtimeRoutedPluginHost(t *testing.T, app *runtimeApp) routedPluginHost {
+	t.Helper()
+	host, ok := app.runtime.PluginHost().(routedPluginHost)
+	if !ok {
+		t.Fatalf("expected routed plugin host, got %T", app.runtime.PluginHost())
+	}
+	return host
+}
+
+func runtimeSubprocessHost(t *testing.T, host routedPluginHost) *runtimecore.SubprocessPluginHost {
+	t.Helper()
+	subprocessHost, ok := host.subprocess.(*runtimecore.SubprocessPluginHost)
+	if !ok {
+		t.Fatalf("expected subprocess host route, got %T", host.subprocess)
+	}
+	return subprocessHost
+}
+
+func waitForRuntimeSubprocessCapture(t *testing.T, host *runtimecore.SubprocessPluginHost, predicate func(stdout string, stderr string) bool) (string, string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		stdout := strings.Join(host.StdoutLines(), "\n")
+		stderr := strings.Join(host.StderrLines(), "\n")
+		if predicate(stdout, stderr) {
+			return stdout, stderr
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	stdout := strings.Join(host.StdoutLines(), "\n")
+	stderr := strings.Join(host.StderrLines(), "\n")
+	return stdout, stderr
+}
+
+func TestRuntimeAppDefaultPluginHostRoutingRoutesPluginEchoThroughSubprocess(t *testing.T) {
+	t.Parallel()
+
+	app, err := newRuntimeApp(writeTestConfig(t))
+	if err != nil {
+		t.Fatalf("new runtime app: %v", err)
+	}
+	defer func() { _ = app.Close() }()
+
+	host := runtimeRoutedPluginHost(t, app)
+	if _, routed := host.routes["plugin-echo"]; !routed {
+		t.Fatalf("expected plugin-echo to use subprocess routing by default, routes=%+v", host.routes)
+	}
+	if _, ok := host.defaultHost.(runtimecore.DirectPluginHost); !ok {
+		t.Fatalf("expected default host to be direct, got %T", host.defaultHost)
+	}
+	if _, ok := host.hostForPlugin("plugin-echo").(*runtimecore.SubprocessPluginHost); !ok {
+		t.Fatalf("expected plugin-echo to resolve to subprocess host, got %T", host.hostForPlugin("plugin-echo"))
+	}
+
+	resp := performRuntimeOneBotMessageRequest(t, app, runtimeDemoOneBotMessageBody(t, 9401, "hello default routing"))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", resp.Code, resp.Body.String())
+	}
+	var payload struct {
+		Status  string        `json:"status"`
+		Replies []replyRecord `json:"replies"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if payload.Status != "ok" || len(payload.Replies) != 1 || payload.Replies[0].Payload != "echo: hello default routing" {
+		t.Fatalf("unexpected subprocess-routing payload %+v", payload)
+	}
+	if app.replies.Count() != 1 {
+		t.Fatalf("expected one recorded reply, got %+v", app.replies.Since(0))
+	}
+	subprocessHost := runtimeSubprocessHost(t, host)
+	stdout, stderr := waitForRuntimeSubprocessCapture(t, subprocessHost, func(stdout string, stderr string) bool {
+		return strings.Contains(stderr, "runtime-plugin-echo-subprocess-online") && strings.Contains(stdout, `"callback":"reply_text"`)
+	})
+	if !strings.Contains(stderr, "runtime-plugin-echo-subprocess-online") {
+		t.Fatalf("expected default routing to boot hidden subprocess entry, stderr=%s stdout=%s", stderr, stdout)
+	}
+	if !strings.Contains(stdout, `"callback":"reply_text"`) {
+		t.Fatalf("expected default routing to reply through subprocess callback bridge, stderr=%s stdout=%s", stderr, stdout)
+	}
+}
+
+func TestRuntimeAppDefaultPluginHostRoutingRoutesOfficialWave4PluginsThroughSubprocess(t *testing.T) {
+	t.Parallel()
+
+	app, err := newRuntimeApp(writeTestConfig(t))
+	if err != nil {
+		t.Fatalf("new runtime app: %v", err)
+	}
+	defer func() { _ = app.Close() }()
+
+	host := runtimeRoutedPluginHost(t, app)
+	if len(host.routes) != 2 {
+		t.Fatalf("expected exactly two official plugins to use subprocess routing in Wave 4, routes=%+v", host.routes)
+	}
+	for _, pluginID := range []string{"plugin-echo", "plugin-workflow-demo"} {
+		if _, routed := host.routes[pluginID]; !routed {
+			t.Fatalf("expected %s to use subprocess routing by default in Wave 4, routes=%+v", pluginID, host.routes)
+		}
+		if _, ok := host.hostForPlugin(pluginID).(*runtimecore.SubprocessPluginHost); !ok {
+			t.Fatalf("expected %s to resolve to subprocess host, got %T", pluginID, host.hostForPlugin(pluginID))
+		}
+	}
+	for _, pluginID := range []string{"plugin-admin", "plugin-ai-chat"} {
+		if _, routed := host.routes[pluginID]; routed {
+			t.Fatalf("expected %s to remain on direct host this wave, routes=%+v", pluginID, host.routes)
+		}
+		if _, ok := host.hostForPlugin(pluginID).(runtimecore.DirectPluginHost); !ok {
+			t.Fatalf("expected %s to resolve to direct host, got %T", pluginID, host.hostForPlugin(pluginID))
+		}
+	}
+	workflowResp := performRuntimeWorkflowMessageRequest(t, app, `{"actor_id":"user-wave4","message":"start workflow"}`)
+	if workflowResp.Code != http.StatusOK {
+		t.Fatalf("expected workflow start 200, got %d: %s", workflowResp.Code, workflowResp.Body.String())
+	}
+	if !strings.Contains(workflowResp.Body.String(), `workflow started, please send another message to continue`) {
+		t.Fatalf("expected workflow start reply through subprocess path, got %s", workflowResp.Body.String())
+	}
+	stored, err := app.state.LoadWorkflowInstance(t.Context(), "workflow-user-wave4")
+	if err != nil {
+		t.Fatalf("load subprocess-routed workflow instance: %v", err)
+	}
+	if stored.PluginID != "plugin-workflow-demo" || stored.Status != runtimecore.WorkflowRuntimeStatusWaitingEvent || stored.Workflow.State["greeting"] != "start workflow" {
+		t.Fatalf("expected subprocess-routed workflow instance persisted, got %+v", stored)
+	}
+	subprocessHost := runtimeSubprocessHost(t, host)
+	stdout, stderr := waitForRuntimeSubprocessCapture(t, subprocessHost, func(stdout string, stderr string) bool {
+		return strings.Contains(stderr, "runtime-plugin-echo-subprocess-online") && strings.Contains(stdout, `"callback":"workflow_start_or_resume"`) && strings.Contains(stdout, `"callback":"reply_text"`)
+	})
+	if !strings.Contains(stderr, "runtime-plugin-echo-subprocess-online") {
+		t.Fatalf("expected workflow subprocess routing to boot hidden subprocess entry, stderr=%s stdout=%s", stderr, stdout)
+	}
+	if !strings.Contains(stdout, `"callback":"workflow_start_or_resume"`) {
+		t.Fatalf("expected workflow subprocess routing to use workflow callback bridge, stderr=%s stdout=%s", stderr, stdout)
+	}
+	if !strings.Contains(stdout, `"callback":"reply_text"`) {
+		t.Fatalf("expected workflow subprocess routing to use reply callback bridge, stderr=%s stdout=%s", stderr, stdout)
+	}
+}
+
+func TestRuntimeAppDefaultPluginHostRoutingCrashRecoversWorkflowSubprocessAndExposesFailureEvidence(t *testing.T) {
+	dir := t.TempDir()
+	configPath := writeTestConfigAt(t, dir)
+	markerPath := filepath.Join(dir, "workflow-subprocess-crash-once.marker")
+
+	var output bytes.Buffer
+	app, err := newRuntimeAppWithOutputAndOptions(configPath, &output, runtimeAppBuildOptions{
+		pluginHostFactory: func(replies *replyBuffer, workflowRuntime *runtimecore.WorkflowRuntime) runtimecore.PluginHost {
+			launcherConfig := runtimeDefaultSubprocessLauncherConfig()
+			direct := runtimecore.DirectPluginHost{}
+			subprocess := runtimecore.NewSubprocessPluginHostWithErrorFactory(func(ctx context.Context) (*exec.Cmd, error) {
+				cmd, err := runtimePluginProcessFactory(launcherConfig)(ctx)
+				if err != nil {
+					return nil, err
+				}
+				cmd.Env = append(cmd.Env, runtimeSubprocessCrashOncePluginEnv+"=plugin-workflow-demo", runtimeSubprocessCrashOnceMarkerEnv+"="+markerPath)
+				return cmd, nil
+			})
+			subprocess.SetReplyTextCallback(replies.ReplyText)
+			if workflowRuntime != nil {
+				subprocess.SetWorkflowStartOrResumeCallback(func(ctx context.Context, request runtimecore.SubprocessWorkflowStartOrResumeRequest) (runtimecore.WorkflowTransition, error) {
+					return workflowRuntime.StartOrResume(ctx, request.WorkflowID, request.PluginID, request.EventType, request.EventID, request.Initial)
+				})
+			}
+			subprocess.SetRestartBudget(launcherConfig.restartBudget, launcherConfig.restartWindow)
+			eventScopes := map[string]map[string]struct{}{
+				"plugin-echo":          allowedSources("onebot", "runtime-demo-scheduler"),
+				"plugin-workflow-demo": allowedSources("runtime-workflow-demo"),
+			}
+			return newRoutedPluginHostWithEventScopes(direct, subprocess, []string{"plugin-echo", "plugin-workflow-demo"}, eventScopes)
+		},
+	})
+	if err != nil {
+		t.Fatalf("new runtime app with crash-once subprocess seam: %v", err)
+	}
+	defer func() { _ = app.Close() }()
+
+	host := runtimeRoutedPluginHost(t, app)
+	if _, ok := host.hostForPlugin("plugin-workflow-demo").(*runtimecore.SubprocessPluginHost); !ok {
+		t.Fatalf("expected plugin-workflow-demo subprocess route during crash recovery test, got %T", host.hostForPlugin("plugin-workflow-demo"))
+	}
+
+	failedResp := performRuntimeWorkflowMessageRequest(t, app, `{"actor_id":"user-crash","message":"crash once"}`)
+	if failedResp.Code != http.StatusOK {
+		t.Fatalf("expected first workflow request to recover without restarting the app, got %d: %s", failedResp.Code, failedResp.Body.String())
+	}
+	if !strings.Contains(failedResp.Body.String(), `workflow started, please send another message to continue`) {
+		t.Fatalf("expected in-request recovery to still return workflow reply, got %s", failedResp.Body.String())
+	}
+	if _, err := os.Stat(markerPath); err != nil {
+		t.Fatalf("expected crash marker to prove injected subprocess crash, err=%v", err)
+	}
+	results := app.runtime.DispatchResults()
+	if len(results) == 0 {
+		t.Fatal("expected runtime dispatch results to capture subprocess crash failure")
+	}
+	first := results[len(results)-1]
+	if first.PluginID != "plugin-workflow-demo" || first.Kind != "event" || !first.Success {
+		t.Fatalf("expected workflow subprocess dispatch to recover and succeed in-request, got %+v", first)
+	}
+	snapshot, err := app.state.LoadPluginStatusSnapshot(t.Context(), "plugin-workflow-demo")
+	if err != nil {
+		t.Fatalf("load failed workflow subprocess snapshot: %v", err)
+	}
+	if snapshot.PluginID != "plugin-workflow-demo" || snapshot.LastDispatchKind != "event" || !snapshot.LastDispatchSuccess {
+		t.Fatalf("expected recovered persisted workflow subprocess snapshot, got %+v", snapshot)
+	}
+	if snapshot.CurrentFailureStreak != 0 || snapshot.LastDispatchError != "" {
+		t.Fatalf("expected clean persisted snapshot after in-request restart, got %+v", snapshot)
+	}
+	storedWorkflow, err := app.state.LoadWorkflowInstance(t.Context(), "workflow-user-crash")
+	if err != nil {
+		t.Fatalf("expected recovered workflow subprocess dispatch to persist workflow instance, err=%v", err)
+	}
+	if storedWorkflow.PluginID != "plugin-workflow-demo" || storedWorkflow.Status != runtimecore.WorkflowRuntimeStatusWaitingEvent || storedWorkflow.Workflow.State["greeting"] != "crash once" {
+		t.Fatalf("expected recovered workflow state after injected crash, got %+v", storedWorkflow)
+	}
+	if statusCode, health := readRuntimeHealthResponse(t, app); statusCode != http.StatusOK || health.Status != "ok" || !health.Components.Scheduler.Running {
+		t.Fatalf("expected app to stay healthy after subprocess crash without restart, status=%d payload=%+v", statusCode, health)
+	}
+	metricsReq := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	metricsResp := httptest.NewRecorder()
+	app.ServeHTTP(metricsResp, metricsReq)
+	if metricsResp.Code != http.StatusOK {
+		t.Fatalf("expected metrics 200 after subprocess crash, got %d: %s", metricsResp.Code, metricsResp.Body.String())
+	}
+	if !strings.Contains(metricsResp.Body.String(), `bot_platform_handler_latency_ms{plugin_id="plugin-workflow-demo"}`) {
+		t.Fatalf("expected metrics surface to remain available for workflow plugin after crash recovery, got %s", metricsResp.Body.String())
+	}
+	combinedLogs := output.String() + strings.Join(app.logs.Lines(), "")
+	for _, expected := range []string{"subprocess host dispatch failed after handshake", `"plugin_id":"plugin-workflow-demo"`, `"failure_stage":"dispatch"`, `"failure_reason":"crash_after_handshake"`} {
+		if !strings.Contains(combinedLogs, expected) {
+			t.Fatalf("expected crash failure log evidence %q, got %s", expected, combinedLogs)
+		}
+	}
+	consoleAfterCrashReq := httptest.NewRequest(http.MethodGet, "/api/console?plugin_id=plugin-workflow-demo", nil)
+	consoleAfterCrashResp := httptest.NewRecorder()
+	app.ServeHTTP(consoleAfterCrashResp, consoleAfterCrashReq)
+	if consoleAfterCrashResp.Code != http.StatusOK {
+		t.Fatalf("expected filtered console 200 after subprocess crash recovery, got %d: %s", consoleAfterCrashResp.Code, consoleAfterCrashResp.Body.String())
+	}
+	for _, expected := range []string{`"id": "plugin-workflow-demo"`, `"statusLevel": "ok"`, `"statusRecovery": "last-dispatch-succeeded"`, `"lastDispatchKind": "event"`, `"lastDispatchSuccess": true`} {
+		if !strings.Contains(consoleAfterCrashResp.Body.String(), expected) {
+			t.Fatalf("expected workflow console payload after in-request crash recovery to include %s, got %s", expected, consoleAfterCrashResp.Body.String())
+		}
+	}
+
+	recoveredResp := performRuntimeWorkflowMessageRequest(t, app, `{"actor_id":"user-crash","message":"recover now"}`)
+	if recoveredResp.Code != http.StatusOK {
+		t.Fatalf("expected second workflow request to recover without app restart, got %d: %s", recoveredResp.Code, recoveredResp.Body.String())
+	}
+	if !strings.Contains(recoveredResp.Body.String(), `workflow resumed and completed`) {
+		t.Fatalf("expected recovered workflow reply after subprocess restart, got %s", recoveredResp.Body.String())
+	}
+	recoveredResults := app.runtime.DispatchResults()
+	if len(recoveredResults) < 2 {
+		t.Fatalf("expected recovery dispatch to add success evidence, got %+v", recoveredResults)
+	}
+	recovered := recoveredResults[len(recoveredResults)-1]
+	if recovered.PluginID != "plugin-workflow-demo" || recovered.Kind != "event" || !recovered.Success {
+		t.Fatalf("expected recovered workflow subprocess dispatch success, got %+v", recovered)
+	}
+	recoveredSnapshot, err := app.state.LoadPluginStatusSnapshot(t.Context(), "plugin-workflow-demo")
+	if err != nil {
+		t.Fatalf("load recovered workflow subprocess snapshot: %v", err)
+	}
+	if !recoveredSnapshot.LastDispatchSuccess || recoveredSnapshot.CurrentFailureStreak != 0 || recoveredSnapshot.LastDispatchError != "" {
+		t.Fatalf("expected persisted success snapshot after resumed workflow completion, got %+v", recoveredSnapshot)
+	}
+	workflowState, err := app.state.LoadWorkflowInstance(t.Context(), "workflow-user-crash")
+	if err != nil {
+		t.Fatalf("load recovered workflow instance: %v", err)
+	}
+	if workflowState.PluginID != "plugin-workflow-demo" || workflowState.Status != runtimecore.WorkflowRuntimeStatusCompleted || !workflowState.Workflow.Completed || !workflowState.Workflow.Compensated || workflowState.Workflow.State["greeting"] != "crash once" {
+		t.Fatalf("expected recovered workflow dispatch to persist waiting state, got %+v", workflowState)
+	}
+	recoveredConsoleReq := httptest.NewRequest(http.MethodGet, "/api/console?plugin_id=plugin-workflow-demo", nil)
+	recoveredConsoleResp := httptest.NewRecorder()
+	app.ServeHTTP(recoveredConsoleResp, recoveredConsoleReq)
+	if recoveredConsoleResp.Code != http.StatusOK {
+		t.Fatalf("expected filtered console 200 after recovery, got %d: %s", recoveredConsoleResp.Code, recoveredConsoleResp.Body.String())
+	}
+	for _, expected := range []string{`"id": "plugin-workflow-demo"`, `"statusLevel": "ok"`, `"statusRecovery": "last-dispatch-succeeded"`, `"lastDispatchSuccess": true`} {
+		if !strings.Contains(recoveredConsoleResp.Body.String(), expected) {
+			t.Fatalf("expected recovered workflow console payload to include %s, got %s", expected, recoveredConsoleResp.Body.String())
+		}
+	}
+	subprocessHost := runtimeSubprocessHost(t, host)
+	stdout, stderr := waitForRuntimeSubprocessCapture(t, subprocessHost, func(stdout string, stderr string) bool {
+		return strings.Count(stderr, "runtime-plugin-echo-subprocess-online") >= 2 && strings.Contains(stdout, `"callback":"workflow_start_or_resume"`) && strings.Contains(stdout, `"callback":"reply_text"`)
+	})
+	if strings.Count(stderr, "runtime-plugin-echo-subprocess-online") < 2 {
+		t.Fatalf("expected subprocess auto-recovery to start a second workflow subprocess without app restart, stderr=%s stdout=%s", stderr, stdout)
+	}
+	if !strings.Contains(stdout, `"callback":"workflow_start_or_resume"`) || !strings.Contains(stdout, `"callback":"reply_text"`) {
+		t.Fatalf("expected recovered workflow subprocess to use callback bridges, stderr=%s stdout=%s", stderr, stdout)
+	}
+}
+
+func TestRuntimePluginProcessFactoryAppliesLauncherGuards(t *testing.T) {
+	t.Parallel()
+
+	config := runtimeSubprocessLauncherConfig{
+		workingDirectory: filepath.Join(".."),
+		envAllowlist:     []string{"PATH", "SYSTEMROOT"},
+	}
+	factory := runtimePluginProcessFactory(config)
+	_, err := factory(context.Background())
+	if err == nil {
+		t.Fatal("expected guarded subprocess factory to fail closed")
+	}
+	if !strings.Contains(err.Error(), "subprocess launch guard blocked start") || !strings.Contains(err.Error(), "escapes workspace root") {
+		t.Fatalf("expected precise launch guard error, got %v", err)
+	}
+
+	workspaceRoot, err := filepath.Abs(".")
+	if err != nil {
+		t.Fatalf("abs workspace root: %v", err)
+	}
+	allowedFactory := runtimePluginProcessFactory(runtimeSubprocessLauncherConfig{
+		workingDirectory: workspaceRoot,
+		envAllowlist:     []string{"PATH", "SYSTEMROOT"},
+	})
+	allowed, err := allowedFactory(context.Background())
+	if err != nil {
+		t.Fatalf("expected allowed command, got %v", err)
+	}
+	if allowed == nil {
+		t.Fatal("expected allowed command")
+	}
+	allowedEnv := strings.Join(allowed.Env, "\n")
+	for _, forbidden := range []string{"GO_WANT_HELPER_PROCESS=1", "BOT_PLATFORM_SECRET=1"} {
+		if strings.Contains(allowedEnv, forbidden) {
+			t.Fatalf("expected allowlisted env to drop %q, got %v", forbidden, allowed.Env)
+		}
+	}
+}
+
+func TestRuntimeAppSubprocessWorkflowCallbackBridgeWorksAtSubstrateLevel(t *testing.T) {
+	t.Parallel()
+
+	app, err := newRuntimeApp(writeTestConfig(t))
+	if err != nil {
+		t.Fatalf("new runtime app: %v", err)
+	}
+	defer func() { _ = app.Close() }()
+
+	host := runtimeRoutedPluginHost(t, app)
+	subprocessHost := runtimeSubprocessHost(t, host)
+	subprocessHost.SetWorkflowStartOrResumeCallback(func(ctx context.Context, request runtimecore.SubprocessWorkflowStartOrResumeRequest) (runtimecore.WorkflowTransition, error) {
+		return app.workflowRuntime.StartOrResume(ctx, request.WorkflowID, request.PluginID, request.EventType, request.EventID, request.Initial)
+	})
+
+	workflowPlugin := testRuntimeWorkflowSubprocessPlugin(t)
+	event := eventmodel.Event{
+		EventID:        "evt-runtime-workflow-subprocess",
+		TraceID:        "trace-runtime-workflow-subprocess",
+		Source:         "runtime-workflow-demo",
+		Type:           "message.received",
+		Timestamp:      time.Date(2026, 4, 22, 12, 30, 0, 0, time.UTC),
+		IdempotencyKey: "runtime-workflow-subprocess:1",
+		Actor:          &eventmodel.Actor{ID: "user-1", Type: "user"},
+		Message:        &eventmodel.Message{ID: "msg-runtime-workflow-subprocess", Text: "workflow-callback"},
+	}
+	if err := subprocessHost.DispatchEvent(t.Context(), workflowPlugin, event, eventmodel.ExecutionContext{TraceID: event.TraceID, EventID: event.EventID}); err != nil {
+		t.Fatalf("dispatch workflow subprocess event: %v", err)
+	}
+	stored, err := app.state.LoadWorkflowInstance(t.Context(), "workflow-user-1")
+	if err != nil {
+		t.Fatalf("load workflow instance: %v", err)
+	}
+	if stored.PluginID != "plugin-workflow-demo" || stored.Status != runtimecore.WorkflowRuntimeStatusWaitingEvent || stored.Workflow.State["greeting"] != "workflow-callback" {
+		t.Fatalf("expected workflow callback bridge to persist waiting runtime state, got %+v", stored)
+	}
+	stdout, _ := waitForRuntimeSubprocessCapture(t, subprocessHost, func(stdout string, _ string) bool {
+		return strings.Contains(stdout, `"callback":"workflow_start_or_resume"`)
+	})
+	if !strings.Contains(stdout, `"callback":"workflow_start_or_resume"`) {
+		t.Fatalf("expected workflow callback capture, got %s", stdout)
+	}
+}
+
+func testRuntimeWorkflowSubprocessPlugin(t *testing.T) pluginsdk.Plugin {
+	t.Helper()
+	plugin := testRuntimeWorkflowSubprocessDefinition()
+	return plugin
+}
+
+func testRuntimeWorkflowSubprocessDefinition() pluginsdk.Plugin {
+	return testRuntimeWorkflowSubprocessPluginWithID("plugin-workflow-demo")
+}
+
+func testRuntimeWorkflowSubprocessPluginWithID(pluginID string) pluginsdk.Plugin {
+	return pluginsdk.Plugin{Manifest: pluginsdk.PluginManifest{
+		ID:         pluginID,
+		Name:       "Workflow Demo Plugin",
+		Version:    "0.1.0",
+		APIVersion: "v0",
+		Mode:       pluginsdk.ModeSubprocess,
+		Entry:      pluginsdk.PluginEntry{Module: "plugins/plugin-workflow-demo", Symbol: "Plugin"},
+	}}
 }
 
 func dispatchRuntimeAdminReplay(t *testing.T, app *runtimeApp, actor string, eventID string) error {
@@ -1675,6 +2087,10 @@ func TestRuntimeAppReloadsPersistedPluginEchoConfigAfterRestart(t *testing.T) {
 		t.Fatalf("restart runtime app: %v", err)
 	}
 	defer func() { _ = restarted.Close() }()
+	restartedHost := runtimeRoutedPluginHost(t, restarted)
+	if _, routed := restartedHost.routes["plugin-echo"]; !routed {
+		t.Fatalf("expected restarted runtime to keep plugin-echo on subprocess route, routes=%+v", restartedHost.routes)
+	}
 
 	messageReq := httptest.NewRequest(http.MethodPost, "/demo/onebot/message", strings.NewReader(`{"post_type":"message","message_type":"group","time":1712034000,"user_id":10001,"group_id":42,"message_id":9901,"raw_message":"hello restart","sender":{"nickname":"alice"}}`))
 	messageReq.Header.Set("Content-Type", "application/json")
@@ -1686,6 +2102,16 @@ func TestRuntimeAppReloadsPersistedPluginEchoConfigAfterRestart(t *testing.T) {
 	}
 	if !strings.Contains(messageResp.Body.String(), "persisted: hello restart") {
 		t.Fatalf("expected restarted runtime to use persisted echo prefix, got %s", messageResp.Body.String())
+	}
+	restartedSubprocessHost := runtimeSubprocessHost(t, restartedHost)
+	restartedStdout, restartedStderr := waitForRuntimeSubprocessCapture(t, restartedSubprocessHost, func(stdout string, stderr string) bool {
+		return strings.Contains(stderr, "runtime-plugin-echo-subprocess-online") && strings.Contains(stdout, `"callback":"reply_text"`)
+	})
+	if !strings.Contains(restartedStderr, "runtime-plugin-echo-subprocess-online") {
+		t.Fatalf("expected restarted runtime to boot echo subprocess, stderr=%s stdout=%s", restartedStderr, restartedStdout)
+	}
+	if !strings.Contains(restartedStdout, `"callback":"reply_text"`) {
+		t.Fatalf("expected restarted runtime to send persisted echo reply through subprocess callback bridge, stderr=%s stdout=%s", restartedStderr, restartedStdout)
 	}
 
 	consoleReq := consoleRequestWithViewer("/api/console?plugin_id=plugin-echo")
@@ -1744,6 +2170,54 @@ func TestRuntimeAppReloadsPersistedPluginEchoConfigAfterRestart(t *testing.T) {
 	}
 	if !pluginFound {
 		t.Fatalf("expected plugin-echo in restarted console payload, got %+v", console.Plugins)
+	}
+}
+
+func TestRuntimeAppDefaultPluginHostRoutingBlocksDisallowedPluginEchoSourcesBeforeSubprocess(t *testing.T) {
+	t.Parallel()
+
+	app, err := newRuntimeApp(writeTestConfig(t))
+	if err != nil {
+		t.Fatalf("new runtime app: %v", err)
+	}
+	defer func() { _ = app.Close() }()
+
+	host := runtimeRoutedPluginHost(t, app)
+	if _, routed := host.routes["plugin-echo"]; !routed {
+		t.Fatalf("expected plugin-echo to use subprocess routing by default, routes=%+v", host.routes)
+	}
+	if err := app.runtime.DispatchEvent(t.Context(), eventmodel.Event{
+		EventID:        "evt-disallowed-plugin-echo-source",
+		TraceID:        "trace-disallowed-plugin-echo-source",
+		Source:         "runtime-ai",
+		Type:           "message.received",
+		Timestamp:      time.Now().UTC(),
+		IdempotencyKey: "idempotency-disallowed-plugin-echo-source",
+		Actor:          &eventmodel.Actor{ID: "user-1", Type: "user", DisplayName: "alice"},
+		Channel:        &eventmodel.Channel{ID: "group-42", Type: "group", Title: "group-42"},
+		Message:        &eventmodel.Message{ID: "msg-disallowed-plugin-echo-source", Text: "should stay blocked"},
+		Reply: &eventmodel.ReplyHandle{
+			Capability: "onebot.reply",
+			TargetID:   "group-42",
+			MessageID:  "msg-disallowed-plugin-echo-source",
+			Metadata: map[string]any{
+				"message_type": "group",
+				"group_id":     42,
+				"user_id":      10001,
+			},
+		},
+	}); err != nil {
+		t.Fatalf("dispatch disallowed plugin-echo event: %v", err)
+	}
+	if app.replies.Count() != 0 {
+		t.Fatalf("expected disallowed source to produce no replies, got %+v", app.replies.Since(0))
+	}
+	subprocessHost := runtimeSubprocessHost(t, host)
+	stdout, stderr := waitForRuntimeSubprocessCapture(t, subprocessHost, func(stdout string, stderr string) bool {
+		return strings.TrimSpace(stdout) != "" || strings.TrimSpace(stderr) != ""
+	})
+	if strings.TrimSpace(stdout) != "" || strings.TrimSpace(stderr) != "" {
+		t.Fatalf("expected disallowed source to avoid subprocess boot, stderr=%s stdout=%s", stderr, stdout)
 	}
 }
 

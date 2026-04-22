@@ -13,6 +13,7 @@ type MetricsRegistry struct {
 	eventThroughput    int
 	handlerLatencyMs   map[string]float64
 	pluginErrors       map[string]int
+	subprocessFailures map[string]int
 	queueLag           int
 	jobStatusCounts    map[JobStatus]int
 	jobRecoveries      int
@@ -23,9 +24,10 @@ type MetricsRegistry struct {
 
 func NewMetricsRegistry() *MetricsRegistry {
 	return &MetricsRegistry{
-		handlerLatencyMs: make(map[string]float64),
-		pluginErrors:     make(map[string]int),
-		jobStatusCounts:  make(map[JobStatus]int),
+		handlerLatencyMs:   make(map[string]float64),
+		pluginErrors:       make(map[string]int),
+		subprocessFailures: make(map[string]int),
+		jobStatusCounts:    make(map[JobStatus]int),
 	}
 }
 
@@ -45,6 +47,13 @@ func (m *MetricsRegistry) RecordPluginError(pluginID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.pluginErrors[pluginID]++
+}
+
+func (m *MetricsRegistry) RecordSubprocessFailure(pluginID string, stage string, reason string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := fmt.Sprintf("%s|%s|%s", pluginID, stage, reason)
+	m.subprocessFailures[key]++
 }
 
 func (m *MetricsRegistry) SetQueueLag(lag int) {
@@ -103,6 +112,14 @@ func (m *MetricsRegistry) RenderPrometheus() string {
 
 	for _, pluginID := range sortedStringKeys(m.pluginErrors) {
 		lines = append(lines, fmt.Sprintf("bot_platform_plugin_errors_total{plugin_id=%q} %d", pluginID, m.pluginErrors[pluginID]))
+	}
+
+	for _, key := range sortedStringKeys(m.subprocessFailures) {
+		parts := strings.SplitN(key, "|", 3)
+		if len(parts) != 3 {
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("bot_platform_subprocess_failures_total{plugin_id=%q,failure_stage=%q,failure_reason=%q} %d", parts[0], parts[1], parts[2], m.subprocessFailures[key]))
 	}
 
 	statuses := make([]string, 0, len(m.jobStatusCounts))

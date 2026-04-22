@@ -139,6 +139,15 @@ func (r *WorkflowRuntime) StartOrResume(ctx context.Context, workflowID string, 
 	if err != nil {
 		return WorkflowTransition{}, fmt.Errorf(`load workflow instance: %w`, err)
 	}
+	if found {
+		current.PluginID = strings.TrimSpace(current.PluginID)
+		if current.PluginID == `` {
+			return WorkflowTransition{}, fmt.Errorf(`workflow %q owner plugin is missing`, workflowID)
+		}
+		if current.PluginID != pluginID {
+			return WorkflowTransition{}, fmt.Errorf(`workflow %q is owned by plugin %q, not %q`, workflowID, current.PluginID, pluginID)
+		}
+	}
 	if !found || current.Workflow.Completed {
 		initial.ID = workflowID
 		if len(initial.Steps) == 0 {
@@ -165,7 +174,6 @@ func (r *WorkflowRuntime) StartOrResume(ctx context.Context, workflowID string, 
 	}
 
 	updated := cloneWorkflowInstanceState(current)
-	updated.PluginID = pluginID
 	workflow := cloneWorkflow(updated.Workflow)
 	if workflow.WaitingFor != `` {
 		workflow, err = workflow.ResumeWithEvent(eventType)

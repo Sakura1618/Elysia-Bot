@@ -1109,3 +1109,63 @@ func TestSQLiteStateStorePersistsWorkflowInstancesAcrossReopen(t *testing.T) {
 		t.Fatalf(`expected one persisted workflow instance, got %+v`, instances)
 	}
 }
+
+func TestSQLiteStateStoreRejectsWorkflowOwnerOverwriteOnConflict(t *testing.T) {
+	t.Parallel()
+
+	store := openTempSQLiteStore(t)
+	defer func() { _ = store.Close() }()
+	ctx := context.Background()
+	createdAt := time.Date(2026, 4, 22, 11, 0, 0, 0, time.UTC)
+	updatedAt := createdAt.Add(time.Minute)
+	originalWorkflow := NewWorkflow(
+		`workflow-owner-locked`,
+		WorkflowStep{Kind: WorkflowStepKindWaitEvent, Name: `wait-confirm`, Value: `message.received`},
+	)
+	originalWorkflow.CurrentIndex = 1
+	originalWorkflow.WaitingFor = `message.received`
+	if err := store.SaveWorkflowInstance(ctx, WorkflowInstanceState{
+		WorkflowID:    `workflow-owner-locked`,
+		PluginID:      `plugin-workflow-demo`,
+		Status:        WorkflowRuntimeStatusWaitingEvent,
+		Workflow:      originalWorkflow,
+		LastEventID:   `evt-original`,
+		LastEventType: `message.received`,
+		CreatedAt:     createdAt,
+		UpdatedAt:     updatedAt,
+	}); err != nil {
+		t.Fatalf(`save original workflow instance: %v`, err)
+	}
+
+	overwriteAttempt := NewWorkflow(
+		`workflow-owner-locked`,
+		WorkflowStep{Kind: WorkflowStepKindCompensate, Name: `complete`},
+	)
+	err := store.SaveWorkflowInstance(ctx, WorkflowInstanceState{
+		WorkflowID:    `workflow-owner-locked`,
+		PluginID:      `plugin-admin`,
+		Status:        WorkflowRuntimeStatusCompleted,
+		Workflow:      overwriteAttempt,
+		LastEventID:   `evt-overwrite`,
+		LastEventType: `message.received`,
+		CreatedAt:     createdAt.Add(2 * time.Minute),
+		UpdatedAt:     updatedAt.Add(2 * time.Minute),
+	})
+	if err == nil {
+		t.Fatal(`expected owner overwrite conflict to fail`)
+	}
+	if err.Error() != `save workflow instance: workflow "workflow-owner-locked" is owned by plugin "plugin-workflow-demo", not "plugin-admin"` {
+		t.Fatalf(`expected owner overwrite error, got %v`, err)
+	}
+
+	loaded, err := store.LoadWorkflowInstance(ctx, `workflow-owner-locked`)
+	if err != nil {
+		t.Fatalf(`load workflow instance after rejected overwrite: %v`, err)
+	}
+	if loaded.PluginID != `plugin-workflow-demo` || loaded.Status != WorkflowRuntimeStatusWaitingEvent {
+		t.Fatalf(`expected original workflow owner/status after rejected overwrite, got %+v`, loaded)
+	}
+	if loaded.LastEventID != `evt-original` || loaded.LastEventType != `message.received` || loaded.Workflow.WaitingFor != `message.received` {
+		t.Fatalf(`expected original workflow payload after rejected overwrite, got %+v`, loaded)
+	}
+}

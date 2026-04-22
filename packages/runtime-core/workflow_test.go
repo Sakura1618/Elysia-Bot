@@ -2,6 +2,7 @@ package runtimecore
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 )
@@ -129,5 +130,86 @@ func TestWorkflowRuntimeRestoresPersistedSleepingWorkflow(t *testing.T) {
 	}
 	if persisted.Status != WorkflowRuntimeStatusCompleted || !persisted.Workflow.Completed {
 		t.Fatalf(`expected restored workflow to persist completed state, got %+v`, persisted)
+	}
+}
+
+func TestWorkflowRuntimeStartOrResumeRejectsOwnerMismatch(t *testing.T) {
+	t.Parallel()
+
+	store := openTempSQLiteStore(t)
+	defer func() { _ = store.Close() }()
+	runtime := NewWorkflowRuntime(store)
+	runtime.now = func() time.Time { return time.Date(2026, 4, 22, 10, 0, 0, 0, time.UTC) }
+	ctx := context.Background()
+	initial := NewWorkflow(
+		`wf-owner-mismatch`,
+		WorkflowStep{Kind: WorkflowStepKindPersist, Name: `greeting`, Value: `hello`},
+		WorkflowStep{Kind: WorkflowStepKindWaitEvent, Name: `wait`, Value: `message.received`},
+		WorkflowStep{Kind: WorkflowStepKindCompensate, Name: `complete`},
+	)
+
+	started, err := runtime.StartOrResume(ctx, `wf-owner-mismatch`, `plugin-workflow-demo`, `message.received`, `evt-start`, initial)
+	if err != nil {
+		t.Fatalf(`start workflow: %v`, err)
+	}
+	if !started.Started || started.Instance.PluginID != `plugin-workflow-demo` || started.Instance.Status != WorkflowRuntimeStatusWaitingEvent {
+		t.Fatalf(`expected started workflow to persist original owner, got %+v`, started)
+	}
+
+	_, err = runtime.StartOrResume(ctx, `wf-owner-mismatch`, `plugin-admin`, `message.received`, `evt-collision`, Workflow{})
+	if err == nil {
+		t.Fatal(`expected owner mismatch to reject resume/start collision`)
+	}
+	if !strings.Contains(err.Error(), `workflow "wf-owner-mismatch" is owned by plugin "plugin-workflow-demo", not "plugin-admin"`) {
+		t.Fatalf(`expected owner mismatch error, got %v`, err)
+	}
+
+	persisted, err := store.LoadWorkflowInstance(ctx, `wf-owner-mismatch`)
+	if err != nil {
+		t.Fatalf(`load workflow after owner mismatch: %v`, err)
+	}
+	if persisted.PluginID != `plugin-workflow-demo` || persisted.Status != WorkflowRuntimeStatusWaitingEvent {
+		t.Fatalf(`expected workflow owner/status to stay unchanged after mismatch, got %+v`, persisted)
+	}
+	if persisted.LastEventID != `evt-start` || persisted.LastEventType != `message.received` {
+		t.Fatalf(`expected mismatch to leave persisted event cursor unchanged, got %+v`, persisted)
+	}
+}
+
+func TestWorkflowRuntimeStartOrResumeKeepsOwnerOnMatchingResume(t *testing.T) {
+	t.Parallel()
+
+	store := openTempSQLiteStore(t)
+	defer func() { _ = store.Close() }()
+	runtime := NewWorkflowRuntime(store)
+	now := time.Date(2026, 4, 22, 10, 30, 0, 0, time.UTC)
+	runtime.now = func() time.Time { return now }
+	ctx := context.Background()
+	initial := NewWorkflow(
+		`wf-owner-stable`,
+		WorkflowStep{Kind: WorkflowStepKindWaitEvent, Name: `wait`, Value: `message.received`},
+		WorkflowStep{Kind: WorkflowStepKindCompensate, Name: `complete`},
+	)
+
+	if _, err := runtime.StartOrResume(ctx, `wf-owner-stable`, `plugin-workflow-demo`, `message.received`, `evt-start`, initial); err != nil {
+		t.Fatalf(`start workflow: %v`, err)
+	}
+	resumed, err := runtime.StartOrResume(ctx, `wf-owner-stable`, `plugin-workflow-demo`, `message.received`, `evt-resume`, Workflow{})
+	if err != nil {
+		t.Fatalf(`resume workflow: %v`, err)
+	}
+	if !resumed.Resumed || resumed.Instance.PluginID != `plugin-workflow-demo` || resumed.Instance.Status != WorkflowRuntimeStatusCompleted {
+		t.Fatalf(`expected matching resume to keep owner and complete workflow, got %+v`, resumed)
+	}
+
+	persisted, err := store.LoadWorkflowInstance(ctx, `wf-owner-stable`)
+	if err != nil {
+		t.Fatalf(`load resumed workflow: %v`, err)
+	}
+	if persisted.PluginID != `plugin-workflow-demo` || persisted.Status != WorkflowRuntimeStatusCompleted || !persisted.Workflow.Completed {
+		t.Fatalf(`expected persisted workflow owner to remain stable after resume, got %+v`, persisted)
+	}
+	if persisted.LastEventID != `evt-resume` || persisted.LastEventType != `message.received` {
+		t.Fatalf(`expected persisted workflow to record resume event, got %+v`, persisted)
 	}
 }

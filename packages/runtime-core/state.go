@@ -381,22 +381,36 @@ func (s *SQLiteStateStore) SaveWorkflowInstance(ctx context.Context, instance Wo
 	if err != nil {
 		return fmt.Errorf(`marshal workflow instance: %w`, err)
 	}
-	_, err = s.db.ExecContext(ctx, `
+	result, err := s.db.ExecContext(ctx, `
 INSERT INTO workflow_instances (
   workflow_id, plugin_id, status, workflow_json, last_event_id, last_event_type, created_at, updated_at
 )
 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(workflow_id) DO UPDATE SET
-  plugin_id=excluded.plugin_id,
   status=excluded.status,
   workflow_json=excluded.workflow_json,
   last_event_id=excluded.last_event_id,
   last_event_type=excluded.last_event_type,
   created_at=excluded.created_at,
   updated_at=excluded.updated_at
+WHERE workflow_instances.plugin_id = excluded.plugin_id
 `, instance.WorkflowID, instance.PluginID, string(instance.Status), string(payload), strings.TrimSpace(instance.LastEventID), strings.TrimSpace(instance.LastEventType), formatSQLiteTimestamp(createdAt), formatSQLiteTimestamp(updatedAt))
 	if err != nil {
 		return fmt.Errorf(`upsert workflow instance: %w`, err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf(`save workflow instance affected rows: %w`, err)
+	}
+	if affected == 0 {
+		stored, loadErr := s.LoadWorkflowInstance(ctx, instance.WorkflowID)
+		if loadErr == nil {
+			stored.PluginID = strings.TrimSpace(stored.PluginID)
+			if stored.PluginID != `` && stored.PluginID != instance.PluginID {
+				return fmt.Errorf(`save workflow instance: workflow %q is owned by plugin %q, not %q`, instance.WorkflowID, stored.PluginID, instance.PluginID)
+			}
+		}
+		return fmt.Errorf(`save workflow instance: workflow %q was not persisted`, instance.WorkflowID)
 	}
 	return nil
 }
@@ -1195,19 +1209,19 @@ func (s *SQLiteStateStore) HasIdempotencyKey(ctx context.Context, key string) (b
 
 func (s *SQLiteStateStore) Counts(ctx context.Context) (map[string]int, error) {
 	tables := map[string]string{
-		"event_journal":           `SELECT COUNT(*) FROM event_journal`,
-		"plugin_registry":         `SELECT COUNT(*) FROM plugin_registry`,
-		"plugin_enabled_overlays": `SELECT COUNT(*) FROM plugin_enabled_overlays`,
-		"plugin_configs":          `SELECT COUNT(*) FROM plugin_configs`,
-		"plugin_status_snapshots": `SELECT COUNT(*) FROM plugin_status_snapshots`,
-		"adapter_instances":       `SELECT COUNT(*) FROM adapter_instances`,
-		"sessions":                `SELECT COUNT(*) FROM sessions`,
-		"idempotency_keys":        `SELECT COUNT(*) FROM idempotency_keys`,
-		"jobs":                    `SELECT COUNT(*) FROM jobs`,
-		"alerts":                  `SELECT COUNT(*) FROM alerts`,
-		"schedule_plans":          `SELECT COUNT(*) FROM schedule_plans`,
-		"operator_identities":     `SELECT COUNT(*) FROM operator_identities`,
-		"rbac_snapshots":          `SELECT COUNT(*) FROM rbac_snapshots`,
+		"event_journal":             `SELECT COUNT(*) FROM event_journal`,
+		"plugin_registry":           `SELECT COUNT(*) FROM plugin_registry`,
+		"plugin_enabled_overlays":   `SELECT COUNT(*) FROM plugin_enabled_overlays`,
+		"plugin_configs":            `SELECT COUNT(*) FROM plugin_configs`,
+		"plugin_status_snapshots":   `SELECT COUNT(*) FROM plugin_status_snapshots`,
+		"adapter_instances":         `SELECT COUNT(*) FROM adapter_instances`,
+		"sessions":                  `SELECT COUNT(*) FROM sessions`,
+		"idempotency_keys":          `SELECT COUNT(*) FROM idempotency_keys`,
+		"jobs":                      `SELECT COUNT(*) FROM jobs`,
+		"alerts":                    `SELECT COUNT(*) FROM alerts`,
+		"schedule_plans":            `SELECT COUNT(*) FROM schedule_plans`,
+		"operator_identities":       `SELECT COUNT(*) FROM operator_identities`,
+		"rbac_snapshots":            `SELECT COUNT(*) FROM rbac_snapshots`,
 		"replay_operation_records":  `SELECT COUNT(*) FROM replay_operation_records`,
 		"rollout_operation_records": `SELECT COUNT(*) FROM rollout_operation_records`,
 	}

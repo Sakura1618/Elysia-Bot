@@ -13,6 +13,7 @@ func TestMetricsRegistryRendersPrometheusOutput(t *testing.T) {
 	metrics.RecordEventThroughput()
 	metrics.RecordHandlerLatency("plugin-echo", 12*time.Millisecond)
 	metrics.RecordPluginError("plugin-echo")
+	metrics.RecordSubprocessFailure("plugin-echo", "dispatch", "response_timeout")
 	metrics.SetQueueLag(3)
 	metrics.SetJobStatusCount(JobStatusRetrying, 2)
 	metrics.IncrementJobRecoveries()
@@ -25,6 +26,7 @@ func TestMetricsRegistryRendersPrometheusOutput(t *testing.T) {
 		"bot_platform_event_throughput_total 1",
 		"bot_platform_handler_latency_ms{plugin_id=\"plugin-echo\"} 12",
 		"bot_platform_plugin_errors_total{plugin_id=\"plugin-echo\"} 1",
+		"bot_platform_subprocess_failures_total{plugin_id=\"plugin-echo\",failure_stage=\"dispatch\",failure_reason=\"response_timeout\"} 1",
 		"bot_platform_queue_lag 3",
 		"bot_platform_job_status_total{status=\"retrying\"} 2",
 		"bot_platform_job_recoveries_total 1",

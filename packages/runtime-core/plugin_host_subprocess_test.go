@@ -136,6 +136,185 @@ func TestSubprocessPluginHostIsolatesProcessesPerPlugin(t *testing.T) {
 	}
 }
 
+func TestSubprocessPluginHostHandlesChildReplyTextCallbackBeforeTerminalEventResponse(t *testing.T) {
+	t.Parallel()
+
+	host := NewSubprocessPluginHost(testPluginProcessFactory(t, "reply-text-callback"))
+	t.Cleanup(func() { shutdownSubprocessHostForTest(host) })
+	var gotHandle eventmodel.ReplyHandle
+	var gotText string
+	host.SetReplyTextCallback(func(handle eventmodel.ReplyHandle, text string) error {
+		gotHandle = handle
+		gotText = text
+		return nil
+	})
+	plugin := testPluginDefinition()
+	event := eventmodel.Event{
+		EventID:        "evt-host-reply",
+		TraceID:        "trace-host-reply",
+		Source:         "onebot",
+		Type:           "message.received",
+		Timestamp:      time.Date(2026, 4, 22, 12, 0, 0, 0, time.UTC),
+		IdempotencyKey: "onebot:reply-text-callback",
+		Message:        &eventmodel.Message{ID: "msg-1", Text: "hello from child"},
+		Reply: &eventmodel.ReplyHandle{
+			Capability: "onebot.reply",
+			TargetID:   "group-42",
+			MessageID:  "msg-1",
+			Metadata: map[string]any{
+				"trace_id":  "trace-host-reply",
+				"event_id":  "evt-host-reply",
+				"plugin_id": plugin.Manifest.ID,
+			},
+		},
+	}
+
+	if err := host.DispatchEvent(context.Background(), plugin, event, eventmodel.ExecutionContext{TraceID: event.TraceID, EventID: event.EventID, Reply: event.Reply}); err != nil {
+		t.Fatalf("dispatch event with reply_text callback: %v", err)
+	}
+	if gotText != "callback: hello from child" {
+		t.Fatalf("expected callback text, got %q", gotText)
+	}
+	if gotHandle.Capability != "onebot.reply" || gotHandle.TargetID != "group-42" || gotHandle.MessageID != "msg-1" {
+		t.Fatalf("unexpected reply handle %+v", gotHandle)
+	}
+	stdout := strings.Join(host.StdoutLines(), "\n")
+	for _, marker := range []string{"handshake-ready", `"callback":"reply_text"`, "event-ok"} {
+		if !strings.Contains(stdout, marker) {
+			t.Fatalf("expected stdout to include %q, got %s", marker, stdout)
+		}
+	}
+}
+
+func TestSubprocessPluginHostHandlesWorkflowStartOrResumeCallbackBeforeTerminalEventResponse(t *testing.T) {
+	t.Parallel()
+
+	host := NewSubprocessPluginHost(testPluginProcessFactory(t, "workflow-start-or-resume-callback"))
+	t.Cleanup(func() { shutdownSubprocessHostForTest(host) })
+	var got SubprocessWorkflowStartOrResumeRequest
+	host.SetWorkflowStartOrResumeCallback(func(ctx context.Context, request SubprocessWorkflowStartOrResumeRequest) (WorkflowTransition, error) {
+		got = request
+		transition := WorkflowTransition{Started: true}
+		transition.Instance = WorkflowInstanceState{
+			WorkflowID:    request.WorkflowID,
+			PluginID:      request.PluginID,
+			Status:        WorkflowRuntimeStatusWaitingEvent,
+			Workflow:      request.Initial,
+			LastEventID:   request.EventID,
+			LastEventType: request.EventType,
+		}
+		return transition, nil
+	})
+	plugin := pluginsdk.Plugin{Manifest: pluginsdk.PluginManifest{ID: "plugin-routed-parent", Name: "Routed Parent", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, Entry: pluginsdk.PluginEntry{Module: "plugins/routed-parent", Symbol: "Plugin"}}}
+	event := eventmodel.Event{
+		EventID:        "evt-host-workflow",
+		TraceID:        "trace-host-workflow",
+		Source:         "runtime-workflow-demo",
+		Type:           "message.received",
+		Timestamp:      time.Date(2026, 4, 22, 12, 10, 0, 0, time.UTC),
+		IdempotencyKey: "workflow:callback",
+		Actor:          &eventmodel.Actor{ID: "user-1", Type: "user"},
+		Message:        &eventmodel.Message{ID: "msg-workflow", Text: "start workflow"},
+	}
+
+	if err := host.DispatchEvent(context.Background(), plugin, event, eventmodel.ExecutionContext{TraceID: event.TraceID, EventID: event.EventID}); err != nil {
+		t.Fatalf("dispatch event with workflow_start_or_resume callback: %v", err)
+	}
+	if got.WorkflowID != "workflow-user-1" || got.PluginID != plugin.Manifest.ID || got.EventType != event.Type || got.EventID != event.EventID {
+		t.Fatalf("unexpected workflow callback request %+v", got)
+	}
+	if got.PluginID == "plugin-subprocess-demo" {
+		t.Fatalf("expected routed parent plugin identity to override child callback payload, got %+v", got)
+	}
+	if got.Initial.WaitingFor != "" || len(got.Initial.State) != 0 || len(got.Initial.Steps) != 3 || got.Initial.Steps[0].Name != "greeting" || got.Initial.Steps[0].Value != "start workflow" {
+		t.Fatalf("unexpected workflow callback initial state %+v", got.Initial)
+	}
+	stdout := strings.Join(host.StdoutLines(), "\n")
+	for _, marker := range []string{"handshake-ready", `"callback":"workflow_start_or_resume"`, `"workflow_id":"workflow-user-1"`, "event-ok"} {
+		if !strings.Contains(stdout, marker) {
+			t.Fatalf("expected stdout to include %q, got %s", marker, stdout)
+		}
+	}
+}
+
+func TestSubprocessPluginHostFailsClosedWhenCommandFactoryReturnsLaunchGuardError(t *testing.T) {
+	t.Parallel()
+
+	logs := &bytes.Buffer{}
+	tracer := NewTraceRecorder()
+	metrics := NewMetricsRegistry()
+	host := NewSubprocessPluginHostWithErrorFactory(func(context.Context) (*exec.Cmd, error) {
+		return nil, errors.New(`subprocess launch guard blocked start: launch guard working directory "D:\\outside" escapes workspace root "D:\\repo"`)
+	})
+	host.SetObservability(NewLogger(logs), tracer, metrics)
+	plugin := testPluginDefinition()
+	ctx := eventmodel.ExecutionContext{TraceID: "trace-launch-guard", EventID: "evt-launch-guard", PluginID: plugin.Manifest.ID, CorrelationID: "corr-launch-guard"}
+
+	err := host.DispatchEvent(context.Background(), plugin, testPluginEvent(), ctx)
+	if err == nil || !strings.Contains(err.Error(), "subprocess start failed") || !strings.Contains(err.Error(), "subprocess launch guard blocked start") || !strings.Contains(err.Error(), `working directory "D:\\outside" escapes workspace root`) {
+		t.Fatalf("expected fail-closed launch guard error, got %v", err)
+	}
+	if stdout := strings.Join(host.StdoutLines(), "\n"); stdout != "" {
+		t.Fatalf("expected fail-closed launch guard to skip handshake stdout, got %s", stdout)
+	}
+	if stderr := strings.Join(host.StderrLines(), "\n"); stderr != "" {
+		t.Fatalf("expected fail-closed launch guard to skip subprocess stderr, got %s", stderr)
+	}
+	for _, expected := range []string{"subprocess host process bootstrap failed", `"failure_stage":"start"`, `"failure_reason":"launcher_guard_blocked"`, `"plugin_id":"plugin-subprocess-demo"`} {
+		if !strings.Contains(logs.String(), expected) {
+			t.Fatalf("expected fail-closed launch guard log %q, got %s", expected, logs.String())
+		}
+	}
+	renderedTrace := tracer.RenderTrace("trace-launch-guard")
+	if !strings.Contains(renderedTrace, "plugin_host.process_bootstrap") {
+		t.Fatalf("expected bootstrap trace for fail-closed launch guard, got %s", renderedTrace)
+	}
+	for _, expected := range []string{
+		`bot_platform_subprocess_failures_total{plugin_id="plugin-subprocess-demo",failure_stage="start",failure_reason="launcher_guard_blocked"} 1`,
+		`bot_platform_plugin_errors_total{plugin_id="plugin-subprocess-demo"} 1`,
+	} {
+		if !strings.Contains(metrics.RenderPrometheus(), expected) {
+			t.Fatalf("expected fail-closed launch guard metric %q, got %s", expected, metrics.RenderPrometheus())
+		}
+	}
+}
+
+func TestSubprocessPluginHostEnforcesRestartBudgetWithAssertableTelemetry(t *testing.T) {
+	t.Parallel()
+
+	logs := &bytes.Buffer{}
+	tracer := NewTraceRecorder()
+	metrics := NewMetricsRegistry()
+	host := NewSubprocessPluginHost(testPluginProcessFactory(t, "crash-after-handshake"))
+	host.SetObservability(NewLogger(logs), tracer, metrics)
+	host.SetRestartBudget(1, time.Minute)
+	plugin := testPluginDefinition()
+	ctx := eventmodel.ExecutionContext{TraceID: "trace-restart-budget", EventID: "evt-restart-budget", PluginID: plugin.Manifest.ID}
+
+	err := host.DispatchEvent(context.Background(), plugin, testPluginEvent(), ctx)
+	if err == nil || !strings.Contains(err.Error(), "subprocess dispatch failed after handshake") {
+		t.Fatalf("expected first dispatch to classify crash-after-handshake, got %v", err)
+	}
+	err = host.DispatchEvent(context.Background(), plugin, testPluginEvent(), ctx)
+	if err == nil || !strings.Contains(err.Error(), "restart budget exhausted") {
+		t.Fatalf("expected restart budget guard on second dispatch, got %v", err)
+	}
+	for _, expected := range []string{"subprocess host process bootstrap failed", `"failure_reason":"launcher_guard_blocked"`, `"failure_stage":"start"`} {
+		if !strings.Contains(logs.String(), expected) {
+			t.Fatalf("expected restart budget log %q, got %s", expected, logs.String())
+		}
+	}
+	rendered := metrics.RenderPrometheus()
+	for _, expected := range []string{
+		`bot_platform_subprocess_failures_total{plugin_id="plugin-subprocess-demo",failure_stage="dispatch",failure_reason="crash_after_handshake"} 1`,
+		`bot_platform_subprocess_failures_total{plugin_id="plugin-subprocess-demo",failure_stage="start",failure_reason="launcher_guard_blocked"} 2`,
+	} {
+		if !strings.Contains(rendered, expected) {
+			t.Fatalf("expected subprocess failure metric %q, got %s", expected, rendered)
+		}
+	}
+}
+
 func TestSubprocessPluginHostRejectsIncompatibleManifestBeforeProcessLaunch(t *testing.T) {
 	t.Parallel()
 
@@ -3987,10 +4166,10 @@ func TestBuildSubprocessHostRequestRejectsBeyondSupportedDeeperNestedRequiredEnu
 	t.Parallel()
 
 	cases := []struct {
-		name          string
-		pluginID      string
+		name           string
+		pluginID       string
 		instanceConfig map[string]any
-		wantErr       string
+		wantErr        string
 		wantActualType string
 	}{
 		{name: "boolean", pluginID: "plugin-instance-config-beyond-supported-deeper-nested-required-enum-default-explicit-object-node-bad-value-request", instanceConfig: map[string]any{"settings": map[string]any{"labels": map[string]any{"naming": true}}}, wantErr: `nested instance config property "settings.labels.naming" value type must match declared type "object", got "boolean"`, wantActualType: "boolean"},
@@ -4712,10 +4891,14 @@ func TestHelperPluginProcess(t *testing.T) {
 		os.Exit(0)
 	}
 
-	reader := bufio.NewScanner(os.Stdin)
+	reader := bufio.NewReader(os.Stdin)
 	crashed := false
-	for reader.Scan() {
-		line := reader.Text()
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			break
+		}
+		line = strings.TrimSpace(line)
 		if strings.Contains(line, `"type":"health"`) {
 			if mode == "hang-health" {
 				time.Sleep(5 * time.Second)
@@ -4725,6 +4908,129 @@ func TestHelperPluginProcess(t *testing.T) {
 			continue
 		}
 		if strings.Contains(line, `"type":"event"`) {
+			if mode == "reply-text-callback" {
+				var requestEnvelope map[string]json.RawMessage
+				if err := json.Unmarshal([]byte(line), &requestEnvelope); err != nil {
+					_, _ = os.Stdout.WriteString("{\"type\":\"event\",\"status\":\"error\",\"error\":\"failed to decode host request envelope\"}\n")
+					continue
+				}
+				rawEvent, ok := requestEnvelope["event"]
+				if !ok {
+					_, _ = os.Stdout.WriteString("{\"type\":\"event\",\"status\":\"error\",\"error\":\"missing event payload\"}\n")
+					continue
+				}
+				var payload struct {
+					Event eventmodel.Event            `json:"event"`
+					Ctx   eventmodel.ExecutionContext `json:"ctx"`
+				}
+				if err := json.Unmarshal(rawEvent, &payload); err != nil {
+					_, _ = os.Stdout.WriteString("{\"type\":\"event\",\"status\":\"error\",\"error\":\"failed to decode event payload\"}\n")
+					continue
+				}
+				if payload.Ctx.Reply == nil {
+					_, _ = os.Stdout.WriteString("{\"type\":\"event\",\"status\":\"error\",\"error\":\"missing reply handle\"}\n")
+					continue
+				}
+				callbackEnvelope := map[string]any{
+					"type":     "callback",
+					"callback": "reply_text",
+					"reply_text": map[string]any{
+						"handle": payload.Ctx.Reply,
+						"text":   "callback: " + payload.Event.Message.Text,
+					},
+				}
+				encoded, err := json.Marshal(callbackEnvelope)
+				if err != nil {
+					_, _ = os.Stdout.WriteString("{\"type\":\"event\",\"status\":\"error\",\"error\":\"failed to encode callback envelope\"}\n")
+					continue
+				}
+				_, _ = os.Stdout.WriteString(string(encoded) + "\n")
+				ackLine, err := reader.ReadString('\n')
+				if err != nil {
+					_, _ = os.Stdout.WriteString("{\"type\":\"event\",\"status\":\"error\",\"error\":\"failed to read callback ack\"}\n")
+					continue
+				}
+				var ack hostCallbackResult
+				if err := json.Unmarshal([]byte(strings.TrimSpace(ackLine)), &ack); err != nil {
+					_, _ = os.Stdout.WriteString("{\"type\":\"event\",\"status\":\"error\",\"error\":\"failed to decode callback ack\"}\n")
+					continue
+				}
+				if ack.Type != "callback_result" || ack.Status != "ok" {
+					_, _ = os.Stdout.WriteString("{\"type\":\"event\",\"status\":\"error\",\"error\":\"unexpected callback ack\"}\n")
+					continue
+				}
+				_, _ = os.Stdout.WriteString("{\"type\":\"event\",\"status\":\"ok\",\"message\":\"event-ok\"}\n")
+				continue
+			}
+			if mode == "workflow-start-or-resume-callback" {
+				var requestEnvelope map[string]json.RawMessage
+				if err := json.Unmarshal([]byte(line), &requestEnvelope); err != nil {
+					_, _ = os.Stdout.WriteString("{\"type\":\"event\",\"status\":\"error\",\"error\":\"failed to decode host request envelope\"}\n")
+					continue
+				}
+				rawEvent, ok := requestEnvelope["event"]
+				if !ok {
+					_, _ = os.Stdout.WriteString("{\"type\":\"event\",\"status\":\"error\",\"error\":\"missing event payload\"}\n")
+					continue
+				}
+				var payload struct {
+					Event eventmodel.Event            `json:"event"`
+					Ctx   eventmodel.ExecutionContext `json:"ctx"`
+				}
+				if err := json.Unmarshal(rawEvent, &payload); err != nil {
+					_, _ = os.Stdout.WriteString("{\"type\":\"event\",\"status\":\"error\",\"error\":\"failed to decode event payload\"}\n")
+					continue
+				}
+				greeting := ""
+				if payload.Event.Message != nil {
+					greeting = payload.Event.Message.Text
+				}
+				workflowID := "workflow-anon"
+				if payload.Event.Actor != nil && strings.TrimSpace(payload.Event.Actor.ID) != "" {
+					workflowID = "workflow-" + payload.Event.Actor.ID
+				}
+				callbackEnvelope := map[string]any{
+					"type":     "callback",
+					"callback": "workflow_start_or_resume",
+					"workflow_start_or_resume": map[string]any{
+						"workflow_id": workflowID,
+						"plugin_id":   "plugin-subprocess-demo",
+						"event_type":  payload.Event.Type,
+						"event_id":    payload.Event.EventID,
+						"initial": map[string]any{
+							"id":           workflowID,
+							"steps":        []map[string]any{{"kind": "persist_state", "name": "greeting", "value": greeting}, {"kind": "wait_event", "name": "wait-confirm", "value": "message.received"}, {"kind": "compensate", "name": "complete"}},
+							"currentIndex": 0,
+							"state":        map[string]any{},
+							"waitingFor":   "",
+							"completed":    false,
+							"compensated":  false,
+						},
+					},
+				}
+				encoded, err := json.Marshal(callbackEnvelope)
+				if err != nil {
+					_, _ = os.Stdout.WriteString("{\"type\":\"event\",\"status\":\"error\",\"error\":\"failed to encode workflow callback envelope\"}\n")
+					continue
+				}
+				_, _ = os.Stdout.WriteString(string(encoded) + "\n")
+				ackLine, err := reader.ReadString('\n')
+				if err != nil {
+					_, _ = os.Stdout.WriteString("{\"type\":\"event\",\"status\":\"error\",\"error\":\"failed to read workflow callback ack\"}\n")
+					continue
+				}
+				var ack hostCallbackResult
+				if err := json.Unmarshal([]byte(strings.TrimSpace(ackLine)), &ack); err != nil {
+					_, _ = os.Stdout.WriteString("{\"type\":\"event\",\"status\":\"error\",\"error\":\"failed to decode workflow callback ack\"}\n")
+					continue
+				}
+				if ack.Type != "callback_result" || ack.Status != "ok" || ack.WorkflowStartOrResume == nil || !ack.WorkflowStartOrResume.Started {
+					_, _ = os.Stdout.WriteString("{\"type\":\"event\",\"status\":\"error\",\"error\":\"unexpected workflow callback ack\"}\n")
+					continue
+				}
+				_, _ = os.Stdout.WriteString("{\"type\":\"event\",\"status\":\"ok\",\"message\":\"event-ok\"}\n")
+				continue
+			}
 			if mode == "assert-instance-config" {
 				var requestEnvelope map[string]json.RawMessage
 				if err := json.Unmarshal([]byte(line), &requestEnvelope); err != nil {
