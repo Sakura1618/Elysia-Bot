@@ -285,7 +285,7 @@ func (s *Scheduler) Restore(ctx context.Context) error {
 				recovery.RecoveredSchedules++
 				recovery.RecoveredClaims++
 				if s.metrics != nil {
-					s.metrics.IncrementScheduleRecoveries()
+					s.metrics.IncrementScheduleRecovery("recovered_claim")
 				}
 			}
 		}
@@ -310,7 +310,7 @@ func (s *Scheduler) Restore(ctx context.Context) error {
 			}
 			recovery.RecoveredSchedules++
 			if s.metrics != nil {
-				s.metrics.IncrementScheduleRecoveries()
+				s.metrics.IncrementScheduleRecovery("recomputed_due_at")
 			}
 		}
 		restoredPlans[stored.Plan.ID] = stored.Plan
@@ -324,13 +324,13 @@ func (s *Scheduler) Restore(ctx context.Context) error {
 	s.lastRecovery = recovery
 	s.mu.Unlock()
 	if s.logger != nil {
-		_ = s.logger.Log("info", "scheduler restored from persistence", LogContext{}, map[string]any{
+		_ = s.logger.Log("info", "scheduler restored from persistence", LogContext{}, BaselineLogFields("scheduler", "recover", map[string]any{
 			"restored_schedules":        recovery.TotalSchedules,
 			"recovered_schedules":       recovery.RecoveredSchedules,
 			"recovered_schedule_claims": recovery.RecoveredClaims,
 			"invalid_schedules":         recovery.InvalidSchedules,
 			"persisted_schedule_kinds":  recovery.ScheduleKinds,
-		})
+		}))
 	}
 	return nil
 }

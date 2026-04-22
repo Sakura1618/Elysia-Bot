@@ -213,3 +213,48 @@ func TestWorkflowRuntimeStartOrResumeKeepsOwnerOnMatchingResume(t *testing.T) {
 		t.Fatalf(`expected persisted workflow to record resume event, got %+v`, persisted)
 	}
 }
+
+func TestWorkflowRuntimeStartOrResumeRecordsWave2CMetrics(t *testing.T) {
+	t.Parallel()
+
+	store := openTempSQLiteStore(t)
+	defer func() { _ = store.Close() }()
+	metrics := NewMetricsRegistry()
+	runtime := NewWorkflowRuntime(store)
+	runtime.SetMetrics(metrics)
+	now := time.Date(2026, 4, 22, 11, 0, 0, 0, time.UTC)
+	runtime.now = func() time.Time { return now }
+	ctx := context.Background()
+	initial := NewWorkflow(
+		`wf-metrics`,
+		WorkflowStep{Kind: WorkflowStepKindWaitEvent, Name: `wait`, Value: `message.received`},
+		WorkflowStep{Kind: WorkflowStepKindCompensate, Name: `complete`},
+	)
+
+	started, err := runtime.StartOrResume(ctx, `wf-metrics`, `plugin-workflow-demo`, `message.received`, `evt-start`, initial)
+	if err != nil {
+		t.Fatalf(`start workflow: %v`, err)
+	}
+	if !started.Started || started.Instance.Status != WorkflowRuntimeStatusWaitingEvent {
+		t.Fatalf(`expected waiting workflow after start, got %+v`, started)
+	}
+	resumed, err := runtime.StartOrResume(ctx, `wf-metrics`, `plugin-workflow-demo`, `message.received`, `evt-resume`, Workflow{})
+	if err != nil {
+		t.Fatalf(`resume workflow: %v`, err)
+	}
+	if !resumed.Resumed || resumed.Instance.Status != WorkflowRuntimeStatusCompleted {
+		t.Fatalf(`expected completed workflow after resume, got %+v`, resumed)
+	}
+
+	output := metrics.RenderPrometheus()
+	for _, expected := range []string{
+		`bot_platform_workflow_transition_total{plugin_id="plugin-workflow-demo",outcome="started"} 1`,
+		`bot_platform_workflow_transition_total{plugin_id="plugin-workflow-demo",outcome="resumed"} 1`,
+		`bot_platform_workflow_instance_count{status="completed"} 1`,
+		`bot_platform_workflow_instance_count{status="waiting_event"} 0`,
+	} {
+		if !strings.Contains(output, expected) {
+			t.Fatalf(`expected workflow metrics output to contain %q, got %s`, expected, output)
+		}
+	}
+}

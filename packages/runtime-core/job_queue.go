@@ -505,7 +505,7 @@ func (q *JobQueue) Restore(ctx context.Context) error {
 			recovery.RecoveredJobs++
 			recovery.RecoveredRunning++
 			if q.metrics != nil {
-				q.metrics.IncrementJobRecoveries()
+				q.metrics.IncrementJobRecovery("recovered_running")
 			}
 			q.observeLifecycle("job.recovered", recovered)
 		}
@@ -768,7 +768,7 @@ func (q *JobQueue) syncMetricsLocked() {
 	if q.metrics == nil {
 		return
 	}
-	lag := 0
+	active := 0
 	counts := map[JobStatus]int{
 		JobStatusPending:   0,
 		JobStatusRunning:   0,
@@ -781,12 +781,12 @@ func (q *JobQueue) syncMetricsLocked() {
 	for _, job := range q.jobs {
 		counts[job.Status]++
 		if job.Status != JobStatusDone && job.Status != JobStatusDead && job.Status != JobStatusCancelled {
-			lag++
+			active++
 		}
 	}
-	q.metrics.SetQueueLag(lag)
+	q.metrics.SetJobQueueActiveCount(active)
 	for status, count := range counts {
-		q.metrics.SetJobStatusCount(status, count)
+		q.metrics.SetJobCount(status, count)
 	}
 }
 

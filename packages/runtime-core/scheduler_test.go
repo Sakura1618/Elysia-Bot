@@ -1,7 +1,9 @@
 package runtimecore
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -945,6 +947,50 @@ func TestSchedulerRestoreLoadsPersistedPlansIntoRuntimeState(t *testing.T) {
 	}
 }
 
+func TestSchedulerRestoreLogsStructuredBaseline(t *testing.T) {
+	t.Parallel()
+
+	store := openTempSQLiteStore(t)
+	defer func() { _ = store.Close() }()
+
+	createdAt := time.Date(2026, 4, 8, 12, 0, 0, 0, time.UTC)
+	dueAt := time.Date(2026, 4, 8, 12, 0, 30, 0, time.UTC)
+	if err := store.SaveSchedulePlan(context.Background(), storedSchedulePlan{
+		Plan: SchedulePlan{
+			ID:        "restore-delay-log",
+			Kind:      ScheduleKindDelay,
+			Delay:     30 * time.Second,
+			Source:    "scheduler",
+			EventType: "schedule.triggered",
+		},
+		DueAt:     &dueAt,
+		CreatedAt: createdAt,
+		UpdatedAt: createdAt,
+	}); err != nil {
+		t.Fatalf("save delay schedule plan: %v", err)
+	}
+
+	logs := &bytes.Buffer{}
+	scheduler := NewScheduler()
+	scheduler.now = func() time.Time { return createdAt.Add(5 * time.Second) }
+	scheduler.SetStore(store)
+	scheduler.SetObservability(NewLogger(logs), nil, NewMetricsRegistry())
+	if err := scheduler.Restore(context.Background()); err != nil {
+		t.Fatalf("restore scheduler: %v", err)
+	}
+
+	entries := decodeSchedulerLogEntries(t, logs)
+	if len(entries) != 1 {
+		t.Fatalf("expected one scheduler recovery log entry, got %+v", entries)
+	}
+	if entries[0].Message != "scheduler restored from persistence" {
+		t.Fatalf("expected scheduler recovery message, got %+v", entries[0])
+	}
+	if entries[0].Fields["component"] != "scheduler" || entries[0].Fields["operation"] != "recover" {
+		t.Fatalf("expected scheduler recovery baseline fields, got %+v", entries[0])
+	}
+}
+
 func TestSchedulerRestoreCountsRecoveredMissingDueAtAndInvalidPlans(t *testing.T) {
 	t.Parallel()
 
@@ -1021,9 +1067,30 @@ func TestSchedulerRestoreCountsRecoveredMissingDueAtAndInvalidPlans(t *testing.T
 	if _, ok := scheduler.dueAt["restore-cron-invalid"]; ok {
 		t.Fatal("expected invalid persisted schedule to be skipped during restore")
 	}
-	if output := metrics.RenderPrometheus(); !strings.Contains(output, "bot_platform_schedule_recoveries_total 1") {
+	if output := metrics.RenderPrometheus(); !strings.Contains(output, `bot_platform_schedule_recovery_total{outcome="recomputed_due_at"} 1`) {
 		t.Fatalf("expected metrics to count recovered schedules, got %s", output)
 	}
+}
+
+func decodeSchedulerLogEntries(t *testing.T, logs *bytes.Buffer) []LogEntry {
+	t.Helper()
+	raw := strings.TrimSpace(logs.String())
+	if raw == "" {
+		return nil
+	}
+	lines := strings.Split(raw, "\n")
+	entries := make([]LogEntry, 0, len(lines))
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var entry LogEntry
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatalf("decode scheduler log entry %q: %v", line, err)
+		}
+		entries = append(entries, entry)
+	}
+	return entries
 }
 
 func TestSchedulerRestoreRecoversAbandonedClaimedDelayPlanAndCatchesUpOnce(t *testing.T) {

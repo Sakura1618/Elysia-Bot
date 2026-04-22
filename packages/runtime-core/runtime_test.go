@@ -340,7 +340,7 @@ func TestRuntimeDispatchRecordsObservability(t *testing.T) {
 		t.Fatalf("expected runtime and plugin spans, got %s", rendered)
 	}
 	output := metrics.RenderPrometheus()
-	if !strings.Contains(output, "bot_platform_event_throughput_total 1") || !strings.Contains(output, "bot_platform_handler_latency_ms{plugin_id=\"plugin-echo\"}") {
+	if !strings.Contains(output, `bot_platform_runtime_dispatch_total{plugin_id="plugin-echo",operation="event",outcome="success"} 1`) || !strings.Contains(output, `bot_platform_runtime_dispatch_last_duration_ms{plugin_id="plugin-echo",operation="event"}`) {
 		t.Fatalf("expected dispatch metrics, got %s", output)
 	}
 }

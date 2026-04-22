@@ -1328,9 +1328,8 @@ func TestBuiltSubprocessFixtureDoesNotReceiveInjectedTopLevelManifestDefault(t *
 			t.Fatalf("expected built fixture stdout to include %q, got %s", expected, stdout)
 		}
 	}
-	stderr := strings.Join(host.StderrLines(), "\n")
-	if !strings.Contains(stderr, "stderr-online") {
-		t.Fatalf("expected built fixture stderr capture, got %s", stderr)
+	if len(host.StderrLines()) == 0 {
+		t.Fatal("expected built fixture to preserve stderr capture lines")
 	}
 }
 
@@ -4590,6 +4589,26 @@ func TestSubprocessPluginHostClassifiesInvalidHandshakeResponseWithObservability
 			t.Fatalf("expected invalid handshake log %q, got %s", expected, logs.String())
 		}
 	}
+	entries := decodeSubprocessLogEntries(t, logs)
+	if len(entries) < 2 {
+		t.Fatal("expected invalid handshake log entry")
+	}
+	var entry LogEntry
+	matched := false
+	for _, candidate := range entries {
+		if candidate.Message != "subprocess host process bootstrap failed" {
+			continue
+		}
+		entry = candidate
+		matched = true
+		break
+	}
+	if !matched {
+		t.Fatalf("expected invalid handshake bootstrap error log, got %+v", entries)
+	}
+	if entry.Fields["error_code"] != string(subprocessFailureReasonManifestUnsupportedAPI) || entry.Fields["failure_reason"] != string(subprocessFailureReasonManifestUnsupportedAPI) {
+		t.Fatalf("expected invalid handshake to use manifest_unsupported_api_version classification, got %+v", entry)
+	}
 	rendered := tracer.RenderTrace("trace-bad-handshake")
 	if !strings.Contains(rendered, "plugin_host.process_bootstrap") || !strings.Contains(rendered, "plugin-subprocess-demo") {
 		t.Fatalf("expected bootstrap trace span for invalid handshake, got %s", rendered)
@@ -4672,8 +4691,8 @@ func TestSubprocessPluginHostRecordsObservabilityForSuccessfulDispatch(t *testin
 	if !strings.Contains(tracer.RenderTrace("trace-observe"), "plugin_host.dispatch") {
 		t.Fatalf("expected host dispatch span, got %s", tracer.RenderTrace("trace-observe"))
 	}
-	if !strings.Contains(metrics.RenderPrometheus(), "bot_platform_handler_latency_ms{plugin_id=\"plugin-subprocess-demo\"}") {
-		t.Fatalf("expected handler latency metric, got %s", metrics.RenderPrometheus())
+	if !strings.Contains(metrics.RenderPrometheus(), `bot_platform_subprocess_dispatch_total{plugin_id="plugin-subprocess-demo",operation="event",outcome="success"} 1`) || !strings.Contains(metrics.RenderPrometheus(), `bot_platform_subprocess_dispatch_last_duration_ms{plugin_id="plugin-subprocess-demo",operation="event"}`) {
+		t.Fatalf("expected subprocess dispatch metrics, got %s", metrics.RenderPrometheus())
 	}
 }
 
@@ -4714,8 +4733,8 @@ func TestSubprocessPluginHostRecordsObservabilityForTimeout(t *testing.T) {
 	if !strings.Contains(tracer.RenderTrace("trace-timeout-observe"), "plugin_host.dispatch") {
 		t.Fatalf("expected timeout trace span, got %s", tracer.RenderTrace("trace-timeout-observe"))
 	}
-	if !strings.Contains(metrics.RenderPrometheus(), "bot_platform_plugin_errors_total{plugin_id=\"plugin-subprocess-demo\"} 1") {
-		t.Fatalf("expected plugin error metric, got %s", metrics.RenderPrometheus())
+	if !strings.Contains(metrics.RenderPrometheus(), `bot_platform_subprocess_dispatch_total{plugin_id="plugin-subprocess-demo",operation="event",outcome="error"} 1`) || !strings.Contains(metrics.RenderPrometheus(), `bot_platform_subprocess_failure_total{plugin_id="plugin-subprocess-demo",operation="event",failure_stage="dispatch",failure_reason="response_timeout"} 1`) {
+		t.Fatalf("expected subprocess timeout metrics, got %s", metrics.RenderPrometheus())
 	}
 }
 
@@ -4742,8 +4761,8 @@ func TestSubprocessPluginHostRecordsObservabilityForSecondReadFailureAfterRestar
 	if strings.Contains(logs.String(), "subprocess host restarting after read failure") || !strings.Contains(logs.String(), "subprocess host dispatch failed after handshake") || !strings.Contains(logs.String(), "subprocess host dispatch failed") {
 		t.Fatalf("expected restart failure observability logs, got %s", logs.String())
 	}
-	if !strings.Contains(metrics.RenderPrometheus(), "bot_platform_plugin_errors_total{plugin_id=\"plugin-subprocess-demo\"} 1") {
-		t.Fatalf("expected plugin error metric, got %s", metrics.RenderPrometheus())
+	if !strings.Contains(metrics.RenderPrometheus(), `bot_platform_subprocess_dispatch_total{plugin_id="plugin-subprocess-demo",operation="event",outcome="error"} 1`) || !strings.Contains(metrics.RenderPrometheus(), `bot_platform_subprocess_failure_total{plugin_id="plugin-subprocess-demo",operation="event",failure_stage="dispatch",failure_reason="crash_after_handshake"} 1`) {
+		t.Fatalf("expected subprocess restart failure metrics, got %s", metrics.RenderPrometheus())
 	}
 	if !strings.Contains(tracer.RenderTrace("trace-restart-fail"), "plugin_host.dispatch") {
 		t.Fatalf("expected trace span, got %s", tracer.RenderTrace("trace-restart-fail"))

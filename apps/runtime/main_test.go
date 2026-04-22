@@ -734,7 +734,7 @@ func TestRuntimeAppDefaultPluginHostRoutingCrashRecoversWorkflowSubprocessAndExp
 	if metricsResp.Code != http.StatusOK {
 		t.Fatalf("expected metrics 200 after subprocess crash, got %d: %s", metricsResp.Code, metricsResp.Body.String())
 	}
-	if !strings.Contains(metricsResp.Body.String(), `bot_platform_handler_latency_ms{plugin_id="plugin-workflow-demo"}`) {
+	if !strings.Contains(metricsResp.Body.String(), `bot_platform_subprocess_dispatch_last_duration_ms{plugin_id="plugin-workflow-demo",operation="event"}`) {
 		t.Fatalf("expected metrics surface to remain available for workflow plugin after crash recovery, got %s", metricsResp.Body.String())
 	}
 	combinedLogs := output.String() + strings.Join(app.logs.Lines(), "")

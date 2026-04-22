@@ -603,6 +603,9 @@ func newRuntimeAppWithOutputAndOptions(configPath string, output io.Writer, opti
 	scheduler.SetObservability(logger, tracer, metrics)
 	scheduler.SetStore(state)
 	workflowRuntime := runtimecore.NewWorkflowRuntime(state)
+	if metricsAwareWorkflowRuntime, ok := any(workflowRuntime).(interface{ SetMetrics(*runtimecore.MetricsRegistry) }); ok {
+		metricsAwareWorkflowRuntime.SetMetrics(metrics)
+	}
 	if err := workflowRuntime.Restore(context.Background()); err != nil {
 		_ = smokeStore.Close()
 		_ = state.Close()

@@ -317,7 +317,7 @@ func TestJobQueueRetryDeadLetterRevivesJobAndClearsAlert(t *testing.T) {
 		t.Fatalf("expected persisted alert count to be cleared after retry, got %+v", counts)
 	}
 	metricsOutput := queue.metrics.RenderPrometheus()
-	if !strings.Contains(metricsOutput, `bot_platform_job_status_total{status="pending"} 1`) || !strings.Contains(metricsOutput, `bot_platform_job_status_total{status="dead"} 0`) {
+	if !strings.Contains(metricsOutput, `bot_platform_job_count{status="pending"} 1`) || !strings.Contains(metricsOutput, `bot_platform_job_count{status="dead"} 0`) {
 		t.Fatalf("expected metrics to reflect revived pending job, got %s", metricsOutput)
 	}
 }
@@ -378,7 +378,7 @@ func TestJobQueueRecordsObservabilityAcrossLifecycle(t *testing.T) {
 		t.Fatalf("expected job lifecycle span, got %s", rendered)
 	}
 	metricsOutput := metrics.RenderPrometheus()
-	if !strings.Contains(metricsOutput, "bot_platform_queue_lag 0") || !strings.Contains(metricsOutput, "bot_platform_job_status_total{status=\"done\"} 1") {
+	if !strings.Contains(metricsOutput, "bot_platform_job_queue_active_count 0") || !strings.Contains(metricsOutput, "bot_platform_job_count{status=\"done\"} 1") {
 		t.Fatalf("expected job metrics, got %s", metricsOutput)
 	}
 }
@@ -480,7 +480,7 @@ func TestJobQueueCanCancelPendingAndRetryingJobs(t *testing.T) {
 		t.Fatalf("expected cancelled retrying job, got %+v", cancelledRetrying)
 	}
 	metricsOutput := queue.metrics.RenderPrometheus()
-	if !strings.Contains(metricsOutput, "bot_platform_job_status_total{status=\"cancelled\"} 2") || !strings.Contains(metricsOutput, "bot_platform_queue_lag 0") {
+	if !strings.Contains(metricsOutput, "bot_platform_job_count{status=\"cancelled\"} 2") || !strings.Contains(metricsOutput, "bot_platform_job_queue_active_count 0") {
 		t.Fatalf("expected cancelled job metrics, got %s", metricsOutput)
 	}
 }
@@ -860,7 +860,7 @@ func TestJobQueueEnqueueDoesNotMutateMemoryWhenPersistenceFails(t *testing.T) {
 		t.Fatalf("expected empty in-memory queue after failed enqueue, got %d jobs", got)
 	}
 	metricsOutput := queue.metrics.RenderPrometheus()
-	if !strings.Contains(metricsOutput, "bot_platform_queue_lag 0") {
+	if !strings.Contains(metricsOutput, "bot_platform_job_queue_active_count 0") {
 		t.Fatalf("expected queue lag to remain zero, got %s", metricsOutput)
 	}
 }
@@ -891,7 +891,7 @@ func TestJobQueueTransitionDoesNotMutateMemoryWhenPersistenceFails(t *testing.T)
 		t.Fatalf("expected no dead-letter entries after failed transition, got %d", got)
 	}
 	metricsOutput := queue.metrics.RenderPrometheus()
-	if !strings.Contains(metricsOutput, "bot_platform_job_status_total{status=\"pending\"} 1") {
+	if !strings.Contains(metricsOutput, "bot_platform_job_count{status=\"pending\"} 1") {
 		t.Fatalf("expected pending job metric to remain unchanged, got %s", metricsOutput)
 	}
 }

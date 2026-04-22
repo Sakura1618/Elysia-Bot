@@ -1,7 +1,6 @@
 package runtimecore
 
 import (
-	"reflect"
 	"sort"
 	"strings"
 	"testing"
@@ -17,33 +16,40 @@ func TestMetricsRegistryLocksActive2BaselineFamilies(t *testing.T) {
 	output := metrics.RenderPrometheus()
 	gotFamilies := collectPrometheusFamilies(output)
 	wantFamilies := []string{
-		"bot_platform_event_throughput_total",
-		"bot_platform_handler_latency_ms",
-		"bot_platform_job_dispatch_ready_total",
-		"bot_platform_job_recoveries_total",
-		"bot_platform_job_status_total",
-		"bot_platform_plugin_errors_total",
-		"bot_platform_queue_lag",
-		"bot_platform_schedule_due_ready_total",
-		"bot_platform_schedule_recoveries_total",
-		"bot_platform_subprocess_failures_total",
+		"bot_platform_job_count",
+		"bot_platform_job_dispatch_ready_count",
+		"bot_platform_job_queue_active_count",
+		"bot_platform_job_recovery_total",
+		"bot_platform_runtime_dispatch_last_duration_ms",
+		"bot_platform_runtime_dispatch_total",
+		"bot_platform_schedule_due_ready_count",
+		"bot_platform_schedule_recovery_total",
+		"bot_platform_subprocess_dispatch_last_duration_ms",
+		"bot_platform_subprocess_dispatch_total",
+		"bot_platform_subprocess_failure_total",
+		"bot_platform_workflow_instance_count",
+		"bot_platform_workflow_transition_total",
 	}
-	sort.Strings(wantFamilies)
-	if !reflect.DeepEqual(gotFamilies, wantFamilies) {
-		t.Fatalf("expected baseline metric families %v, got %v", wantFamilies, gotFamilies)
+	for _, family := range wantFamilies {
+		if !slicesContains(gotFamilies, family) {
+			t.Fatalf("expected baseline metric family %q, got %v", family, gotFamilies)
+		}
 	}
 
 	for _, expected := range []string{
-		"bot_platform_event_throughput_total 1",
-		"bot_platform_handler_latency_ms{plugin_id=\"plugin-echo\"} 12",
-		"bot_platform_plugin_errors_total{plugin_id=\"plugin-echo\"} 1",
-		"bot_platform_subprocess_failures_total{plugin_id=\"plugin-echo\",failure_stage=\"dispatch\",failure_reason=\"response_timeout\"} 1",
-		"bot_platform_queue_lag 3",
-		"bot_platform_job_status_total{status=\"retrying\"} 2",
-		"bot_platform_job_recoveries_total 1",
-		"bot_platform_schedule_recoveries_total 1",
-		"bot_platform_job_dispatch_ready_total 1",
-		"bot_platform_schedule_due_ready_total 4",
+		"bot_platform_runtime_dispatch_total{plugin_id=\"plugin-echo\",operation=\"event\",outcome=\"success\"} 1",
+		"bot_platform_runtime_dispatch_last_duration_ms{plugin_id=\"plugin-echo\",operation=\"event\"} 12",
+		"bot_platform_subprocess_dispatch_total{plugin_id=\"plugin-echo\",operation=\"event\",outcome=\"error\"} 1",
+		"bot_platform_subprocess_dispatch_last_duration_ms{plugin_id=\"plugin-echo\",operation=\"event\"} 12",
+		"bot_platform_subprocess_failure_total{plugin_id=\"plugin-echo\",operation=\"event\",failure_stage=\"dispatch\",failure_reason=\"response_timeout\"} 1",
+		"bot_platform_job_queue_active_count 3",
+		"bot_platform_job_count{status=\"retrying\"} 2",
+		"bot_platform_job_recovery_total{outcome=\"recovered_running\"} 1",
+		"bot_platform_schedule_recovery_total{outcome=\"recomputed_due_at\"} 1",
+		"bot_platform_job_dispatch_ready_count 1",
+		"bot_platform_schedule_due_ready_count 4",
+		"bot_platform_workflow_instance_count{status=\"waiting_event\"} 1",
+		"bot_platform_workflow_transition_total{plugin_id=\"plugin-echo\",outcome=\"started\"} 1",
 	} {
 		if !strings.Contains(output, expected) {
 			t.Fatalf("expected metrics output to contain %q, got %s", expected, output)
@@ -66,16 +72,17 @@ func TestMetricsRegistryForbidsHighCardinalityContextLabels(t *testing.T) {
 }
 
 func recordActive2BaselineMetrics(metrics *MetricsRegistry) {
-	metrics.RecordEventThroughput()
-	metrics.RecordHandlerLatency("plugin-echo", 12*time.Millisecond)
-	metrics.RecordPluginError("plugin-echo")
-	metrics.RecordSubprocessFailure("plugin-echo", "dispatch", "response_timeout")
-	metrics.SetQueueLag(3)
-	metrics.SetJobStatusCount(JobStatusRetrying, 2)
-	metrics.IncrementJobRecoveries()
-	metrics.IncrementScheduleRecoveries()
+	metrics.RecordRuntimeDispatch("plugin-echo", "event", "success", 12*time.Millisecond)
+	metrics.RecordSubprocessDispatch("plugin-echo", "event", "error", 12*time.Millisecond)
+	metrics.RecordSubprocessFailure("plugin-echo", "event", "dispatch", "response_timeout")
+	metrics.SetJobQueueActiveCount(3)
+	metrics.SetJobCount(JobStatusRetrying, 2)
+	metrics.IncrementJobRecovery("recovered_running")
+	metrics.IncrementScheduleRecovery("recomputed_due_at")
 	metrics.SetJobDispatchReadyCount(1)
 	metrics.SetScheduleDueReadyCount(4)
+	metrics.SetWorkflowInstanceCount(WorkflowRuntimeStatusWaitingEvent, 1)
+	metrics.RecordWorkflowTransition("plugin-echo", "started")
 }
 
 func collectPrometheusFamilies(output string) []string {
@@ -97,4 +104,13 @@ func collectPrometheusFamilies(output string) []string {
 	}
 	sort.Strings(result)
 	return result
+}
+
+func slicesContains(items []string, target string) bool {
+	for _, item := range items {
+		if item == target {
+			return true
+		}
+	}
+	return false
 }

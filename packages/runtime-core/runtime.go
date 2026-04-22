@@ -214,7 +214,9 @@ func (r *InMemoryRuntime) DispatchEvent(ctx context.Context, event eventmodel.Ev
 		r.log("error", "runtime event manifest permission gate failed", logContextFromExecutionContext(baseContext), manifestPermissionGateFields("event", requiredPermission, pluginIDs, map[string]any{"event_type": event.Type, "source": event.Source, "error": err.Error()}))
 		return err
 	}
-	r.metrics.RecordEventThroughput()
+	if r.metrics != nil {
+		r.metrics.RecordEventThroughput()
+	}
 	return r.dispatchToPluginsWithFilter(ctx, "event", baseContext,
 		func(plugin pluginsdk.Plugin, _ eventmodel.ExecutionContext) bool {
 			if plugin.Handlers.Event == nil {
@@ -883,23 +885,23 @@ func (r *InMemoryRuntime) dispatchToPluginsWithFilter(
 		if shouldDispatch != nil && !shouldDispatch(plugin, executionContext) {
 			continue
 		}
+
+		invokeStarted := time.Now()
 		if authorize != nil {
 			if err := authorize(plugin, executionContext); err != nil {
 				r.log("error", "runtime dispatch authorization failed", logContextFromExecutionContext(executionContext), FailureLogFields("runtime", "dispatch."+dispatchKind+".authorize", err, authorizationDeniedAuditReason(err), mergeFields(fields, map[string]any{"dispatch_kind": dispatchKind})))
+				r.metrics.RecordRuntimeDispatch(manifest.ID, dispatchKind, "denied", time.Since(invokeStarted))
 				r.recordDispatch(DispatchResult{PluginID: manifest.ID, Kind: dispatchKind, Success: false, Error: fmt.Sprintf("dispatch authorization %q: %v", manifest.ID, err)})
 				dispatchErr = err
 				continue
 			}
 		}
-
-		invokeStarted := time.Now()
 		finishInvokeSpan := r.tracer.StartSpan(executionContext.TraceID, "plugin.invoke", executionContext.EventID, manifest.ID, executionContext.RunID, executionContext.CorrelationID, mergeFields(fields, map[string]any{"dispatch_kind": dispatchKind, "parent_span_name": "runtime.dispatch"}))
 		r.log("info", "plugin dispatch started", logContextFromExecutionContext(executionContext), BaselineLogFields("runtime", "plugin.dispatch."+dispatchKind, mergeFields(fields, map[string]any{"dispatch_kind": dispatchKind})))
 
 		if err := r.supervisor.EnsurePlugin(ctx, manifest.ID); err != nil {
 			finishInvokeSpan()
-			r.metrics.RecordPluginError(manifest.ID)
-			r.metrics.RecordHandlerLatency(manifest.ID, time.Since(invokeStarted))
+			r.metrics.RecordRuntimeDispatch(manifest.ID, dispatchKind, "error", time.Since(invokeStarted))
 			r.log("error", "plugin dispatch failed", logContextFromExecutionContext(executionContext), FailureLogFields("runtime", "plugin.dispatch."+dispatchKind, err, "plugin_supervisor_failed", mergeFields(fields, map[string]any{"dispatch_kind": dispatchKind})))
 			r.recordDispatch(DispatchResult{PluginID: manifest.ID, Kind: dispatchKind, Success: false, Error: fmt.Sprintf("supervisor ensure plugin %q: %v", manifest.ID, err)})
 			dispatchErr = err
@@ -908,15 +910,14 @@ func (r *InMemoryRuntime) dispatchToPluginsWithFilter(
 
 		if err := dispatch(plugin, executionContext); err != nil {
 			finishInvokeSpan()
-			r.metrics.RecordPluginError(manifest.ID)
-			r.metrics.RecordHandlerLatency(manifest.ID, time.Since(invokeStarted))
+			r.metrics.RecordRuntimeDispatch(manifest.ID, dispatchKind, "error", time.Since(invokeStarted))
 			r.log("error", "plugin dispatch failed", logContextFromExecutionContext(executionContext), FailureLogFields("runtime", "plugin.dispatch."+dispatchKind, err, "plugin_dispatch_failed", mergeFields(fields, map[string]any{"dispatch_kind": dispatchKind})))
 			r.recordDispatch(DispatchResult{PluginID: manifest.ID, Kind: dispatchKind, Success: false, Error: fmt.Sprintf("plugin host dispatch %q: %v", manifest.ID, err)})
 			dispatchErr = err
 			continue
 		}
 		finishInvokeSpan()
-		r.metrics.RecordHandlerLatency(manifest.ID, time.Since(invokeStarted))
+		r.metrics.RecordRuntimeDispatch(manifest.ID, dispatchKind, "success", time.Since(invokeStarted))
 		r.log("info", "plugin dispatch completed", logContextFromExecutionContext(executionContext), BaselineLogFields("runtime", "plugin.dispatch."+dispatchKind, mergeFields(fields, map[string]any{"dispatch_kind": dispatchKind})))
 
 		delivered = true

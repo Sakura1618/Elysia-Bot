@@ -73,6 +73,7 @@ type WorkflowRuntime struct {
 	store        workflowRuntimeStore
 	now          func() time.Time
 	instances    map[string]WorkflowInstanceState
+	metrics      *MetricsRegistry
 	lastRecovery WorkflowRecoverySnapshot
 }
 
@@ -81,7 +82,17 @@ func NewWorkflowRuntime(store workflowRuntimeStore) *WorkflowRuntime {
 		store:     store,
 		now:       time.Now().UTC,
 		instances: map[string]WorkflowInstanceState{},
+		metrics:   NewMetricsRegistry(),
 	}
+}
+
+func (r *WorkflowRuntime) SetMetrics(metrics *MetricsRegistry) {
+	if r == nil || metrics == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.metrics = metrics
 }
 
 func (r *WorkflowRuntime) Restore(ctx context.Context) error {
@@ -111,6 +122,7 @@ func (r *WorkflowRuntime) Restore(ctx context.Context) error {
 	r.mu.Lock()
 	r.instances = restored
 	r.lastRecovery = snapshot
+	r.syncMetricsLocked()
 	r.mu.Unlock()
 	return nil
 }
@@ -170,6 +182,7 @@ func (r *WorkflowRuntime) StartOrResume(ctx context.Context, workflowID string, 
 		if err := r.save(ctx, instance); err != nil {
 			return WorkflowTransition{}, fmt.Errorf(`save started workflow: %w`, err)
 		}
+		r.recordTransitionMetric(instance.PluginID, "started")
 		return WorkflowTransition{Instance: cloneWorkflowInstanceState(instance), Started: true}, nil
 	}
 
@@ -203,6 +216,7 @@ func (r *WorkflowRuntime) StartOrResume(ctx context.Context, workflowID string, 
 	if err := r.save(ctx, updated); err != nil {
 		return WorkflowTransition{}, fmt.Errorf(`save resumed workflow: %w`, err)
 	}
+	r.recordTransitionMetric(updated.PluginID, "resumed")
 	return WorkflowTransition{Instance: cloneWorkflowInstanceState(updated), Resumed: true}, nil
 }
 
@@ -285,8 +299,37 @@ func (r *WorkflowRuntime) save(ctx context.Context, instance WorkflowInstanceSta
 	}
 	r.mu.Lock()
 	r.instances[instance.WorkflowID] = cloneWorkflowInstanceState(instance)
+	r.syncMetricsLocked()
 	r.mu.Unlock()
 	return nil
+}
+
+func (r *WorkflowRuntime) syncMetricsLocked() {
+	if r == nil || r.metrics == nil {
+		return
+	}
+	counts := map[WorkflowRuntimeStatus]int{
+		WorkflowRuntimeStatusReady:        0,
+		WorkflowRuntimeStatusWaitingEvent: 0,
+		WorkflowRuntimeStatusSleeping:     0,
+		WorkflowRuntimeStatusCompleted:    0,
+	}
+	for _, instance := range r.instances {
+		counts[instance.Status]++
+	}
+	for status, count := range counts {
+		r.metrics.SetWorkflowInstanceCount(status, count)
+	}
+}
+
+func (r *WorkflowRuntime) recordTransitionMetric(pluginID string, outcome string) {
+	r.mu.RLock()
+	metrics := r.metrics
+	r.mu.RUnlock()
+	if metrics == nil {
+		return
+	}
+	metrics.RecordWorkflowTransition(pluginID, outcome)
 }
 
 func (r *WorkflowRuntime) restoreInstance(ctx context.Context, instance WorkflowInstanceState, at time.Time) (WorkflowInstanceState, error) {
