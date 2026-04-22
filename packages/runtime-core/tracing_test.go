@@ -6,38 +6,65 @@ import (
 	"time"
 )
 
-func TestTraceRecorderTracksCoreSpanChain(t *testing.T) {
+func TestTraceRecorderLocksActive2CanonicalSpanNames(t *testing.T) {
 	t.Parallel()
 
 	recorder := NewTraceRecorder()
-	timestamps := []time.Time{
-		time.Date(2026, 4, 3, 10, 0, 0, 0, time.UTC),
-		time.Date(2026, 4, 3, 10, 0, 1, 0, time.UTC),
-		time.Date(2026, 4, 3, 10, 0, 2, 0, time.UTC),
-		time.Date(2026, 4, 3, 10, 0, 3, 0, time.UTC),
-		time.Date(2026, 4, 3, 10, 0, 4, 0, time.UTC),
-		time.Date(2026, 4, 3, 10, 0, 5, 0, time.UTC),
-		time.Date(2026, 4, 3, 10, 0, 6, 0, time.UTC),
-		time.Date(2026, 4, 3, 10, 0, 7, 0, time.UTC),
-		time.Date(2026, 4, 3, 10, 0, 8, 0, time.UTC),
-		time.Date(2026, 4, 3, 10, 0, 9, 0, time.UTC),
-	}
+	base := time.Date(2026, 4, 3, 10, 0, 0, 0, time.UTC)
 	index := 0
 	recorder.now = func() time.Time {
-		value := timestamps[index]
+		value := base.Add(time.Duration(index) * time.Second)
 		index++
 		return value
 	}
 
-	for _, spanName := range []string{"adapter.ingress", "runtime.dispatch", "plugin.invoke", "job.lifecycle", "reply.send"} {
-		finish := recorder.StartSpan("trace-1", spanName, "evt-1", "plugin-echo", "run-1", "corr-1", nil)
+	canonicalSpanNames := []string{
+		"adapter.ingress",
+		"runtime.event.dispatch",
+		"job.enqueue",
+		"job.dispatch",
+		"workflow.start_or_resume",
+		"plugin.dispatch",
+		"reply.dispatch",
+	}
+
+	for _, spanName := range canonicalSpanNames {
+		finish := recorder.StartSpan("trace-active2", spanName, "evt-active2", "plugin-echo", "run-active2", "corr-active2", nil)
 		finish()
 	}
 
-	rendered := recorder.RenderTrace("trace-1")
-	for _, expected := range []string{"adapter.ingress", "runtime.dispatch", "plugin.invoke", "job.lifecycle", "reply.send"} {
+	spans := recorder.SpansByTrace("trace-active2")
+	if len(spans) != len(canonicalSpanNames) {
+		t.Fatalf("expected %d canonical spans, got %d", len(canonicalSpanNames), len(spans))
+	}
+	for i, expected := range canonicalSpanNames {
+		if spans[i].SpanName != expected {
+			t.Fatalf("expected span %d to be %q, got %q", i, expected, spans[i].SpanName)
+		}
+	}
+
+	rendered := recorder.RenderTrace("trace-active2")
+	for _, expected := range canonicalSpanNames {
 		if !strings.Contains(rendered, expected) {
 			t.Fatalf("expected rendered trace to contain %q, got %s", expected, rendered)
 		}
+	}
+}
+
+func TestTraceRecorderSpanCarriesFiveIDContext(t *testing.T) {
+	t.Parallel()
+
+	recorder := NewTraceRecorder()
+	finish := recorder.StartSpan("trace-ctx-1", "plugin.dispatch", "evt-ctx-1", "plugin-echo", "run-ctx-1", "corr-ctx-1", map[string]any{"dispatch_kind": "event"})
+	finish()
+
+	spans := recorder.SpansByTrace("trace-ctx-1")
+	if len(spans) != 1 {
+		t.Fatalf("expected one span, got %d", len(spans))
+	}
+
+	span := spans[0]
+	if span.TraceID != "trace-ctx-1" || span.EventID != "evt-ctx-1" || span.PluginID != "plugin-echo" || span.RunID != "run-ctx-1" || span.CorrelationID != "corr-ctx-1" {
+		t.Fatalf("expected five-ID span context to round-trip, got %+v", span)
 	}
 }
