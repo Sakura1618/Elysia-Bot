@@ -82,7 +82,7 @@ func (a *Adapter) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 			finishFailureSpan()
 		}
 		if a.Logger != nil {
-			_ = a.Logger.Log("error", "webhook secret resolution failed", runtimecore.LogContext{TraceID: traceID}, map[string]any{"path": r.URL.Path, "failure_code": secretResolutionFailureCode, "failure_reason": failureReason, "error": err.Error()})
+			_ = a.Logger.Log("error", "webhook secret resolution failed", runtimecore.LogContext{TraceID: traceID}, runtimecore.FailureLogFields("adapter_webhook", "ingress.secret_resolution", err, secretResolutionFailureCode, map[string]any{"path": r.URL.Path, "failure_code": secretResolutionFailureCode, "failure_reason": failureReason}))
 		}
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"status": "error", "code": secretResolutionFailureCode, "message": secretResolutionMessage, "trace_id": traceID})
 		return
@@ -136,7 +136,7 @@ func (a *Adapter) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 	defer finishSpan()
 	if a.Logger != nil {
-		_ = a.Logger.Log("info", "webhook ingress mapped to standard event", runtimecore.LogContext{TraceID: event.TraceID, EventID: event.EventID, CorrelationID: event.IdempotencyKey}, map[string]any{"source": event.Source, "type": event.Type})
+		_ = a.Logger.Log("info", "webhook ingress mapped to standard event", runtimecore.LogContext{TraceID: event.TraceID, EventID: event.EventID, CorrelationID: event.IdempotencyKey}, runtimecore.BaselineLogFields("adapter_webhook", "ingress.map_payload", map[string]any{"source": event.Source, "type": event.Type}))
 	}
 	if err := a.Dispatcher.DispatchEvent(r.Context(), event); err != nil {
 		failureReason := webhookDispatchFailureReason(err)
@@ -145,7 +145,7 @@ func (a *Adapter) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 			finishFailureSpan()
 		}
 		if a.Logger != nil {
-			_ = a.Logger.Log("error", "webhook ingress dispatch failed", runtimecore.LogContext{TraceID: event.TraceID, EventID: event.EventID, CorrelationID: event.IdempotencyKey}, map[string]any{"source": event.Source, "type": event.Type, "failure_code": dispatchFailureCode, "failure_reason": failureReason, "error": err.Error()})
+			_ = a.Logger.Log("error", "webhook ingress dispatch failed", runtimecore.LogContext{TraceID: event.TraceID, EventID: event.EventID, CorrelationID: event.IdempotencyKey}, runtimecore.FailureLogFields("adapter_webhook", "ingress.dispatch", err, dispatchFailureCode, map[string]any{"source": event.Source, "type": event.Type, "failure_code": dispatchFailureCode, "failure_reason": failureReason}))
 		}
 		writeJSON(w, http.StatusBadGateway, map[string]any{"status": "error", "code": dispatchFailureCode, "message": dispatchFailureMessage, "event_id": event.EventID, "trace_id": event.TraceID})
 		return
@@ -192,7 +192,7 @@ func (a *Adapter) recordRejectObservability(traceID, spanName, message string, s
 		finishFailureSpan()
 	}
 	if a.Logger != nil {
-		_ = a.Logger.Log("error", message, runtimecore.LogContext{TraceID: traceID}, logFields)
+		_ = a.Logger.Log("error", message, runtimecore.LogContext{TraceID: traceID}, runtimecore.FailureLogFields("adapter_webhook", spanName, nil, "", logFields))
 	}
 }
 

@@ -41,6 +41,35 @@ func TestLoggerWritesStructuredEntryWithDefaultFields(t *testing.T) {
 	if entry.TraceID != "trace-1" || entry.EventID != "event-1" || entry.PluginID != "plugin-echo" || entry.RunID != "run-1" || entry.CorrelationID != "corr-1" {
 		t.Fatal("expected structured log to include default trace fields")
 	}
+	if entry.Fields["component"] != "runtime" || entry.Fields["operation"] == "" {
+		t.Fatalf("expected structured log baseline fields, got %+v", entry.Fields)
+	}
+}
+
+func TestLoggerNormalizesBaselineErrorFields(t *testing.T) {
+	t.Parallel()
+
+	buffer := &bytes.Buffer{}
+	logger := NewLogger(buffer)
+	logger.now = func() time.Time {
+		return time.Date(2026, 4, 2, 12, 1, 0, 0, time.UTC)
+	}
+
+	err := logger.Log("error", "runtime dispatch failed", LogContext{TraceID: "trace-2"}, FailureLogFields("runtime", "dispatch.event", context.DeadlineExceeded, "response_timeout", map[string]any{"dispatch_kind": "event"}))
+	if err != nil {
+		t.Fatalf("log entry: %v", err)
+	}
+
+	var entry LogEntry
+	if err := json.Unmarshal(buffer.Bytes(), &entry); err != nil {
+		t.Fatalf("unmarshal log entry: %v", err)
+	}
+	if entry.Fields["component"] != "runtime" || entry.Fields["operation"] != "dispatch.event" {
+		t.Fatalf("expected baseline component/operation fields, got %+v", entry.Fields)
+	}
+	if entry.Fields["error_category"] != "timeout" || entry.Fields["error_code"] != "response_timeout" {
+		t.Fatalf("expected normalized timeout error fields, got %+v", entry.Fields)
+	}
 }
 
 func TestLoadConfigReadsYAMLAndAppliesEnvOverride(t *testing.T) {

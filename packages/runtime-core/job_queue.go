@@ -179,12 +179,12 @@ func (q *JobQueue) DispatchReady(ctx context.Context, at time.Time) {
 		claimed, claimErr := q.MarkRunning(ctx, job.ID)
 		if claimErr != nil {
 			if q.logger != nil {
-				_ = q.logger.Log("error", "job queue failed to claim ready job", LogContext{TraceID: job.TraceID, EventID: job.EventID, RunID: job.RunID, CorrelationID: job.Correlation}, map[string]any{"job_id": job.ID, "job_type": job.Type, "error": claimErr.Error()})
+				_ = q.logger.Log("error", "job queue failed to claim ready job", LogContext{TraceID: job.TraceID, EventID: job.EventID, RunID: job.RunID, CorrelationID: job.Correlation}, FailureLogFields("job_queue", "dispatch_ready.claim", claimErr, "claim_ready_failed", map[string]any{"job_id": job.ID, "job_type": job.Type}))
 			}
 			continue
 		}
 		if err := dispatcher.DispatchQueuedJob(ctx, claimed); err != nil && q.logger != nil {
-			_ = q.logger.Log("error", "job queue dispatcher returned error", LogContext{TraceID: claimed.TraceID, EventID: claimed.EventID, RunID: claimed.RunID, CorrelationID: claimed.Correlation}, map[string]any{"job_id": claimed.ID, "job_type": claimed.Type, "error": err.Error()})
+			_ = q.logger.Log("error", "job queue dispatcher returned error", LogContext{TraceID: claimed.TraceID, EventID: claimed.EventID, RunID: claimed.RunID, CorrelationID: claimed.Correlation}, FailureLogFields("job_queue", "dispatch_ready.dispatch", err, "queued_dispatch_failed", map[string]any{"job_id": claimed.ID, "job_type": claimed.Type}))
 		}
 	}
 }
@@ -528,13 +528,13 @@ func (q *JobQueue) Restore(ctx context.Context) error {
 	q.syncMetricsLocked()
 	q.mu.Unlock()
 	if q.logger != nil {
-		_ = q.logger.Log("info", "job queue restored from persistence", LogContext{}, map[string]any{
+		_ = q.logger.Log("info", "job queue restored from persistence", LogContext{}, BaselineLogFields("job_queue", "recover", map[string]any{
 			"restored_jobs":     recovery.TotalJobs,
 			"recovered_jobs":    recovery.RecoveredJobs,
 			"recovered_running": recovery.RecoveredRunning,
 			"retrying_jobs":     recovery.RetriedJobs,
 			"dead_jobs":         recovery.DeadJobs,
-		})
+		}))
 	}
 	return nil
 }
@@ -798,7 +798,7 @@ func (q *JobQueue) observeLifecycle(message string, job Job) {
 		CorrelationID: job.Correlation,
 	}
 	if q.logger != nil {
-		_ = q.logger.Log("info", message, ctx, map[string]any{
+		_ = q.logger.Log("info", message, ctx, BaselineLogFields("job_queue", "lifecycle", map[string]any{
 			"job_id":       job.ID,
 			"job_type":     job.Type,
 			"job_status":   job.Status,
@@ -807,7 +807,7 @@ func (q *JobQueue) observeLifecycle(message string, job Job) {
 			"reason_code":  job.ReasonCode,
 			"worker_id":    job.WorkerID,
 			"heartbeat_at": nullableLogTime(job.HeartbeatAt),
-		})
+		}))
 	}
 	if q.tracer != nil {
 		finish := q.tracer.StartSpan(ctx.TraceID, "job.lifecycle", ctx.EventID, "", "", ctx.CorrelationID, map[string]any{

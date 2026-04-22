@@ -3,6 +3,7 @@ package runtimecore
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -18,12 +19,20 @@ type recordingAlertSink struct {
 	err    error
 }
 
+type failingQueuedJobDispatcher struct {
+	err error
+}
+
 func (s *recordingAlertSink) RecordAlert(_ context.Context, alert AlertRecord) error {
 	if s.err != nil {
 		return s.err
 	}
 	s.alerts = append(s.alerts, alert)
 	return nil
+}
+
+func (d failingQueuedJobDispatcher) DispatchQueuedJob(context.Context, Job) error {
+	return d.err
 }
 
 func (s failingJobQueueStore) SaveJob(context.Context, Job) error {
@@ -372,6 +381,67 @@ func TestJobQueueRecordsObservabilityAcrossLifecycle(t *testing.T) {
 	if !strings.Contains(metricsOutput, "bot_platform_queue_lag 0") || !strings.Contains(metricsOutput, "bot_platform_job_status_total{status=\"done\"} 1") {
 		t.Fatalf("expected job metrics, got %s", metricsOutput)
 	}
+}
+
+func TestJobQueueDispatchReadyLogsStructuredDispatcherFailure(t *testing.T) {
+	t.Parallel()
+
+	buffer := &bytes.Buffer{}
+	queue := NewJobQueue()
+	queue.SetObservability(NewLogger(buffer), NewTraceRecorder(), NewMetricsRegistry())
+	queue.SetWorkerIdentity("runtime-local:test-worker")
+	queue.now = func() time.Time { return time.Date(2026, 4, 2, 21, 15, 0, 0, time.UTC) }
+	if err := queue.RegisterDispatcher("ai.call", failingQueuedJobDispatcher{err: errors.New("dispatcher exploded")}); err != nil {
+		t.Fatalf("register dispatcher: %v", err)
+	}
+	job := NewJob("job-dispatch-ready-fail", "ai.call", 0, 30*time.Second)
+	job.TraceID = "trace-dispatch-ready-fail"
+	job.EventID = "evt-dispatch-ready-fail"
+	job.Correlation = "corr-dispatch-ready-fail"
+	if err := queue.Enqueue(context.Background(), job); err != nil {
+		t.Fatalf("enqueue job: %v", err)
+	}
+
+	queue.DispatchReady(context.Background(), time.Date(2026, 4, 2, 21, 15, 1, 0, time.UTC))
+
+	entries := decodeJobQueueLogEntries(t, buffer)
+	matched := false
+	for _, entry := range entries {
+		if entry.Message != "job queue dispatcher returned error" {
+			continue
+		}
+		matched = true
+		if entry.Fields["component"] != "job_queue" || entry.Fields["operation"] != "dispatch_ready.dispatch" {
+			t.Fatalf("expected queue failure baseline fields, got %+v", entry)
+		}
+		if entry.Fields["error_category"] != "internal" || entry.Fields["error_code"] != "queued_dispatch_failed" {
+			t.Fatalf("expected queue failure taxonomy, got %+v", entry)
+		}
+	}
+	if !matched {
+		t.Fatalf("expected queue dispatcher failure log entry, got %+v", entries)
+	}
+}
+
+func decodeJobQueueLogEntries(t *testing.T, buffer *bytes.Buffer) []LogEntry {
+	t.Helper()
+	raw := strings.TrimSpace(buffer.String())
+	if raw == "" {
+		return nil
+	}
+	lines := strings.Split(raw, "\n")
+	entries := make([]LogEntry, 0, len(lines))
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var entry LogEntry
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatalf("decode job queue log entry %q: %v", line, err)
+		}
+		entries = append(entries, entry)
+	}
+	return entries
 }
 
 func TestJobQueueCanCancelPendingAndRetryingJobs(t *testing.T) {

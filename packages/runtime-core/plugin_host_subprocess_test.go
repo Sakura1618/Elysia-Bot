@@ -4694,6 +4694,23 @@ func TestSubprocessPluginHostRecordsObservabilityForTimeout(t *testing.T) {
 	if !strings.Contains(logs.String(), "subprocess host dispatch timed out") {
 		t.Fatalf("expected timeout observability log, got %s", logs.String())
 	}
+	entries := decodeSubprocessLogEntries(t, logs)
+	matched := false
+	for _, entry := range entries {
+		if entry.Message != "subprocess host dispatch timed out" {
+			continue
+		}
+		matched = true
+		if entry.Fields["component"] != "plugin_host" || entry.Fields["operation"] != "dispatch.event.timeout" {
+			t.Fatalf("expected subprocess timeout baseline fields, got %+v", entry)
+		}
+		if entry.Fields["error_category"] != "timeout" || entry.Fields["error_code"] != "response_timeout" {
+			t.Fatalf("expected subprocess timeout taxonomy, got %+v", entry)
+		}
+	}
+	if !matched {
+		t.Fatalf("expected subprocess timeout log entry, got %+v", entries)
+	}
 	if !strings.Contains(tracer.RenderTrace("trace-timeout-observe"), "plugin_host.dispatch") {
 		t.Fatalf("expected timeout trace span, got %s", tracer.RenderTrace("trace-timeout-observe"))
 	}
@@ -4818,6 +4835,27 @@ func buildSubprocessFixtureBinary(t *testing.T) string {
 		t.Fatalf("build subprocess fixture: %v\n%s", err, string(output))
 	}
 	return outputPath
+}
+
+func decodeSubprocessLogEntries(t *testing.T, logs *bytes.Buffer) []LogEntry {
+	t.Helper()
+	raw := strings.TrimSpace(logs.String())
+	if raw == "" {
+		return nil
+	}
+	lines := strings.Split(raw, "\n")
+	entries := make([]LogEntry, 0, len(lines))
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var entry LogEntry
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatalf("decode subprocess log entry %q: %v", line, err)
+		}
+		entries = append(entries, entry)
+	}
+	return entries
 }
 
 func shutdownSubprocessHostForTest(host *SubprocessPluginHost) {

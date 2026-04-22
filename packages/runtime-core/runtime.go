@@ -261,7 +261,7 @@ func (r *InMemoryRuntime) DispatchCommand(ctx context.Context, command eventmode
 		if err := commandAuth.AuthorizeCommand(ctx, command, executionContext); err != nil {
 			actor, action, target, permission, targetKind := commandAuthorizationFields(command)
 			r.recordAuthorizationDeniedAudit(auditRecorder, actor, permission, target, authorizationDeniedAuditReason(err))
-			r.log("error", "runtime command authorization failed", logContextFromExecutionContext(executionContext), map[string]any{"command_name": command.Name, "actor": actor, "action": action, "target": target, "permission": permission, "error": err.Error()})
+			r.log("error", "runtime command authorization failed", logContextFromExecutionContext(executionContext), FailureLogFields("runtime", "dispatch.command.authorize", err, authorizationDeniedAuditReason(err), map[string]any{"command_name": command.Name, "actor": actor, "action": action, "target": target, "permission": permission}))
 			_ = targetKind
 			return err
 		}
@@ -474,12 +474,12 @@ func missingManifestPermissionError(kind, permission string, pluginIDs []string)
 }
 
 func manifestPermissionGateFields(dispatchKind, permission string, pluginIDs []string, fields map[string]any) map[string]any {
-	result := mergeFields(fields, map[string]any{
+	result := FailureLogFields("runtime", "dispatch."+dispatchKind+".manifest_permission_gate", nil, "missing_manifest_permission", mergeFields(fields, map[string]any{
 		"dispatch_kind":  dispatchKind,
 		"failure_stage":  "manifest_permission_gate",
 		"failure_reason": "missing_manifest_permission",
 		"permission":     permission,
-	})
+	}))
 	if len(pluginIDs) == 0 {
 		result["registered_handler_plugins"] = ""
 		result["registered_handler_plugins_count"] = 0
@@ -627,7 +627,7 @@ func (r *InMemoryRuntime) logQueuedDispatchFailure(job Job, dispatchErr error, t
 		EventID:       job.EventID,
 		RunID:         job.RunID,
 		CorrelationID: job.Correlation,
-	}, fields)
+	}, FailureLogFields("runtime", "dispatch.job.queued", dispatchErr, "queued_dispatch_failed", fields))
 }
 
 func transitionQueuedJobDispatchFailure(ctx context.Context, queue QueuedJobFailureTransitioner, original Job, dispatchErr error) error {
@@ -859,11 +859,11 @@ func (r *InMemoryRuntime) dispatchToPluginsWithFilter(
 ) error {
 	finishDispatchSpan := r.tracer.StartSpan(baseContext.TraceID, "runtime.dispatch", baseContext.EventID, "", baseContext.RunID, baseContext.CorrelationID, mergeFields(fields, map[string]any{"dispatch_kind": dispatchKind}))
 	defer finishDispatchSpan()
-	r.log("info", "runtime dispatch started", logContextFromExecutionContext(baseContext), mergeFields(fields, map[string]any{"dispatch_kind": dispatchKind}))
+	r.log("info", "runtime dispatch started", logContextFromExecutionContext(baseContext), BaselineLogFields("runtime", "dispatch."+dispatchKind, mergeFields(fields, map[string]any{"dispatch_kind": dispatchKind})))
 
 	manifests := r.plugins.List()
 	if len(manifests) == 0 {
-		r.log("error", "runtime dispatch failed", logContextFromExecutionContext(baseContext), mergeFields(fields, map[string]any{"dispatch_kind": dispatchKind, "error": "no plugins registered for dispatch"}))
+		r.log("error", "runtime dispatch failed", logContextFromExecutionContext(baseContext), FailureLogFields("runtime", "dispatch."+dispatchKind, errors.New("no plugins registered for dispatch"), "dispatch_no_plugins", mergeFields(fields, map[string]any{"dispatch_kind": dispatchKind})))
 		return errors.New("no plugins registered for dispatch")
 	}
 
@@ -885,7 +885,7 @@ func (r *InMemoryRuntime) dispatchToPluginsWithFilter(
 		}
 		if authorize != nil {
 			if err := authorize(plugin, executionContext); err != nil {
-				r.log("error", "runtime dispatch authorization failed", logContextFromExecutionContext(executionContext), mergeFields(fields, map[string]any{"dispatch_kind": dispatchKind, "error": err.Error()}))
+				r.log("error", "runtime dispatch authorization failed", logContextFromExecutionContext(executionContext), FailureLogFields("runtime", "dispatch."+dispatchKind+".authorize", err, authorizationDeniedAuditReason(err), mergeFields(fields, map[string]any{"dispatch_kind": dispatchKind})))
 				r.recordDispatch(DispatchResult{PluginID: manifest.ID, Kind: dispatchKind, Success: false, Error: fmt.Sprintf("dispatch authorization %q: %v", manifest.ID, err)})
 				dispatchErr = err
 				continue
@@ -894,13 +894,13 @@ func (r *InMemoryRuntime) dispatchToPluginsWithFilter(
 
 		invokeStarted := time.Now()
 		finishInvokeSpan := r.tracer.StartSpan(executionContext.TraceID, "plugin.invoke", executionContext.EventID, manifest.ID, executionContext.RunID, executionContext.CorrelationID, mergeFields(fields, map[string]any{"dispatch_kind": dispatchKind, "parent_span_name": "runtime.dispatch"}))
-		r.log("info", "plugin dispatch started", logContextFromExecutionContext(executionContext), mergeFields(fields, map[string]any{"dispatch_kind": dispatchKind}))
+		r.log("info", "plugin dispatch started", logContextFromExecutionContext(executionContext), BaselineLogFields("runtime", "plugin.dispatch."+dispatchKind, mergeFields(fields, map[string]any{"dispatch_kind": dispatchKind})))
 
 		if err := r.supervisor.EnsurePlugin(ctx, manifest.ID); err != nil {
 			finishInvokeSpan()
 			r.metrics.RecordPluginError(manifest.ID)
 			r.metrics.RecordHandlerLatency(manifest.ID, time.Since(invokeStarted))
-			r.log("error", "plugin dispatch failed", logContextFromExecutionContext(executionContext), mergeFields(fields, map[string]any{"dispatch_kind": dispatchKind, "error": err.Error()}))
+			r.log("error", "plugin dispatch failed", logContextFromExecutionContext(executionContext), FailureLogFields("runtime", "plugin.dispatch."+dispatchKind, err, "plugin_supervisor_failed", mergeFields(fields, map[string]any{"dispatch_kind": dispatchKind})))
 			r.recordDispatch(DispatchResult{PluginID: manifest.ID, Kind: dispatchKind, Success: false, Error: fmt.Sprintf("supervisor ensure plugin %q: %v", manifest.ID, err)})
 			dispatchErr = err
 			continue
@@ -910,27 +910,27 @@ func (r *InMemoryRuntime) dispatchToPluginsWithFilter(
 			finishInvokeSpan()
 			r.metrics.RecordPluginError(manifest.ID)
 			r.metrics.RecordHandlerLatency(manifest.ID, time.Since(invokeStarted))
-			r.log("error", "plugin dispatch failed", logContextFromExecutionContext(executionContext), mergeFields(fields, map[string]any{"dispatch_kind": dispatchKind, "error": err.Error()}))
+			r.log("error", "plugin dispatch failed", logContextFromExecutionContext(executionContext), FailureLogFields("runtime", "plugin.dispatch."+dispatchKind, err, "plugin_dispatch_failed", mergeFields(fields, map[string]any{"dispatch_kind": dispatchKind})))
 			r.recordDispatch(DispatchResult{PluginID: manifest.ID, Kind: dispatchKind, Success: false, Error: fmt.Sprintf("plugin host dispatch %q: %v", manifest.ID, err)})
 			dispatchErr = err
 			continue
 		}
 		finishInvokeSpan()
 		r.metrics.RecordHandlerLatency(manifest.ID, time.Since(invokeStarted))
-		r.log("info", "plugin dispatch completed", logContextFromExecutionContext(executionContext), mergeFields(fields, map[string]any{"dispatch_kind": dispatchKind}))
+		r.log("info", "plugin dispatch completed", logContextFromExecutionContext(executionContext), BaselineLogFields("runtime", "plugin.dispatch."+dispatchKind, mergeFields(fields, map[string]any{"dispatch_kind": dispatchKind})))
 
 		delivered = true
 		r.recordDispatch(DispatchResult{PluginID: manifest.ID, Kind: dispatchKind, Success: true})
 	}
 
 	if !delivered {
-		r.log("error", "runtime dispatch failed", logContextFromExecutionContext(baseContext), mergeFields(fields, map[string]any{"dispatch_kind": dispatchKind, "error": "dispatch completed with no successful plugin deliveries"}))
+		r.log("error", "runtime dispatch failed", logContextFromExecutionContext(baseContext), FailureLogFields("runtime", "dispatch."+dispatchKind, errors.New("dispatch completed with no successful plugin deliveries"), "dispatch_no_deliveries", mergeFields(fields, map[string]any{"dispatch_kind": dispatchKind})))
 		if dispatchErr != nil {
 			return fmt.Errorf("dispatch completed with no successful plugin deliveries: %w", dispatchErr)
 		}
 		return errors.New("dispatch completed with no successful plugin deliveries")
 	}
-	r.log("info", "runtime dispatch completed", logContextFromExecutionContext(baseContext), mergeFields(fields, map[string]any{"dispatch_kind": dispatchKind}))
+	r.log("info", "runtime dispatch completed", logContextFromExecutionContext(baseContext), BaselineLogFields("runtime", "dispatch."+dispatchKind, mergeFields(fields, map[string]any{"dispatch_kind": dispatchKind})))
 
 	return nil
 }
@@ -1051,7 +1051,7 @@ func (r *InMemoryRuntime) recordDispatch(result DispatchResult) {
 		return
 	}
 	if err := recorder.RecordDispatchResult(result); err != nil {
-		r.log("error", "persist plugin dispatch snapshot failed", LogContext{PluginID: result.PluginID}, map[string]any{"dispatch_kind": result.Kind, "error": err.Error()})
+		r.log("error", "persist plugin dispatch snapshot failed", LogContext{PluginID: result.PluginID}, FailureLogFields("runtime", "dispatch.snapshot.persist", err, "dispatch_snapshot_persist_failed", map[string]any{"dispatch_kind": result.Kind}))
 	}
 }
 

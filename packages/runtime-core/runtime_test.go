@@ -3,6 +3,7 @@ package runtimecore
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -1777,12 +1778,14 @@ func TestRuntimeDispatchFailureRecordsPluginErrorMetric(t *testing.T) {
 func TestRuntimeDispatchEventStopsBeforePluginWhenEventAuthorizerDenies(t *testing.T) {
 	t.Parallel()
 
+	buffer := &bytes.Buffer{}
 	handler := &recordingEventHandler{}
 	authorizer := &recordingEventAuthorizer{err: errors.New("event authorization denied")}
 	audits := NewInMemoryAuditLog()
 	supervisor := &recordingSupervisor{}
 	runtime := NewInMemoryRuntime(supervisor, DirectPluginHost{})
 	runtime.SetAuditRecorder(audits)
+	runtime.SetObservability(NewLogger(buffer), NewTraceRecorder(), NewMetricsRegistry())
 	runtime.SetEventAuthorizer(authorizer)
 	if err := runtime.RegisterPlugin(pluginsdk.Plugin{
 		Manifest: pluginsdk.PluginManifest{ID: "plugin-echo", Name: "Echo Plugin", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, Permissions: []string{"message:read"}, Entry: pluginsdk.PluginEntry{Module: "plugins/echo", Symbol: "Plugin"}},
@@ -1812,6 +1815,23 @@ func TestRuntimeDispatchEventStopsBeforePluginWhenEventAuthorizerDenies(t *testi
 	}
 	if entries[0].Actor != "viewer-user" || entries[0].Action != "message.read" || entries[0].Permission != "message:read" || entries[0].Target != "plugin-echo" || entries[0].Allowed || auditEntryReason(entries[0]) != "permission_denied" {
 		t.Fatalf("expected denied event audit entry, got %+v", entries[0])
+	}
+	logs := decodeRuntimeLogEntries(t, buffer)
+	matched := false
+	for _, entry := range logs {
+		if entry.Message != "runtime dispatch authorization failed" {
+			continue
+		}
+		matched = true
+		if entry.Fields["component"] != "runtime" || entry.Fields["operation"] != "dispatch.event.authorize" {
+			t.Fatalf("expected runtime authorization log baseline fields, got %+v", entry)
+		}
+		if entry.Fields["error_category"] != "authorization" || entry.Fields["error_code"] != "permission_denied" {
+			t.Fatalf("expected runtime authorization log taxonomy, got %+v", entry)
+		}
+	}
+	if !matched {
+		t.Fatalf("expected runtime authorization failure log, got %+v", logs)
 	}
 }
 
@@ -3135,6 +3155,38 @@ func TestRuntimeDispatchQueuedJobLogsTransitionFailureDetails(t *testing.T) {
 			t.Fatalf("expected logs to contain %q, got %s", expected, logs)
 		}
 	}
+	entries := decodeRuntimeLogEntries(t, buffer)
+	if len(entries) == 0 {
+		t.Fatal("expected queued dispatch failure log entry")
+	}
+	entry := entries[len(entries)-1]
+	if entry.Fields["component"] != "runtime" || entry.Fields["operation"] != "dispatch.job.queued" {
+		t.Fatalf("expected queued dispatch baseline fields, got %+v", entry)
+	}
+	if entry.Fields["error_category"] != "internal" || entry.Fields["error_code"] != "queued_dispatch_failed" {
+		t.Fatalf("expected queued dispatch error taxonomy, got %+v", entry)
+	}
+}
+
+func decodeRuntimeLogEntries(t *testing.T, buffer *bytes.Buffer) []LogEntry {
+	t.Helper()
+	raw := strings.TrimSpace(buffer.String())
+	if raw == "" {
+		return nil
+	}
+	lines := strings.Split(raw, "\n")
+	entries := make([]LogEntry, 0, len(lines))
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var entry LogEntry
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatalf("decode runtime log entry %q: %v", line, err)
+		}
+		entries = append(entries, entry)
+	}
+	return entries
 }
 
 func TestRuntimeRejectsInvalidDirectionInputs(t *testing.T) {

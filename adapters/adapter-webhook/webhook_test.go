@@ -340,6 +340,23 @@ func TestWebhookAdapterObservabilityCoversDispatchFailure(t *testing.T) {
 	if !strings.Contains(logs.String(), "webhook ingress dispatch failed") || !strings.Contains(logs.String(), "dispatch boom") || !strings.Contains(logs.String(), dispatchFailureCode) || !strings.Contains(logs.String(), dispatchFailureReasonGeneric) {
 		t.Fatalf("expected failure observability log with root cause, stable code, and generic failure reason, got %s", logs.String())
 	}
+	entries := decodeLogEntries(t, logs)
+	matched := false
+	for _, entry := range entries {
+		if entry.Message != "webhook ingress dispatch failed" {
+			continue
+		}
+		matched = true
+		if entry.Fields["component"] != "adapter_webhook" || entry.Fields["operation"] != "ingress.dispatch" {
+			t.Fatalf("expected webhook dispatch baseline fields, got %+v", entry)
+		}
+		if entry.Fields["error_category"] != "dependency" || entry.Fields["error_code"] != dispatchFailureReasonGeneric {
+			t.Fatalf("expected webhook dispatch taxonomy, got %+v", entry)
+		}
+	}
+	if !matched {
+		t.Fatalf("expected webhook dispatch failure log entry, got %+v", entries)
+	}
 	trace := adapter.Tracer.RenderTrace(dispatcher.event.TraceID)
 	if !strings.Contains(trace, "adapter.ingress") || !strings.Contains(trace, "adapter.ingress.failure") {
 		t.Fatalf("expected ingress and failure spans on dispatch failure, got %s", trace)
@@ -527,6 +544,16 @@ func TestWebhookAdapterReturnsInternalErrorWhenSecretMissing(t *testing.T) {
 	}
 	if !strings.Contains(logs.String(), "webhook secret resolution failed") || !strings.Contains(logs.String(), secretResolutionFailureCode) || !strings.Contains(logs.String(), "BOT_PLATFORM_MISSING_SECRET") || !strings.Contains(logs.String(), "secret_not_found") {
 		t.Fatalf("expected internal log to preserve root cause, stable code, and failure reason, got %s", logs.String())
+	}
+	logEntries := decodeLogEntries(t, logs)
+	if len(logEntries) != 1 {
+		t.Fatalf("expected one secret resolution log entry, got %+v", logEntries)
+	}
+	if logEntries[0].Fields["component"] != "adapter_webhook" || logEntries[0].Fields["operation"] != "ingress.secret_resolution" {
+		t.Fatalf("expected webhook secret resolution baseline fields, got %+v", logEntries[0])
+	}
+	if logEntries[0].Fields["error_category"] != "dependency" || logEntries[0].Fields["error_code"] != "secret_not_found" {
+		t.Fatalf("expected webhook secret resolution taxonomy, got %+v", logEntries[0])
 	}
 	trace := adapter.Tracer.RenderTrace(traceID)
 	if !strings.Contains(trace, "adapter.ingress.secret_resolution.failure") {
