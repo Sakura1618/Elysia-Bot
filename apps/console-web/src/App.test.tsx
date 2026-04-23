@@ -43,14 +43,19 @@ describe('App', () => {
   it('renders the routed local operator shell and overview from the live console payload', async () => {
     const fetchMock = vi.fn().mockResolvedValue(createFetchResponse(consolePayload));
     globalThis.fetch = fetchMock as typeof fetch;
+    window.localStorage.setItem('bot-platform.console.operator-bearer-token', 'opaque-viewer-token');
 
     render(<App />);
 
     expect(screen.getByText('Loading local operator console')).toBeInTheDocument();
     await screen.findByRole('heading', { name: 'Local operator console' });
 
-    expect(screen.getByText('Stored in this browser and sent via the existing runtime actor header. This is not a new auth/session system.')).toBeInTheDocument();
-    expect(screen.getByDisplayValue('viewer-user')).toBeInTheDocument();
+    expect(screen.getByText('Stored in this browser and sent as Authorization: Bearer .... The runtime resolves actor/session identity and returns that metadata in the console payload.')).toBeInTheDocument();
+    expect(screen.getByLabelText('Bearer token')).toHaveValue('opaque-viewer-token');
+    expect(screen.getByText('viewer-user')).toBeInTheDocument();
+    expect(screen.getByText('session-operator-bearer-viewer-user')).toBeInTheDocument();
+    expect(screen.getByText('viewer-main')).toBeInTheDocument();
+    expect(screen.getByText('bearer')).toBeInTheDocument();
     expect(screen.getByText('read+operator-plugin-enable-disable+plugin-config+job-retry+schedule-cancel')).toBeInTheDocument();
     expect(screen.getByText('Recovery and alert evidence')).toBeInTheDocument();
     expect(screen.getAllByText('job-dead-letter-console').length).toBeGreaterThan(0);
@@ -65,10 +70,10 @@ describe('App', () => {
     expect(requestURL).toBeInstanceOf(URL);
     expect((requestURL as URL).pathname).toBe('/api/console');
     expect(requestInit?.headers).toBeInstanceOf(Headers);
-    expect((requestInit?.headers as Headers).get('X-Bot-Platform-Actor')).toBe('viewer-user');
+    expect((requestInit?.headers as Headers).get('Authorization')).toBe('Bearer opaque-viewer-token');
   });
 
-  it('applies a new local operator identity and refetches the console snapshot with the runtime actor header', async () => {
+  it('applies a new local bearer token and refetches the console snapshot with Authorization bearer auth', async () => {
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce(createFetchResponse(consolePayload))
@@ -78,16 +83,16 @@ describe('App', () => {
     render(<App />);
     await screen.findByRole('heading', { name: 'Local operator console' });
 
-    fireEvent.change(screen.getByLabelText('Actor ID'), { target: { value: 'admin-user' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Apply identity' }));
+    fireEvent.change(screen.getByLabelText('Bearer token'), { target: { value: 'opaque-admin-token' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Apply token' }));
 
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledTimes(2);
     });
 
     const secondInit = fetchMock.mock.calls[1]?.[1];
-    expect((secondInit?.headers as Headers).get('X-Bot-Platform-Actor')).toBe('admin-user');
-    expect(window.localStorage.getItem('bot-platform.console.operator-identity')).toBe('admin-user');
+    expect((secondInit?.headers as Headers).get('Authorization')).toBe('Bearer opaque-admin-token');
+    expect(window.localStorage.getItem('bot-platform.console.operator-bearer-token')).toBe('opaque-admin-token');
   });
 
   it('navigates to a plugin detail route and submits the narrow plugin-echo config update through the existing runtime endpoint', async () => {
@@ -119,6 +124,7 @@ describe('App', () => {
       )
       .mockResolvedValueOnce(createFetchResponse(updatedPayload));
     globalThis.fetch = fetchMock as typeof fetch;
+    window.localStorage.setItem('bot-platform.console.operator-bearer-token', 'opaque-viewer-token');
 
     render(<App />);
     await screen.findByRole('heading', { name: 'Local operator console' });
@@ -140,7 +146,7 @@ describe('App', () => {
     const [actionURL, actionInit] = actionCall;
     expect(actionURL.pathname).toBe('/demo/plugins/plugin-echo/config');
     expect(actionInit?.method).toBe('POST');
-    expect((actionInit?.headers as Headers).get('X-Bot-Platform-Actor')).toBe('viewer-user');
+    expect((actionInit?.headers as Headers).get('Authorization')).toBe('Bearer opaque-viewer-token');
     expect(actionInit?.body).toBe(JSON.stringify({ prefix: 'operator: ' }));
     expect(fetchMock).toHaveBeenCalledTimes(4);
     const finalRequest = fetchMock.mock.calls[3]?.[0] as URL;
@@ -174,6 +180,7 @@ describe('App', () => {
       )
       .mockResolvedValueOnce(createFetchResponse(retriedPayload));
     globalThis.fetch = fetchMock as typeof fetch;
+    window.localStorage.setItem('bot-platform.console.operator-bearer-token', 'opaque-viewer-token');
 
     render(<App />);
     await screen.findByRole('heading', { name: 'Local operator console' });
@@ -189,8 +196,9 @@ describe('App', () => {
     if (!actionCall) {
       throw new Error('missing job retry action call');
     }
-    const [actionURL] = actionCall;
+    const [actionURL, actionInit] = actionCall;
     expect(actionURL.pathname).toBe('/demo/jobs/job-dead-letter-console/retry');
+    expect((actionInit?.headers as Headers).get('Authorization')).toBe('Bearer opaque-viewer-token');
     expect(fetchMock).toHaveBeenCalledTimes(4);
     const finalRequest = fetchMock.mock.calls[3]?.[0] as URL;
     expect(finalRequest.pathname).toBe('/api/console');
@@ -207,6 +215,7 @@ describe('App', () => {
       .mockResolvedValueOnce(createFetchResponse({ status: 'ok', schedule_id: 'schedule-console', action: 'cancel' }))
       .mockResolvedValueOnce(createFetchResponse(cancelledPayload));
     globalThis.fetch = fetchMock as typeof fetch;
+    window.localStorage.setItem('bot-platform.console.operator-bearer-token', 'opaque-viewer-token');
 
     render(<App />);
     await screen.findByRole('heading', { name: 'Local operator console' });
@@ -222,8 +231,9 @@ describe('App', () => {
     if (!actionCall) {
       throw new Error('missing schedule cancel action call');
     }
-    const [actionURL] = actionCall;
+    const [actionURL, actionInit] = actionCall;
     expect(actionURL.pathname).toBe('/demo/schedules/schedule-console/cancel');
+    expect((actionInit?.headers as Headers).get('Authorization')).toBe('Bearer opaque-viewer-token');
     expect(fetchMock).toHaveBeenCalledTimes(4);
     const finalRequest = fetchMock.mock.calls[3]?.[0] as URL;
     expect(finalRequest.pathname).toBe('/api/console');
@@ -280,7 +290,7 @@ describe('App', () => {
     render(<App />);
 
     await screen.findByText('Console API unavailable');
-    expect(screen.getByDisplayValue('viewer-user')).toBeInTheDocument();
+    expect(screen.getByLabelText('Bearer token')).toBeInTheDocument();
     expect(screen.getByText('permission denied')).toBeInTheDocument();
   });
 });

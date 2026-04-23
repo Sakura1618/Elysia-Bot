@@ -307,6 +307,12 @@ export type ConsoleMeta = {
   rbac_console_read_permission?: boolean;
   rbac_console_limitations?: string[];
   verification_endpoints?: string[];
+  request_identity?: {
+    actor_id?: string;
+    token_id?: string;
+    auth_method?: string;
+    session_id?: string;
+  };
   [key: string]: unknown;
 };
 

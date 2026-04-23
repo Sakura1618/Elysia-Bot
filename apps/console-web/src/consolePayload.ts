@@ -362,6 +362,12 @@ function hasMetaShape(value: unknown): boolean {
     (value.rbac_console_read_actor_header === undefined || isString(value.rbac_console_read_actor_header)) &&
     (value.rbac_console_read_permission === undefined || isBoolean(value.rbac_console_read_permission)) &&
     isStringArrayOrUndefined(value.rbac_console_limitations) &&
+    (value.request_identity === undefined ||
+      (isRecord(value.request_identity) &&
+        (value.request_identity.actor_id === undefined || isString(value.request_identity.actor_id)) &&
+        (value.request_identity.token_id === undefined || isString(value.request_identity.token_id)) &&
+        (value.request_identity.auth_method === undefined || isString(value.request_identity.auth_method)) &&
+        (value.request_identity.session_id === undefined || isString(value.request_identity.session_id)))) &&
     isStringArrayOrUndefined(value.verification_endpoints)
   );
 }

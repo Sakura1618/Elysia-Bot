@@ -1,9 +1,8 @@
 import { parseConsolePayload } from './consolePayload';
 import type { ConsoleFilters, ConsolePayload, OperatorActionResult } from './types';
 
-export const DEFAULT_ACTOR_HEADER = 'X-Bot-Platform-Actor';
-export const DEFAULT_OPERATOR_IDENTITY = 'viewer-user';
-export const LOCAL_OPERATOR_STORAGE_KEY = 'bot-platform.console.operator-identity';
+export const DEFAULT_OPERATOR_BEARER_TOKEN = '';
+export const LOCAL_OPERATOR_BEARER_TOKEN_STORAGE_KEY = 'bot-platform.console.operator-bearer-token';
 export const AUTO_REFRESH_STORAGE_KEY = 'bot-platform.console.auto-refresh';
 
 const consoleApiURL = import.meta.env.VITE_CONSOLE_API_URL ?? '/api/console';
@@ -17,17 +16,21 @@ export function getConsoleApiURL(): string {
   return consoleApiURL;
 }
 
-export function getStoredOperatorIdentity(): string {
-  const stored = window.localStorage.getItem(LOCAL_OPERATOR_STORAGE_KEY);
+export function getStoredOperatorBearerToken(): string {
+  const stored = window.localStorage.getItem(LOCAL_OPERATOR_BEARER_TOKEN_STORAGE_KEY);
   if (stored === null) {
-    return DEFAULT_OPERATOR_IDENTITY;
+    return DEFAULT_OPERATOR_BEARER_TOKEN;
   }
   return stored.trim();
 }
 
-export function persistOperatorIdentity(actor: string): string {
-  const normalized = actor.trim();
-  window.localStorage.setItem(LOCAL_OPERATOR_STORAGE_KEY, normalized);
+export function persistOperatorBearerToken(token: string): string {
+  const normalized = token.trim();
+  if (normalized === '') {
+    window.localStorage.removeItem(LOCAL_OPERATOR_BEARER_TOKEN_STORAGE_KEY);
+    return normalized;
+  }
+  window.localStorage.setItem(LOCAL_OPERATOR_BEARER_TOKEN_STORAGE_KEY, normalized);
   return normalized;
 }
 
@@ -68,23 +71,23 @@ export function buildRuntimeRequestURL(origin: string, path: string): URL {
   return new URL(normalizedPath, base);
 }
 
-export function createActorHeaders(actor: string, actorHeader = DEFAULT_ACTOR_HEADER, hasBody = false): Headers {
+export function createAuthorizationHeaders(bearerToken: string, hasBody = false): Headers {
   const headers = new Headers({
     Accept: 'application/json',
   });
   if (hasBody) {
     headers.set('Content-Type', 'application/json');
   }
-  const normalizedActor = actor.trim();
-  if (normalizedActor !== '') {
-    headers.set(actorHeader, normalizedActor);
+  const normalizedToken = bearerToken.trim();
+  if (normalizedToken !== '') {
+    headers.set('Authorization', `Bearer ${normalizedToken}`);
   }
   return headers;
 }
 
-export async function fetchConsolePayload(origin: string, actor: string, actorHeader: string, filters: ConsoleFilters): Promise<ConsolePayload> {
+export async function fetchConsolePayload(origin: string, bearerToken: string, filters: ConsoleFilters): Promise<ConsolePayload> {
   const response = await fetch(buildConsoleRequestURL(origin, filters), {
-    headers: createActorHeaders(actor, actorHeader),
+    headers: createAuthorizationHeaders(bearerToken),
   });
   if (!response.ok) {
     throw new Error(await response.text() || `Console API request failed: ${response.status}`);
@@ -94,14 +97,13 @@ export async function fetchConsolePayload(origin: string, actor: string, actorHe
 
 export async function postOperatorAction(
   origin: string,
-  actor: string,
-  actorHeader: string,
+  bearerToken: string,
   path: string,
   body?: Record<string, unknown>,
 ): Promise<OperatorActionResult> {
   const response = await fetch(buildRuntimeRequestURL(origin, path), {
     method: 'POST',
-    headers: createActorHeaders(actor, actorHeader, body !== undefined),
+    headers: createAuthorizationHeaders(bearerToken, body !== undefined),
     body: body === undefined ? undefined : JSON.stringify(body),
   });
 

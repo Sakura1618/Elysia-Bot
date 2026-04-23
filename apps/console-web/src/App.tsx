@@ -1,13 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import {
-  DEFAULT_ACTOR_HEADER,
-  DEFAULT_OPERATOR_IDENTITY,
+  DEFAULT_OPERATOR_BEARER_TOKEN,
   fetchConsolePayload,
   getConsoleApiURL,
   getStoredAutoRefresh,
-  getStoredOperatorIdentity,
+  getStoredOperatorBearerToken,
   persistAutoRefresh,
-  persistOperatorIdentity,
+  persistOperatorBearerToken,
   postOperatorAction,
 } from './consoleApiClient';
 import type {
@@ -157,6 +156,13 @@ function formatStringList(items: string[] | undefined): string {
     return '—';
   }
   return items.join(', ');
+}
+
+function formatResolvedIdentityField(value?: string | null): string {
+  if (!value || value.trim() === '') {
+    return 'not returned';
+  }
+  return value;
 }
 
 function formatAuditObservability(entry: AuditEntry): string {
@@ -379,14 +385,13 @@ function App() {
   const [refreshing, setRefreshing] = useState(false);
   const [lastFetchedAt, setLastFetchedAt] = useState<string>('');
   const [actionState, setActionState] = useState<ActionState>({ kind: 'idle' });
-  const [currentActor, setCurrentActor] = useState(() => getStoredOperatorIdentity());
-  const [actorDraft, setActorDraft] = useState(() => getStoredOperatorIdentity());
+  const [currentBearerToken, setCurrentBearerToken] = useState(() => getStoredOperatorBearerToken());
+  const [bearerTokenDraft, setBearerTokenDraft] = useState(() => getStoredOperatorBearerToken());
   const [autoRefresh, setAutoRefresh] = useState(() => getStoredAutoRefresh());
   const [pluginEchoPrefixDraft, setPluginEchoPrefixDraft] = useState('');
   const [pluginEchoDirty, setPluginEchoDirty] = useState(false);
   const hasLoadedOnce = useRef(false);
 
-  const actorHeader = data?.meta.rbac_console_read_actor_header ?? DEFAULT_ACTOR_HEADER;
   const effectiveFilters = useMemo<ConsoleFilters>(() => {
     return {
       logQuery: filters.logQuery,
@@ -432,7 +437,7 @@ function App() {
     }
 
     try {
-      const payload = await fetchConsolePayload(window.location.origin, currentActor, actorHeader, effectiveFilters);
+      const payload = await fetchConsolePayload(window.location.origin, currentBearerToken, effectiveFilters);
       hasLoadedOnce.current = true;
       setData(payload);
       setError('');
@@ -444,7 +449,7 @@ function App() {
       setLoading(false);
       setRefreshing(false);
     }
-  }, [actorHeader, currentActor, effectiveFilters]);
+  }, [currentBearerToken, effectiveFilters]);
 
   useEffect(() => {
     void refreshConsole();
@@ -485,14 +490,14 @@ function App() {
     setPluginEchoPrefixDraft(typeof persistedPrefix === 'string' ? persistedPrefix : '');
   }, [currentPlugin, pluginEchoDirty, route]);
 
-  const applyIdentity = useCallback(() => {
-    const normalized = persistOperatorIdentity(actorDraft);
-    if (normalized === currentActor) {
+  const applyBearerToken = useCallback(() => {
+    const normalized = persistOperatorBearerToken(bearerTokenDraft);
+    if (normalized === currentBearerToken) {
       void refreshConsole();
       return;
     }
-    setCurrentActor(normalized);
-  }, [actorDraft, currentActor, refreshConsole]);
+    setCurrentBearerToken(normalized);
+  }, [bearerTokenDraft, currentBearerToken, refreshConsole]);
 
   const toggleAutoRefresh = useCallback(() => {
     setAutoRefresh((current) => {
@@ -506,7 +511,7 @@ function App() {
     async (label: string, path: string, body?: Record<string, unknown>) => {
       setActionState({ kind: 'pending', label });
       try {
-        const result = await postOperatorAction(window.location.origin, currentActor, actorHeader, path, body);
+        const result = await postOperatorAction(window.location.origin, currentBearerToken, path, body);
         await refreshConsole();
         setActionState({
           kind: 'success',
@@ -523,19 +528,13 @@ function App() {
         });
       }
     },
-    [actorHeader, currentActor, refreshConsole],
+    [currentBearerToken, refreshConsole],
   );
 
-  const knownActors = useMemo(() => {
-    const actors = data?.config.RBAC ? Object.keys(data.config.RBAC.ActorRoles) : [];
-    if (actors.length === 0) {
-      return uniqueStrings([currentActor, DEFAULT_OPERATOR_IDENTITY]);
-    }
-    return actors.sort((left, right) => left.localeCompare(right));
-  }, [currentActor, data?.config.RBAC]);
-
-  const currentRoles = useMemo(() => actorRoles(data?.config, currentActor), [currentActor, data?.config]);
-  const currentPermissions = useMemo(() => actorPermissions(data?.config, currentActor), [currentActor, data?.config]);
+  const requestIdentity = data?.meta.request_identity;
+  const resolvedActor = requestIdentity?.actor_id?.trim() ?? '';
+  const currentRoles = useMemo(() => actorRoles(data?.config, resolvedActor), [data?.config, resolvedActor]);
+  const currentPermissions = useMemo(() => actorPermissions(data?.config, resolvedActor), [data?.config, resolvedActor]);
 
   const pluginAttention = useMemo(() => {
     const plugins = data?.plugins ?? [];
@@ -572,7 +571,7 @@ function App() {
     if (actionState.kind === 'pending') {
       return (
         <Panel title="Applying operator action" description={actionState.label} tone="muted">
-          <p className="muted-copy">Waiting for the runtime write endpoint to return and then refetching /api/console.</p>
+          <p className="muted-copy">Waiting for the runtime write endpoint to return and then refetching /api/console with the current bearer token.</p>
         </Panel>
       );
     }
@@ -595,11 +594,14 @@ function App() {
       <>
         <Panel
           title="Local operator console"
-          description="The browser stores a local operator actor ID and sends it through the existing runtime actor header. This is a dev/local identity flow, not a backend auth product."
+          description="The browser stores a local bearer token and sends Authorization: Bearer ... for console reads and operator writes. The runtime resolves actor and session identity; the browser only carries the token."
           actions={
             <div className="inline-badges">
               <StatusPill label={payload.meta.console_mode} tone="default" />
-              <StatusPill label={payload.meta.rbac_console_read_permission ? 'console read gated by actor header' : 'console read compatibility mode'} tone="warning" />
+              <StatusPill
+                label={payload.meta.request_identity?.auth_method === 'bearer' ? 'server resolved bearer identity' : 'request identity not returned'}
+                tone={payload.meta.request_identity?.auth_method === 'bearer' ? 'good' : 'warning'}
+              />
             </div>
           }
         >
@@ -847,7 +849,7 @@ function App() {
                   <div className="action-copy">
                     <strong>{plugin.enabled ? 'Disable plugin' : 'Enable plugin'}</strong>
                     <p>Persist the existing enabled overlay through the runtime admin command surface.</p>
-                    <span className="list-meta">Likely local actors: {formatStringList(actorsLikelyAllowed(payload.config, plugin.enabled ? 'plugin:disable' : 'plugin:enable', plugin.id))}</span>
+                    <span className="list-meta">Likely RBAC actors: {formatStringList(actorsLikelyAllowed(payload.config, plugin.enabled ? 'plugin:disable' : 'plugin:enable', plugin.id))}</span>
                   </div>
                   <button
                     type="button"
@@ -877,7 +879,7 @@ function App() {
                       <strong>Update plugin-echo prefix</strong>
                       <p>The config editor stays intentionally narrow to the existing `plugin-echo` persisted input contract.</p>
                       <span className="list-meta">Current prefix from /api/console: {currentPrefix || '(empty string)'}</span>
-                      <span className="list-meta">Likely local actors: {formatStringList(actorsLikelyAllowed(payload.config, 'plugin:config', plugin.id))}</span>
+                       <span className="list-meta">Likely RBAC actors: {formatStringList(actorsLikelyAllowed(payload.config, 'plugin:config', plugin.id))}</span>
                     </div>
                     <label className="field-label" htmlFor="plugin-echo-prefix">
                       Prefix
@@ -1065,7 +1067,7 @@ function App() {
                 <div className="action-copy">
                   <strong>Retry dead-letter job</strong>
                   <p>The button remains visible only because this route is where dead-letter evidence, alerts, and retry semantics meet.</p>
-                  <span className="list-meta">Likely local actors: {formatStringList(actorsLikelyAllowed(payload.config, 'job:retry', job.id))}</span>
+                  <span className="list-meta">Likely RBAC actors: {formatStringList(actorsLikelyAllowed(payload.config, 'job:retry', job.id))}</span>
                 </div>
                 <button
                   type="button"
@@ -1218,12 +1220,12 @@ function App() {
           </Panel>
 
           <div className="page-grid two-column">
-            <Panel title="Schedule cancel" description="Cancel remains a narrow runtime operator action; the browser just carries the actor header and refetches evidence afterward.">
+            <Panel title="Schedule cancel" description="Cancel remains a narrow runtime operator action; the browser carries bearer auth and refetches evidence afterward.">
               <div className="action-card">
                 <div className="action-copy">
                   <strong>Cancel schedule</strong>
                   <p>Useful for local/dev operators when a due or stale schedule should stop before the next scheduler loop.</p>
-                  <span className="list-meta">Likely local actors: {formatStringList(actorsLikelyAllowed(payload.config, 'schedule:cancel', schedule.id))}</span>
+                  <span className="list-meta">Likely RBAC actors: {formatStringList(actorsLikelyAllowed(payload.config, 'schedule:cancel', schedule.id))}</span>
                 </div>
                 <button
                   type="button"
@@ -1526,43 +1528,42 @@ function App() {
           <p className="eyebrow">bot-platform / Console Web A11</p>
           <h1>Local operator console</h1>
           <p>
-            Routed browser console for local operators. It reads from <code>{consoleApiURL}</code> and carries write actions through the existing runtime actor header model.
+            Routed browser console for local operators. It reads from <code>{consoleApiURL}</code> and carries write actions through bearer-token Authorization headers.
           </p>
         </div>
 
-        <Panel title="Local operator identity" description="Stored in this browser and sent via the existing runtime actor header. This is not a new auth/session system.">
+        <Panel title="Local bearer token" description="Stored in this browser and sent as Authorization: Bearer .... The runtime resolves actor/session identity and returns that metadata in the console payload.">
           <form
             className="identity-form"
             onSubmit={(event) => {
               event.preventDefault();
-              applyIdentity();
+              applyBearerToken();
             }}
           >
-            <label className="field-label" htmlFor="operator-identity">
-              Actor ID
+            <label className="field-label" htmlFor="operator-bearer-token">
+              Bearer token
             </label>
             <input
-              id="operator-identity"
+              id="operator-bearer-token"
               className="text-input"
-              value={actorDraft}
-              onChange={(event) => setActorDraft(event.target.value)}
-              placeholder={DEFAULT_OPERATOR_IDENTITY}
+              type="password"
+              value={bearerTokenDraft}
+              onChange={(event) => setBearerTokenDraft(event.target.value)}
+              placeholder={DEFAULT_OPERATOR_BEARER_TOKEN || 'opaque-operator-token'}
+              autoComplete="off"
+              spellCheck={false}
             />
-            <div className="quick-actions">
-              {knownActors.map((actor) => (
-                <button key={actor} type="button" className="chip-button" onClick={() => setActorDraft(actor)}>
-                  {actor}
-                </button>
-              ))}
-            </div>
             <button type="submit" className="primary-button">
-              Apply identity
+              Apply token
             </button>
           </form>
 
           <div className="identity-summary">
-            <DetailField label="Current actor" value={currentActor || 'header omitted'} />
-            <DetailField label="Actor header" value={actorHeader} />
+            <DetailField label="Request auth header" value={currentBearerToken === '' ? 'Authorization omitted' : 'Authorization: Bearer …'} />
+            <DetailField label="Resolved actor" value={formatResolvedIdentityField(requestIdentity?.actor_id)} />
+            <DetailField label="Resolved session" value={formatResolvedIdentityField(requestIdentity?.session_id)} />
+            <DetailField label="Resolved token ID" value={formatResolvedIdentityField(requestIdentity?.token_id)} />
+            <DetailField label="Resolved auth method" value={formatResolvedIdentityField(requestIdentity?.auth_method)} />
             <DetailField label="Roles from current snapshot" value={formatStringList(currentRoles)} />
             <DetailField label="Permissions from current snapshot" value={formatStringList(currentPermissions)} />
           </div>
@@ -1608,19 +1609,19 @@ function App() {
         {renderActionState()}
 
         {error !== '' ? (
-          <Panel title="Console API unavailable" description="The console keeps the local operator form visible so you can recover from a missing or denied actor header." tone="error">
+          <Panel title="Console API unavailable" description="The console keeps the local bearer token form visible so you can recover from a missing, invalid, or denied token." tone="error">
             <pre className="code-block">{error}</pre>
           </Panel>
         ) : null}
 
         {loading && data === null ? (
-          <Panel title="Loading local operator console" description={`Requesting ${consoleApiURL} with the current local actor header.`}>
+          <Panel title="Loading local operator console" description={`Requesting ${consoleApiURL} with the current browser bearer token.`}>
             <p className="muted-copy">The routed operator shell stays mounted while the first runtime snapshot loads.</p>
           </Panel>
         ) : data ? (
           renderPageContent(data)
         ) : (
-          <Panel title="Waiting for a valid runtime snapshot" description="Apply a different local actor identity or refresh once the runtime is available.">
+          <Panel title="Waiting for a valid runtime snapshot" description="Apply a bearer token or refresh once the runtime is available.">
             <p className="muted-copy">No compatible console payload is loaded yet.</p>
           </Panel>
         )}

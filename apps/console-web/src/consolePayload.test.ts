@@ -24,6 +24,12 @@ describe('parseConsolePayload', () => {
     expect(parsed.audits[0]?.session_id).toBe('session-operator-bearer-admin-user');
     expect(parsed.audits[0]?.error_code).toBe('plugin_disabled');
     expect(parsed.audits[2]?.session_id).toBe('session-operator-bearer-job-operator');
+    expect(parsed.meta.request_identity).toEqual({
+      actor_id: 'viewer-user',
+      token_id: 'viewer-main',
+      auth_method: 'bearer',
+      session_id: 'session-operator-bearer-viewer-user',
+    });
     expect(parsed.recovery.totalSchedules).toBe(1);
   });
 
@@ -67,6 +73,13 @@ describe('parseConsolePayload', () => {
   it('rejects payloads when audits no longer use the runtime occurred_at field', () => {
     const payload = cloneMockConsoleData();
     payload.audits[0] = { ...payload.audits[0], occurred_at: 123 as never };
+
+    expect(() => parseConsolePayload(payload)).toThrow('Console API payload shape is incompatible with Console Web A11');
+  });
+
+  it('rejects payloads when request identity metadata stops using strings', () => {
+    const payload = cloneMockConsoleData();
+    payload.meta.request_identity = { ...payload.meta.request_identity, actor_id: 123 as never };
 
     expect(() => parseConsolePayload(payload)).toThrow('Console API payload shape is incompatible with Console Web A11');
   });

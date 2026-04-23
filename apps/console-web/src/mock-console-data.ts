@@ -422,8 +422,14 @@ export const mockConsoleData: ConsolePayload = {
     schedule_operator_scope: 'currently-registered schedules only',
     rbac_console_read_actor_header: 'X-Bot-Platform-Actor',
     rbac_console_read_permission: true,
+    request_identity: {
+      actor_id: 'viewer-user',
+      token_id: 'viewer-main',
+      auth_method: 'bearer',
+      session_id: 'session-operator-bearer-viewer-user',
+    },
     rbac_console_limitations: [
-      'console read authorization currently reads actor only from the X-Bot-Platform-Actor header',
+      'console read authorization uses bearer-backed request identity when operator_auth.tokens is configured; otherwise it falls back to the X-Bot-Platform-Actor header',
       'current slice persists and reloads a single runtime snapshot but does not add login/authn UX or a global resource hierarchy',
     ],
     verification_endpoints: ['GET /api/console', 'GET /metrics', 'GET /demo/state/counts'],
