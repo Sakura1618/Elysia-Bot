@@ -142,6 +142,7 @@ func TestDevelopmentConfigWebhookSecretMainPathContractStaysAligned(t *testing.T
 
 	contract := WebhookSecretMainPathContract()
 	aiContract := AIChatAPIKeySecretContract()
+	operatorAuthContract := OperatorAuthTokenSecretContract()
 	configPath := filepath.Join("..", "..", "deploy", "config.dev.yaml")
 	cfg, err := LoadConfig(configPath)
 	if err != nil {
@@ -155,17 +156,17 @@ func TestDevelopmentConfigWebhookSecretMainPathContractStaysAligned(t *testing.T
 	if policy.MainPathContract != contract {
 		t.Fatalf("expected secret policy main path contract %+v, got %+v", contract, policy.MainPathContract)
 	}
-	if len(policy.ConfigRefs) != 2 || policy.ConfigRefs[0] != contract.ConfigRef || policy.ConfigRefs[1] != aiContract.ConfigRef {
+	if len(policy.ConfigRefs) != 3 || policy.ConfigRefs[0] != contract.ConfigRef || policy.ConfigRefs[1] != aiContract.ConfigRef || policy.ConfigRefs[2] != operatorAuthContract.ConfigRef {
 		t.Fatalf("expected secret policy config ref %q, got %+v", contract.ConfigRef, policy.ConfigRefs)
 	}
-	if len(policy.AdditionalContracts) != 1 || policy.AdditionalContracts[0] != aiContract {
-		t.Fatalf("expected ai-chat secret policy additional contract %+v, got %+v", aiContract, policy.AdditionalContracts)
+	if len(policy.AdditionalContracts) != 2 || policy.AdditionalContracts[0] != aiContract || policy.AdditionalContracts[1] != operatorAuthContract {
+		t.Fatalf("expected ai-chat and operator-auth secret policy additional contracts %+v %+v, got %+v", aiContract, operatorAuthContract, policy.AdditionalContracts)
 	}
-	if len(policy.IntegrationPoints) != 4 || policy.IntegrationPoints[0] != contract.ConfigRef || policy.IntegrationPoints[1] != contract.Consumer || policy.IntegrationPoints[2] != aiContract.ConfigRef || policy.IntegrationPoints[3] != aiContract.Consumer {
-		t.Fatalf("expected secret policy integration points [%q %q %q %q], got %+v", contract.ConfigRef, contract.Consumer, aiContract.ConfigRef, aiContract.Consumer, policy.IntegrationPoints)
+	if len(policy.IntegrationPoints) != 6 || policy.IntegrationPoints[0] != contract.ConfigRef || policy.IntegrationPoints[1] != contract.Consumer || policy.IntegrationPoints[2] != aiContract.ConfigRef || policy.IntegrationPoints[3] != aiContract.Consumer || policy.IntegrationPoints[4] != operatorAuthContract.ConfigRef || policy.IntegrationPoints[5] != operatorAuthContract.Consumer {
+		t.Fatalf("expected secret policy integration points [%q %q %q %q %q %q], got %+v", contract.ConfigRef, contract.Consumer, aiContract.ConfigRef, aiContract.Consumer, operatorAuthContract.ConfigRef, operatorAuthContract.Consumer, policy.IntegrationPoints)
 	}
-	if !strings.Contains(strings.Join(policy.Facts, " "), contract.PathNote) || !strings.Contains(strings.Join(policy.Facts, " "), aiContract.PathNote) {
-		t.Fatalf("expected secret policy facts to include path notes %q and %q, got %+v", contract.PathNote, aiContract.PathNote, policy.Facts)
+	if !strings.Contains(strings.Join(policy.Facts, " "), contract.PathNote) || !strings.Contains(strings.Join(policy.Facts, " "), aiContract.PathNote) || !strings.Contains(strings.Join(policy.Facts, " "), operatorAuthContract.PathNote) {
+		t.Fatalf("expected secret policy facts to include path notes %q, %q, and %q, got %+v", contract.PathNote, aiContract.PathNote, operatorAuthContract.PathNote, policy.Facts)
 	}
 }
 
@@ -295,6 +296,66 @@ func TestLoadConfigReadsRuntimeRBACSection(t *testing.T) {
 	policy := cfg.RBAC.Policies["admin"]
 	if len(policy.Permissions) != 3 || len(policy.PluginScope) != 1 || policy.PluginScope[0] != "*" {
 		t.Fatalf("unexpected RBAC policy %+v", policy)
+	}
+}
+
+func TestLoadConfigReadsOperatorAuthTokens(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	raw := []byte("runtime:\n  environment: development\n  log_level: debug\n  http_port: 8080\nrbac:\n  actor_roles:\n    admin-user: [admin]\n  policies:\n    admin:\n      permissions: [console:read]\n      plugin_scope: ['console']\noperator_auth:\n  tokens:\n    - id: console-main\n      actor_id: admin-user\n      token_ref: BOT_PLATFORM_OPERATOR_TOKEN\n")
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.OperatorAuth == nil {
+		t.Fatal("expected operator auth config to be present")
+	}
+	if len(cfg.OperatorAuth.Tokens) != 1 {
+		t.Fatalf("expected one operator auth token, got %+v", cfg.OperatorAuth.Tokens)
+	}
+	token := cfg.OperatorAuth.Tokens[0]
+	if token.ID != "console-main" || token.ActorID != "admin-user" || token.TokenRef != "BOT_PLATFORM_OPERATOR_TOKEN" {
+		t.Fatalf("unexpected operator auth token %+v", token)
+	}
+}
+
+func TestLoadConfigRejectsOperatorAuthTokenRefForUnknownActor(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	raw := []byte("runtime:\n  environment: development\n  log_level: debug\n  http_port: 8080\nrbac:\n  actor_roles:\n    admin-user: [admin]\noperator_auth:\n  tokens:\n    - id: console-main\n      actor_id: missing-user\n      token_ref: BOT_PLATFORM_OPERATOR_TOKEN\n")
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	_, err := LoadConfig(path)
+	expected := `operator_auth.tokens[0].actor_id "missing-user" must reference an existing rbac.actor_roles entry`
+	if err == nil || err.Error() != expected {
+		t.Fatalf("expected missing operator actor rejection, got %v", err)
+	}
+}
+
+func TestLoadConfigRejectsInvalidOperatorAuthTokenRef(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	raw := []byte("runtime:\n  environment: development\n  log_level: debug\n  http_port: 8080\nrbac:\n  actor_roles:\n    admin-user: [admin]\noperator_auth:\n  tokens:\n    - id: console-main\n      actor_id: admin-user\n      token_ref: db.password\n")
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	_, err := LoadConfig(path)
+	expected := "invalid operator_auth.tokens[0].token_ref: secret ref must use BOT_PLATFORM_ prefix"
+	if err == nil || err.Error() != expected {
+		t.Fatalf("expected invalid operator auth token ref rejection, got %v", err)
 	}
 }
 

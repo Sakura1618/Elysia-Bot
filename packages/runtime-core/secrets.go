@@ -19,17 +19,19 @@ type SecretProvider interface {
 var secretRefPattern = regexp.MustCompile(`^[A-Z0-9_]+$`)
 
 const (
-	secretRefPrefix                 = "BOT_PLATFORM_"
-	secretProviderEnv               = "env"
-	secretFailureInvalidRef         = "invalid_secret_ref"
-	secretFailureNotFound           = "secret_not_found"
-	secretFailureReadCanceled       = "secret_read_canceled"
-	secretFailureGenericReadFail    = "secret_read_failed"
-	webhookTokenSecretConfigRef     = "secrets.webhook_token_ref"
-	webhookTokenSecretDefaultDevRef = "BOT_PLATFORM_WEBHOOK_TOKEN"
-	webhookTokenSecretConsumer      = "adapter-webhook.NewWithSecretRef"
-	aiChatAPIKeySecretConfigRef     = "secrets.ai_chat_api_key_ref"
-	aiChatAPIKeySecretConsumer      = "apps/runtime.buildAIProvider"
+	secretRefPrefix                  = "BOT_PLATFORM_"
+	secretProviderEnv                = "env"
+	secretFailureInvalidRef          = "invalid_secret_ref"
+	secretFailureNotFound            = "secret_not_found"
+	secretFailureReadCanceled        = "secret_read_canceled"
+	secretFailureGenericReadFail     = "secret_read_failed"
+	webhookTokenSecretConfigRef      = "secrets.webhook_token_ref"
+	webhookTokenSecretDefaultDevRef  = "BOT_PLATFORM_WEBHOOK_TOKEN"
+	webhookTokenSecretConsumer       = "adapter-webhook.NewWithSecretRef"
+	aiChatAPIKeySecretConfigRef      = "secrets.ai_chat_api_key_ref"
+	aiChatAPIKeySecretConsumer       = "apps/runtime.buildAIProvider"
+	operatorAuthTokenSecretConfigRef = "operator_auth.tokens[].token_ref"
+	operatorAuthTokenSecretConsumer  = "runtimecore.NewOperatorBearerIdentityResolver"
 )
 
 type SecretContract struct {
@@ -81,19 +83,30 @@ func AIChatAPIKeySecretContract() SecretContract {
 	}
 }
 
+func OperatorAuthTokenSecretContract() SecretContract {
+	pathNote := operatorAuthTokenSecretConfigRef + " -> " + operatorAuthTokenSecretConsumer + " -> SecretRegistry.Resolve"
+	return SecretContract{
+		ConfigRef:     operatorAuthTokenSecretConfigRef,
+		DefaultDevRef: "",
+		Consumer:      operatorAuthTokenSecretConsumer,
+		PathNote:      pathNote,
+	}
+}
+
 func SecretPolicy() SecretPolicyDeclaration {
 	contract := WebhookSecretMainPathContract()
 	aiChatContract := AIChatAPIKeySecretContract()
+	operatorAuthContract := OperatorAuthTokenSecretContract()
 	declaration := SecretPolicyDeclaration{
 		Provider:              secretProviderEnv,
 		RefPrefix:             secretRefPrefix,
 		RefFormat:             "BOT_PLATFORM_[A-Z0-9_]+",
 		RuntimeOwned:          true,
 		MainPathContract:      contract,
-		AdditionalContracts:   []SecretContract{aiChatContract},
-		ConfigRefs:            []string{contract.ConfigRef, aiChatContract.ConfigRef},
-		ActiveConsumers:       []string{"adapter-webhook", "apps/runtime"},
-		IntegrationPoints:     []string{contract.ConfigRef, contract.Consumer, aiChatContract.ConfigRef, aiChatContract.Consumer},
+		AdditionalContracts:   []SecretContract{aiChatContract, operatorAuthContract},
+		ConfigRefs:            []string{contract.ConfigRef, aiChatContract.ConfigRef, operatorAuthContract.ConfigRef},
+		ActiveConsumers:       []string{"adapter-webhook", "apps/runtime", "runtime-core"},
+		IntegrationPoints:     []string{contract.ConfigRef, contract.Consumer, aiChatContract.ConfigRef, aiChatContract.Consumer, operatorAuthContract.ConfigRef, operatorAuthContract.Consumer},
 		AuditAction:           "secret.read",
 		AuditOutcomes:         []string{"success", secretFailureInvalidRef, secretFailureNotFound, secretFailureReadCanceled, secretFailureGenericReadFail},
 		UnsupportedModes:      []string{"multi-provider", "secret-write-api", "rotation", "versioning", "scope-based-secret-authorization", "console-secret-management", "plugin-secret-injection"},
@@ -101,11 +114,11 @@ func SecretPolicy() SecretPolicyDeclaration {
 		Facts: []string{
 			"secret refs must be runtime-owned BOT_PLATFORM_* names and may contain only A-Z, 0-9, and _",
 			"the only provider wired today is environment-variable lookup via EnvSecretProvider",
-			"real config-to-read paths wired today are " + contract.PathNote + " and " + aiChatContract.PathNote,
+			"real config-to-read paths wired today are " + contract.PathNote + ", " + aiChatContract.PathNote + ", and " + operatorAuthContract.PathNote,
 			"every registry resolve records secret.read audit with success or failure reason while webhook clients still receive only generic secret resolution failures",
 		},
 	}
-	declaration.Summary = "provider=env; runtime-owned BOT_PLATFORM_* refs only; current active read paths are " + contract.ConfigRef + " -> " + contract.Consumer + " and " + aiChatContract.ConfigRef + " -> " + aiChatContract.Consumer + "; every resolve records secret.read audit; no multi-provider or secret write API"
+	declaration.Summary = "provider=env; runtime-owned BOT_PLATFORM_* refs only; current active read paths are " + contract.ConfigRef + " -> " + contract.Consumer + ", " + aiChatContract.ConfigRef + " -> " + aiChatContract.Consumer + ", and " + operatorAuthContract.ConfigRef + " -> " + operatorAuthContract.Consumer + "; every resolve records secret.read audit; no multi-provider or secret write API"
 	return declaration
 }
 

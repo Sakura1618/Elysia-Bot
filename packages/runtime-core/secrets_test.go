@@ -3,6 +3,7 @@ package runtimecore
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -94,6 +95,7 @@ func TestSecretPolicyDeclaresCurrentRuntimeBoundaries(t *testing.T) {
 
 	policy := SecretPolicy()
 	aiContract := AIChatAPIKeySecretContract()
+	operatorAuthContract := OperatorAuthTokenSecretContract()
 	if policy.Provider != "env" {
 		t.Fatalf("expected env provider, got %q", policy.Provider)
 	}
@@ -103,13 +105,13 @@ func TestSecretPolicyDeclaresCurrentRuntimeBoundaries(t *testing.T) {
 	if !policy.RuntimeOwned {
 		t.Fatal("expected runtime-owned secret refs")
 	}
-	if len(policy.ConfigRefs) != 2 || policy.ConfigRefs[0] != "secrets.webhook_token_ref" || policy.ConfigRefs[1] != aiContract.ConfigRef {
+	if len(policy.ConfigRefs) != 3 || policy.ConfigRefs[0] != "secrets.webhook_token_ref" || policy.ConfigRefs[1] != aiContract.ConfigRef || policy.ConfigRefs[2] != operatorAuthContract.ConfigRef {
 		t.Fatalf("expected webhook config ref declaration, got %+v", policy.ConfigRefs)
 	}
-	if len(policy.ActiveConsumers) != 2 || policy.ActiveConsumers[0] != "adapter-webhook" || policy.ActiveConsumers[1] != "apps/runtime" {
-		t.Fatalf("expected adapter-webhook and apps/runtime as active consumers, got %+v", policy.ActiveConsumers)
+	if len(policy.ActiveConsumers) != 3 || policy.ActiveConsumers[0] != "adapter-webhook" || policy.ActiveConsumers[1] != "apps/runtime" || policy.ActiveConsumers[2] != "runtime-core" {
+		t.Fatalf("expected adapter-webhook, apps/runtime, and runtime-core as active consumers, got %+v", policy.ActiveConsumers)
 	}
-	if len(policy.AdditionalContracts) != 1 || policy.AdditionalContracts[0] != aiContract {
+	if len(policy.AdditionalContracts) != 2 || policy.AdditionalContracts[0] != aiContract || policy.AdditionalContracts[1] != operatorAuthContract {
 		t.Fatalf("expected ai chat secret contract declaration, got %+v", policy.AdditionalContracts)
 	}
 	if !containsSecretPolicyString(policy.IntegrationPoints, "adapter-webhook.NewWithSecretRef") {
@@ -117,6 +119,9 @@ func TestSecretPolicyDeclaresCurrentRuntimeBoundaries(t *testing.T) {
 	}
 	if !containsSecretPolicyString(policy.IntegrationPoints, aiContract.Consumer) {
 		t.Fatalf("expected ai chat integration point %q, got %+v", aiContract.Consumer, policy.IntegrationPoints)
+	}
+	if !containsSecretPolicyString(policy.IntegrationPoints, operatorAuthContract.Consumer) {
+		t.Fatalf("expected operator auth integration point %q, got %+v", operatorAuthContract.Consumer, policy.IntegrationPoints)
 	}
 	if policy.AuditAction != "secret.read" {
 		t.Fatalf("expected secret.read audit action, got %q", policy.AuditAction)
@@ -136,7 +141,7 @@ func TestSecretPolicyDeclaresCurrentRuntimeBoundaries(t *testing.T) {
 			t.Fatalf("expected verification endpoint %q, got %+v", expected, policy.VerificationEndpoints)
 		}
 	}
-	for _, expected := range []string{"BOT_PLATFORM_*", "EnvSecretProvider", "secrets.webhook_token_ref", aiContract.ConfigRef, "SecretRegistry.Resolve", aiContract.Consumer, "generic secret resolution failures"} {
+	for _, expected := range []string{"BOT_PLATFORM_*", "EnvSecretProvider", "secrets.webhook_token_ref", aiContract.ConfigRef, operatorAuthContract.ConfigRef, "SecretRegistry.Resolve", aiContract.Consumer, operatorAuthContract.Consumer, "generic secret resolution failures"} {
 		if !strings.Contains(policy.Summary+" "+strings.Join(policy.Facts, " "), expected) {
 			t.Fatalf("expected declaration to mention %q, got summary=%q facts=%+v", expected, policy.Summary, policy.Facts)
 		}
@@ -144,12 +149,7 @@ func TestSecretPolicyDeclaresCurrentRuntimeBoundaries(t *testing.T) {
 }
 
 func containsSecretPolicyString(items []string, target string) bool {
-	for _, item := range items {
-		if item == target {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(items, target)
 }
 
 func TestSecretRegistryRejectsBarePrefixAndLowercaseSecretRefs(t *testing.T) {

@@ -14,11 +14,12 @@ import (
 )
 
 type Config struct {
-	Runtime RuntimeConfig `yaml:"runtime"`
-	Tracing TracingConfig `yaml:"tracing,omitempty"`
-	AIChat  AIChatConfig  `yaml:"ai_chat,omitempty"`
-	Secrets SecretsConfig `yaml:"secrets,omitempty"`
-	RBAC    *RBACConfig   `yaml:"rbac,omitempty"`
+	Runtime      RuntimeConfig       `yaml:"runtime"`
+	Tracing      TracingConfig       `yaml:"tracing,omitempty"`
+	AIChat       AIChatConfig        `yaml:"ai_chat,omitempty"`
+	Secrets      SecretsConfig       `yaml:"secrets,omitempty"`
+	RBAC         *RBACConfig         `yaml:"rbac,omitempty"`
+	OperatorAuth *OperatorAuthConfig `yaml:"operator_auth,omitempty"`
 }
 
 type RuntimeConfig struct {
@@ -70,6 +71,16 @@ type RBACConfig struct {
 	ConsoleReadPermission string                                   `yaml:"console_read_permission,omitempty"`
 }
 
+type OperatorAuthConfig struct {
+	Tokens []OperatorAuthTokenConfig `yaml:"tokens,omitempty"`
+}
+
+type OperatorAuthTokenConfig struct {
+	ID       string `yaml:"id,omitempty"`
+	ActorID  string `yaml:"actor_id,omitempty"`
+	TokenRef string `yaml:"token_ref,omitempty"`
+}
+
 func (c *RBACConfig) Validate() error {
 	if c == nil {
 		return nil
@@ -87,6 +98,60 @@ func (c *RBACConfig) Validate() error {
 		}
 	}
 	return nil
+}
+
+func (c *OperatorAuthConfig) Validate(rbac *RBACConfig) error {
+	if c == nil {
+		return nil
+	}
+	seenIDs := make(map[string]struct{}, len(c.Tokens))
+	for index, token := range c.Tokens {
+		if err := validateOperatorAuthTokenID(token.ID); err != nil {
+			return fmt.Errorf("invalid operator_auth.tokens[%d].id: %w", index, err)
+		}
+		if _, exists := seenIDs[token.ID]; exists {
+			return fmt.Errorf("operator_auth.tokens[%d].id %q must be unique", index, token.ID)
+		}
+		seenIDs[token.ID] = struct{}{}
+		if err := validateOperatorAuthActorID(token.ActorID); err != nil {
+			return fmt.Errorf("invalid operator_auth.tokens[%d].actor_id: %w", index, err)
+		}
+		if err := ValidateSecretRef(token.TokenRef); err != nil {
+			return fmt.Errorf("invalid operator_auth.tokens[%d].token_ref: %w", index, err)
+		}
+		if !operatorAuthActorExists(rbac, token.ActorID) {
+			return fmt.Errorf("operator_auth.tokens[%d].actor_id %q must reference an existing rbac.actor_roles entry", index, token.ActorID)
+		}
+	}
+	return nil
+}
+
+func validateOperatorAuthTokenID(tokenID string) error {
+	if strings.TrimSpace(tokenID) == "" {
+		return fmt.Errorf("token id is required")
+	}
+	if tokenID != strings.TrimSpace(tokenID) {
+		return fmt.Errorf("token id must not contain leading or trailing whitespace")
+	}
+	return nil
+}
+
+func validateOperatorAuthActorID(actorID string) error {
+	if strings.TrimSpace(actorID) == "" {
+		return fmt.Errorf("actor id is required")
+	}
+	if actorID != strings.TrimSpace(actorID) {
+		return fmt.Errorf("actor id must not contain leading or trailing whitespace")
+	}
+	return nil
+}
+
+func operatorAuthActorExists(rbac *RBACConfig, actorID string) bool {
+	if rbac == nil || len(rbac.ActorRoles) == 0 {
+		return false
+	}
+	_, exists := rbac.ActorRoles[actorID]
+	return exists
 }
 
 func validateRBACPermission(permission string) error {
@@ -128,6 +193,9 @@ func LoadConfig(path string) (Config, error) {
 		}
 	}
 	if err := cfg.RBAC.Validate(); err != nil {
+		return Config{}, err
+	}
+	if err := cfg.OperatorAuth.Validate(cfg.RBAC); err != nil {
 		return Config{}, err
 	}
 
