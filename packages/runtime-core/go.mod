@@ -3,7 +3,7 @@ module github.com/ohmyopencode/bot-platform/packages/runtime-core
 go 1.25.0
 
 require (
-	github.com/jackc/pgx/v5 v5.9.0
+	github.com/jackc/pgx/v5 v5.9.2
 	github.com/ohmyopencode/bot-platform/packages/event-model v0.0.0
 	github.com/ohmyopencode/bot-platform/packages/plugin-sdk v0.0.0
 	github.com/robfig/cron/v3 v3.0.1
