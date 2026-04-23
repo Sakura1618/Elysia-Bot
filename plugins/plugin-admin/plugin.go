@@ -3,7 +3,6 @@ package pluginadmin
 import (
 	"errors"
 	"fmt"
-	"reflect"
 	"strings"
 	"time"
 
@@ -84,24 +83,24 @@ func (p *Plugin) OnCommand(command eventmodel.CommandInvocation, ctx eventmodel.
 
 	parts := commandArguments(command)
 	if len(parts) < 3 {
-		return p.recordAndJoin(command, actor, command.Name, command.Raw, "", false, errors.New("admin command requires action and target"))
+		return p.recordAndJoin(command, ctx, actor, command.Name, command.Raw, "", false, errors.New("admin command requires action and target"))
 	}
 
 	action := parts[1]
 	target := parts[2]
 	if action == "prepare" || action == "activate" {
-		return p.handleRollout(command, actor, action, target)
+		return p.handleRollout(command, ctx, actor, action, target)
 	}
 	if action == "replay" {
-		return p.handleReplay(command, actor, target)
+		return p.handleReplay(command, ctx, actor, target)
 	}
 	permission := permissionForAction(action)
 	if permission == "" {
-		return p.recordAndJoin(command, actor, action, target, "", false, fmt.Errorf("unsupported admin action %q", action))
+		return p.recordAndJoin(command, ctx, actor, action, target, "", false, fmt.Errorf("unsupported admin action %q", action))
 	}
 	decision := p.currentAuthorizer().Authorize(actor, permission, target)
 	if !decision.Allowed {
-		return p.recordAndJoin(command, actor, action, target, permission, false, errors.New(decision.Reason))
+		return p.recordAndJoin(command, ctx, actor, action, target, permission, false, errors.New(decision.Reason))
 	}
 
 	var err error
@@ -111,33 +110,33 @@ func (p *Plugin) OnCommand(command eventmodel.CommandInvocation, ctx eventmodel.
 	case "disable":
 		err = p.Lifecycle.Disable(target)
 	}
-	return p.recordAndJoin(command, actor, action, target, permission, true, err)
+	return p.recordAndJoin(command, ctx, actor, action, target, permission, true, err)
 }
 
-func (p *Plugin) handleReplay(command eventmodel.CommandInvocation, actor, eventID string) error {
+func (p *Plugin) handleReplay(command eventmodel.CommandInvocation, ctx eventmodel.ExecutionContext, actor, eventID string) error {
 	permission := permissionForAction("replay")
 	decision := p.currentAuthorizer().AuthorizeTarget(actor, permission, pluginsdk.AuthorizationTargetEvent, eventID)
 	if !decision.Allowed {
-		return p.recordAndJoin(command, actor, "replay", eventID, permission, false, errors.New(decision.Reason))
+		return p.recordAndJoin(command, ctx, actor, "replay", eventID, permission, false, errors.New(decision.Reason))
 	}
 	if p.Replay == nil {
-		return p.recordAndJoin(command, actor, "replay", eventID, permission, true, errors.New("replay service is required"))
+		return p.recordAndJoin(command, ctx, actor, "replay", eventID, permission, true, errors.New("replay service is required"))
 	}
 	_, err := p.Replay.ReplayEvent(eventID)
-	return p.recordAndJoin(command, actor, "replay", eventID, permission, true, err)
+	return p.recordAndJoin(command, ctx, actor, "replay", eventID, permission, true, err)
 }
 
-func (p *Plugin) handleRollout(command eventmodel.CommandInvocation, actor, action, target string) error {
+func (p *Plugin) handleRollout(command eventmodel.CommandInvocation, ctx eventmodel.ExecutionContext, actor, action, target string) error {
 	permission := permissionForAction(action)
 	if permission == "" {
-		return p.recordAndJoin(command, actor, action, target, "", false, fmt.Errorf("unsupported admin action %q", action))
+		return p.recordAndJoin(command, ctx, actor, action, target, "", false, fmt.Errorf("unsupported admin action %q", action))
 	}
 	decision := p.currentAuthorizer().Authorize(actor, permission, target)
 	if !decision.Allowed {
-		return p.recordAndJoin(command, actor, action, target, permission, false, errors.New(decision.Reason))
+		return p.recordAndJoin(command, ctx, actor, action, target, permission, false, errors.New(decision.Reason))
 	}
 	if p.Rollouts == nil {
-		return p.recordAndJoin(command, actor, action, target, permission, true, errors.New("rollout manager is required"))
+		return p.recordAndJoin(command, ctx, actor, action, target, permission, true, errors.New("rollout manager is required"))
 	}
 	var err error
 	switch action {
@@ -156,15 +155,15 @@ func (p *Plugin) handleRollout(command eventmodel.CommandInvocation, actor, acti
 		}
 		_, err = p.Rollouts.Activate(target)
 	}
-	return p.recordAndJoin(command, actor, action, target, permission, true, err)
+	return p.recordAndJoin(command, ctx, actor, action, target, permission, true, err)
 }
 
 func (p *Plugin) AuditLog() []pluginsdk.AuditEntry {
 	return append([]pluginsdk.AuditEntry(nil), p.AuditTrail...)
 }
 
-func (p *Plugin) recordAndJoin(command eventmodel.CommandInvocation, actor, action, target, permission string, allowed bool, actionErr error) error {
-	auditErr := p.recordAudit(command, actor, action, target, permission, allowed, auditReason(action, actionErr))
+func (p *Plugin) recordAndJoin(command eventmodel.CommandInvocation, executionContext eventmodel.ExecutionContext, actor, action, target, permission string, allowed bool, actionErr error) error {
+	auditErr := p.recordAudit(command, executionContext, actor, action, target, permission, allowed, auditReason(action, permission, actionErr))
 	if actionErr != nil && auditErr != nil {
 		return errors.Join(actionErr, fmt.Errorf("record audit: %w", auditErr))
 	}
@@ -174,19 +173,32 @@ func (p *Plugin) recordAndJoin(command eventmodel.CommandInvocation, actor, acti
 	return auditErr
 }
 
-func (p *Plugin) recordAudit(command eventmodel.CommandInvocation, actor, action, target, permission string, allowed bool, reason string) error {
+func (p *Plugin) recordAudit(command eventmodel.CommandInvocation, executionContext eventmodel.ExecutionContext, actor, action, target, permission string, allowed bool, reason string) error {
+	reason = strings.TrimSpace(reason)
 	entry := pluginsdk.AuditEntry{
-		Actor:      actor,
-		Permission: permission,
-		Action:     action,
-		Target:     target,
+		Actor:      strings.TrimSpace(actor),
+		Permission: strings.TrimSpace(permission),
+		Action:     auditActionName(action, permission),
+		Target:     strings.TrimSpace(target),
 		Allowed:    allowed,
 		OccurredAt: p.CurrentTime().Format(time.RFC3339),
 	}
+	if reason != "" {
+		entry.Reason = reason
+		if shouldNormalizeOperatorAudit(permission) {
+			if allowed {
+				entry.ErrorCategory = "operator"
+				entry.ErrorCode = reason
+			} else {
+				entry.ErrorCategory = "authorization"
+				entry.ErrorCode = reason
+			}
+		}
+	}
+	applyAuditExecutionContext(&entry, executionContext)
 	if sessionID := commandSessionIDFromMetadata(command); sessionID != "" {
 		entry.SessionID = sessionID
 	}
-	setAuditReason(&entry, reason)
 	p.AuditTrail = append(p.AuditTrail, entry)
 	if p.AuditRecorder != nil {
 		return p.AuditRecorder.RecordAudit(entry)
@@ -194,20 +206,82 @@ func (p *Plugin) recordAudit(command eventmodel.CommandInvocation, actor, action
 	return nil
 }
 
-func setAuditReason(entry *pluginsdk.AuditEntry, reason string) {
-	if entry == nil || reason == "" {
-		return
+func auditActionName(action, permission string) string {
+	permission = strings.TrimSpace(permission)
+	switch permission {
+	case "plugin:enable":
+		return "plugin.enable"
+	case "plugin:disable":
+		return "plugin.disable"
 	}
-	value := reflect.ValueOf(entry).Elem()
-	field := value.FieldByName("Reason")
-	if field.IsValid() && field.CanSet() && field.Kind() == reflect.String {
-		field.SetString(reason)
+	if permission != "" {
+		if !shouldNormalizeOperatorAudit(permission) {
+			return strings.TrimSpace(action)
+		}
+		return strings.ReplaceAll(permission, ":", ".")
+	}
+	return strings.TrimSpace(action)
+}
+
+func shouldNormalizeOperatorAudit(permission string) bool {
+	permission = strings.TrimSpace(permission)
+	switch permission {
+	case "plugin:enable", "plugin:disable":
+		return true
+	default:
+		return false
 	}
 }
 
-func auditReason(action string, actionErr error) string {
+func applyAuditExecutionContext(entry *pluginsdk.AuditEntry, ctx eventmodel.ExecutionContext) {
+	if entry == nil {
+		return
+	}
+	ctx = normalizeAuditExecutionContext(ctx)
+	if strings.TrimSpace(entry.TraceID) == "" {
+		entry.TraceID = strings.TrimSpace(ctx.TraceID)
+	}
+	if strings.TrimSpace(entry.EventID) == "" {
+		entry.EventID = strings.TrimSpace(ctx.EventID)
+	}
+	if strings.TrimSpace(entry.PluginID) == "" {
+		entry.PluginID = strings.TrimSpace(ctx.PluginID)
+	}
+	if strings.TrimSpace(entry.RunID) == "" {
+		entry.RunID = strings.TrimSpace(ctx.RunID)
+	}
+	if strings.TrimSpace(entry.CorrelationID) == "" {
+		entry.CorrelationID = strings.TrimSpace(ctx.CorrelationID)
+	}
+	if strings.TrimSpace(entry.SessionID) == "" && ctx.Metadata != nil {
+		if sessionID, _ := ctx.Metadata["session_id"].(string); strings.TrimSpace(sessionID) != "" {
+			entry.SessionID = strings.TrimSpace(sessionID)
+		}
+	}
+}
+
+func normalizeAuditExecutionContext(ctx eventmodel.ExecutionContext) eventmodel.ExecutionContext {
+	ctx.TraceID = strings.TrimSpace(ctx.TraceID)
+	ctx.EventID = strings.TrimSpace(ctx.EventID)
+	ctx.PluginID = strings.TrimSpace(ctx.PluginID)
+	ctx.RunID = strings.TrimSpace(ctx.RunID)
+	ctx.CorrelationID = strings.TrimSpace(ctx.CorrelationID)
+	if ctx.RunID == "" && ctx.EventID != "" {
+		ctx.RunID = "run-" + ctx.EventID
+	}
+	if ctx.CorrelationID == "" {
+		ctx.CorrelationID = ctx.EventID
+	}
+	return ctx
+}
+
+func auditReason(action, permission string, actionErr error) string {
 	if actionErr == nil {
 		switch action {
+		case "enable":
+			return "plugin_enabled"
+		case "disable":
+			return "plugin_disabled"
 		case "prepare":
 			return "rollout_prepared"
 		case "activate":
@@ -221,6 +295,9 @@ func auditReason(action string, actionErr error) string {
 	case strings.Contains(message, "permission denied"):
 		return "permission_denied"
 	case strings.Contains(message, "plugin scope denied"):
+		if shouldNormalizeOperatorAudit(permission) {
+			return "plugin_scope_denied"
+		}
 		return "scope_denied"
 	case strings.Contains(message, "rollout is not prepared"):
 		return "rollout_not_prepared"

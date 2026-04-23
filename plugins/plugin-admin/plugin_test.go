@@ -62,6 +62,24 @@ func auditReasonValue(entry pluginsdk.AuditEntry) string {
 	return ""
 }
 
+func auditErrorCategoryValue(entry pluginsdk.AuditEntry) string {
+	value := reflect.ValueOf(entry)
+	field := value.FieldByName("ErrorCategory")
+	if field.IsValid() && field.Kind() == reflect.String {
+		return field.String()
+	}
+	return ""
+}
+
+func auditErrorCodeValue(entry pluginsdk.AuditEntry) string {
+	value := reflect.ValueOf(entry)
+	field := value.FieldByName("ErrorCode")
+	if field.IsValid() && field.Kind() == reflect.String {
+		return field.String()
+	}
+	return ""
+}
+
 func (r *replayRecorder) ReplayEvent(eventID string) (eventmodel.Event, error) {
 	r.eventIDs = append(r.eventIDs, eventID)
 	return r.event, r.err
@@ -168,6 +186,12 @@ func TestPluginAdminExecutesEnableDisableCommands(t *testing.T) {
 	if len(plugin.AuditLog()) != 2 || !plugin.AuditLog()[0].Allowed || !plugin.AuditLog()[1].Allowed {
 		t.Fatalf("unexpected audit trail %+v", plugin.AuditLog())
 	}
+	if first := plugin.AuditLog()[0]; first.Action != "plugin.enable" || first.Permission != "plugin:enable" || first.Target != "plugin-echo" || first.TraceID != "trace-1" || first.EventID != "evt-1" || first.RunID != "run-evt-1" || first.CorrelationID != "evt-1" || first.Reason != "plugin_enabled" || auditErrorCategoryValue(first) != "operator" || auditErrorCodeValue(first) != "plugin_enabled" {
+		t.Fatalf("unexpected normalized enable audit entry %+v", first)
+	}
+	if second := plugin.AuditLog()[1]; second.Action != "plugin.disable" || second.Permission != "plugin:disable" || second.Target != "plugin-echo" || second.TraceID != "trace-2" || second.EventID != "evt-2" || second.RunID != "run-evt-2" || second.CorrelationID != "evt-2" || second.Reason != "plugin_disabled" || auditErrorCategoryValue(second) != "operator" || auditErrorCodeValue(second) != "plugin_disabled" {
+		t.Fatalf("unexpected normalized disable audit entry %+v", second)
+	}
 	if len(audit.entries) != 2 || audit.entries[0].Target != "plugin-echo" || audit.entries[0].OccurredAt != "2026-04-03T12:00:00Z" {
 		t.Fatalf("unexpected external audit entries %+v", audit.entries)
 	}
@@ -191,6 +215,9 @@ func TestPluginAdminCopiesSessionIDFromCommandMetadataIntoAudit(t *testing.T) {
 	if len(plugin.AuditLog()) != 1 || plugin.AuditLog()[0].SessionID != "session-operator-bearer-admin-user" {
 		t.Fatalf("expected local audit to include session_id, got %+v", plugin.AuditLog())
 	}
+	if plugin.AuditLog()[0].RunID != "run-evt-session" || plugin.AuditLog()[0].CorrelationID != "evt-session" {
+		t.Fatalf("expected local audit to normalize observability ids, got %+v", plugin.AuditLog())
+	}
 	if len(audit.entries) != 1 || audit.entries[0].SessionID != "session-operator-bearer-admin-user" {
 		t.Fatalf("expected external audit to include session_id, got %+v", audit.entries)
 	}
@@ -210,7 +237,7 @@ func TestPluginAdminRejectsUnauthorizedActorAndAudits(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected unauthorized actor to fail")
 	}
-	if len(plugin.AuditLog()) != 1 || plugin.AuditLog()[0].Allowed || plugin.AuditLog()[0].Permission != "plugin:enable" {
+	if len(plugin.AuditLog()) != 1 || plugin.AuditLog()[0].Allowed || plugin.AuditLog()[0].Permission != "plugin:enable" || plugin.AuditLog()[0].Action != "plugin.enable" || auditErrorCategoryValue(plugin.AuditLog()[0]) != "authorization" || auditErrorCodeValue(plugin.AuditLog()[0]) != "permission_denied" {
 		t.Fatalf("expected denied audit record, got %+v", plugin.AuditLog())
 	}
 }
@@ -229,7 +256,7 @@ func TestPluginAdminBubblesLifecycleError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected lifecycle error to bubble up")
 	}
-	if len(plugin.AuditLog()) != 1 || !plugin.AuditLog()[0].Allowed || plugin.AuditLog()[0].Permission != "plugin:enable" {
+	if len(plugin.AuditLog()) != 1 || !plugin.AuditLog()[0].Allowed || plugin.AuditLog()[0].Permission != "plugin:enable" || plugin.AuditLog()[0].Action != "plugin.enable" || auditErrorCategoryValue(plugin.AuditLog()[0]) != "operator" || auditErrorCodeValue(plugin.AuditLog()[0]) != "action_failed" {
 		t.Fatalf("expected failed audit record, got %+v", plugin.AuditLog())
 	}
 }
@@ -267,7 +294,7 @@ func TestPluginAdminDoesNotCombinePermissionAndScopeAcrossRoles(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "plugin scope denied") {
 		t.Fatalf("expected split-role authorization to be rejected, got %v", err)
 	}
-	if len(plugin.AuditLog()) != 1 || plugin.AuditLog()[0].Allowed || plugin.AuditLog()[0].Permission != "plugin:enable" {
+	if len(plugin.AuditLog()) != 1 || plugin.AuditLog()[0].Allowed || plugin.AuditLog()[0].Permission != "plugin:enable" || plugin.AuditLog()[0].Action != "plugin.enable" || auditReasonValue(plugin.AuditLog()[0]) != "plugin_scope_denied" || auditErrorCategoryValue(plugin.AuditLog()[0]) != "authorization" || auditErrorCodeValue(plugin.AuditLog()[0]) != "plugin_scope_denied" {
 		t.Fatalf("expected denied split-role audit record, got %+v", plugin.AuditLog())
 	}
 }
@@ -280,7 +307,7 @@ func TestPluginAdminRejectsKnownActorWithoutRequiredPermission(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "permission denied") {
 		t.Fatalf("expected known actor without permission to be denied, got %v", err)
 	}
-	if len(plugin.AuditLog()) != 1 || plugin.AuditLog()[0].Allowed || plugin.AuditLog()[0].Permission != "plugin:enable" {
+	if len(plugin.AuditLog()) != 1 || plugin.AuditLog()[0].Allowed || plugin.AuditLog()[0].Permission != "plugin:enable" || plugin.AuditLog()[0].Action != "plugin.enable" || auditErrorCategoryValue(plugin.AuditLog()[0]) != "authorization" || auditErrorCodeValue(plugin.AuditLog()[0]) != "permission_denied" {
 		t.Fatalf("expected denied wrong-permission audit record, got %+v", plugin.AuditLog())
 	}
 }
@@ -299,7 +326,7 @@ func TestPluginAdminRejectsOutOfScopePluginAndAuditsPermission(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "plugin scope denied") {
 		t.Fatalf("expected scope denial, got %v", err)
 	}
-	if len(plugin.AuditLog()) != 1 || plugin.AuditLog()[0].Allowed || plugin.AuditLog()[0].Permission != "plugin:enable" {
+	if len(plugin.AuditLog()) != 1 || plugin.AuditLog()[0].Allowed || plugin.AuditLog()[0].Permission != "plugin:enable" || plugin.AuditLog()[0].Action != "plugin.enable" || auditReasonValue(plugin.AuditLog()[0]) != "plugin_scope_denied" || auditErrorCategoryValue(plugin.AuditLog()[0]) != "authorization" || auditErrorCodeValue(plugin.AuditLog()[0]) != "plugin_scope_denied" {
 		t.Fatalf("expected denied scoped audit record, got %+v", plugin.AuditLog())
 	}
 }
@@ -322,7 +349,7 @@ func TestPluginAdminAllowsScopedRoleForConfiguredPlugin(t *testing.T) {
 	if len(lifecycle.enabled) != 1 || lifecycle.enabled[0] != "plugin-echo" {
 		t.Fatalf("unexpected enable calls %+v", lifecycle.enabled)
 	}
-	if len(plugin.AuditLog()) != 1 || !plugin.AuditLog()[0].Allowed || plugin.AuditLog()[0].Permission != "plugin:enable" {
+	if len(plugin.AuditLog()) != 1 || !plugin.AuditLog()[0].Allowed || plugin.AuditLog()[0].Permission != "plugin:enable" || plugin.AuditLog()[0].Action != "plugin.enable" {
 		t.Fatalf("expected allowed scoped audit record, got %+v", plugin.AuditLog())
 	}
 }
@@ -462,7 +489,7 @@ func TestPluginAdminUsesCurrentAuthorizerProviderInsteadOfFrozenAuthorizer(t *te
 	if len(lifecycle.enabled) != 1 || lifecycle.enabled[0] != "plugin-echo" {
 		t.Fatalf("expected provider-backed authorizer to enable plugin-echo, got %+v", lifecycle.enabled)
 	}
-	if len(plugin.AuditLog()) != 1 || !plugin.AuditLog()[0].Allowed || plugin.AuditLog()[0].Permission != "plugin:enable" {
+	if len(plugin.AuditLog()) != 1 || !plugin.AuditLog()[0].Allowed || plugin.AuditLog()[0].Permission != "plugin:enable" || plugin.AuditLog()[0].Action != "plugin.enable" {
 		t.Fatalf("expected allowed provider-backed audit entry, got %+v", plugin.AuditLog())
 	}
 }

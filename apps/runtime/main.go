@@ -306,46 +306,6 @@ func (m runtimeAuditRecorderSlice) RecordAudit(entry pluginsdk.AuditEntry) error
 	return errors.Join(errs...)
 }
 
-func recordAuthorizationDeniedAuditWithContext(recorder runtimecore.AuditRecorder, executionContext eventmodel.ExecutionContext, actor, permission, target string, err error) {
-	if recorder == nil || err == nil || strings.TrimSpace(permission) == "" || strings.TrimSpace(target) == "" {
-		return
-	}
-	reason := authorizationDeniedAuditReason(err)
-	entry := pluginsdk.AuditEntry{
-		Actor:         actor,
-		Permission:    permission,
-		Action:        strings.ReplaceAll(permission, ":", "."),
-		Target:        target,
-		Allowed:       false,
-		ErrorCategory: "authorization",
-		ErrorCode:     reason,
-		OccurredAt:    time.Now().UTC().Format(time.RFC3339),
-	}
-	executionContext = normalizeRuntimeExecutionContext(executionContext)
-	if strings.TrimSpace(entry.TraceID) == "" {
-		entry.TraceID = strings.TrimSpace(executionContext.TraceID)
-	}
-	if strings.TrimSpace(entry.EventID) == "" {
-		entry.EventID = strings.TrimSpace(executionContext.EventID)
-	}
-	if strings.TrimSpace(entry.PluginID) == "" {
-		entry.PluginID = strings.TrimSpace(executionContext.PluginID)
-	}
-	if strings.TrimSpace(entry.RunID) == "" {
-		entry.RunID = strings.TrimSpace(executionContext.RunID)
-	}
-	if strings.TrimSpace(entry.CorrelationID) == "" {
-		entry.CorrelationID = strings.TrimSpace(executionContext.CorrelationID)
-	}
-	if strings.TrimSpace(entry.SessionID) == "" && executionContext.Metadata != nil {
-		if sessionID, _ := executionContext.Metadata["session_id"].(string); strings.TrimSpace(sessionID) != "" {
-			entry.SessionID = strings.TrimSpace(sessionID)
-		}
-	}
-	entry.Reason = reason
-	_ = recorder.RecordAudit(entry)
-}
-
 func bindOperatorRequestSession(ctx context.Context, store runtimecore.SessionStateStore) error {
 	if store == nil {
 		return nil
@@ -371,7 +331,7 @@ func (a *runtimeApp) requestActorID(r *http.Request) (string, error) {
 	return runtimecore.RequestActorID(r.Context(), a != nil && a.operatorAuthConfigured(), r.Header.Get(runtimecore.ConsoleReadActorHeader))
 }
 
-func authorizationDeniedAuditReason(err error) string {
+func operatorDeniedReason(err error) string {
 	if err == nil {
 		return "permission_denied"
 	}
@@ -381,15 +341,6 @@ func authorizationDeniedAuditReason(err error) string {
 	default:
 		return "permission_denied"
 	}
-}
-
-func normalizeRuntimeExecutionContext(ctx eventmodel.ExecutionContext) eventmodel.ExecutionContext {
-	ctx.TraceID = strings.TrimSpace(ctx.TraceID)
-	ctx.EventID = strings.TrimSpace(ctx.EventID)
-	ctx.PluginID = strings.TrimSpace(ctx.PluginID)
-	ctx.RunID = strings.TrimSpace(ctx.RunID)
-	ctx.CorrelationID = strings.TrimSpace(ctx.CorrelationID)
-	return ctx
 }
 
 func (s postgresRuntimeSmokeStore) RecordEvent(ctx context.Context, event eventmodel.Event) error {
@@ -446,6 +397,125 @@ type operatorActionResult struct {
 	Target   string `json:"target"`
 	Accepted bool   `json:"accepted"`
 	Reason   string `json:"reason,omitempty"`
+	Error    string `json:"error,omitempty"`
+}
+
+type operatorPluginStateResponse struct {
+	operatorActionResult
+	PluginID  string `json:"plugin_id,omitempty"`
+	Enabled   *bool  `json:"enabled,omitempty"`
+	UpdatedAt string `json:"updated_at,omitempty"`
+}
+
+type operatorPluginConfigResponse struct {
+	operatorActionResult
+	PluginID   string `json:"plugin_id,omitempty"`
+	Config     any    `json:"config,omitempty"`
+	UpdatedAt  string `json:"updated_at,omitempty"`
+	Persisted  *bool  `json:"persisted,omitempty"`
+	ConfigPath string `json:"config_path,omitempty"`
+}
+
+type operatorJobResponse struct {
+	operatorActionResult
+	JobID      string            `json:"job_id,omitempty"`
+	RetriedJob *runtimecore.Job  `json:"retried_job,omitempty"`
+	CurrentJob *runtimecore.Job  `json:"current_job,omitempty"`
+}
+
+type operatorScheduleResponse struct {
+	operatorActionResult
+	ScheduleID string `json:"schedule_id,omitempty"`
+}
+
+func operatorActionName(action, permission string) string {
+	permission = strings.TrimSpace(permission)
+	switch permission {
+	case "plugin:enable":
+		return "plugin.enable"
+	case "plugin:disable":
+		return "plugin.disable"
+	case pluginConfigPermission:
+		return "plugin.config"
+	case jobRetryPermission:
+		return "job.retry"
+	case scheduleCancelPermission:
+		return "schedule.cancel"
+	}
+	switch strings.TrimSpace(action) {
+	case "enable":
+		return "plugin.enable"
+	case "disable":
+		return "plugin.disable"
+	case "config":
+		return "plugin.config"
+	case "retry":
+		return "job.retry"
+	case "cancel":
+		return "schedule.cancel"
+	default:
+		if permission != "" {
+			return strings.ReplaceAll(permission, ":", ".")
+		}
+		return strings.TrimSpace(action)
+	}
+}
+
+func operatorSuccessResult(action, target, reason string) operatorActionResult {
+	return operatorActionResult{
+		Status:   "ok",
+		Action:   action,
+		Target:   target,
+		Accepted: true,
+		Reason:   strings.TrimSpace(reason),
+	}
+}
+
+func operatorDeniedResult(action, target string, err error) operatorActionResult {
+	result := operatorActionResult{
+		Status:   "forbidden",
+		Action:   action,
+		Target:   target,
+		Accepted: false,
+		Reason:   operatorDeniedReason(err),
+	}
+	if err != nil {
+		result.Error = err.Error()
+	}
+	return result
+}
+
+func writeJSONResponse(w http.ResponseWriter, statusCode int, payload any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	_ = json.NewEncoder(w).Encode(payload)
+}
+
+func boolPtr(value bool) *bool {
+	return &value
+}
+
+func recordOperatorSuccessAudit(recorder runtimecore.AuditRecorder, requestContext context.Context, executionContext eventmodel.ExecutionContext, actor, permission, action, target, reason string) {
+	if recorder == nil || strings.TrimSpace(permission) == "" || strings.TrimSpace(target) == "" {
+		return
+	}
+	reason = strings.TrimSpace(reason)
+	entry := pluginsdk.AuditEntry{
+		Actor:      strings.TrimSpace(actor),
+		Permission: strings.TrimSpace(permission),
+		Action:     operatorActionName(action, permission),
+		Target:     strings.TrimSpace(target),
+		Allowed:    true,
+		OccurredAt: time.Now().UTC().Format(time.RFC3339),
+	}
+	if reason != "" {
+		entry.Reason = reason
+		entry.ErrorCategory = "operator"
+		entry.ErrorCode = reason
+	}
+	runtimecore.ApplyAuditRequestIdentity(&entry, requestContext)
+	runtimecore.ApplyAuditExecutionContext(&entry, executionContext)
+	_ = recorder.RecordAudit(entry)
 }
 
 type aiProviderMock struct{}
@@ -1509,9 +1579,11 @@ func (a *runtimeApp) handleJobOperator(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	permission := jobOperatorPermission(action)
+	operatorAction := operatorActionName(action, permission)
 	if err := runtimecore.AuthorizeRBACActionWithProvider(a.authorizer, actor, permission, jobID); err != nil {
-		recordAuthorizationDeniedAuditWithContext(a.auditRecorder, eventmodel.ExecutionContext{Metadata: map[string]any{"session_id": requestSessionID(r.Context())}}, actor, permission, jobID, err)
-		http.Error(w, err.Error(), http.StatusForbidden)
+		executionContext := eventmodel.ExecutionContext{Metadata: map[string]any{"session_id": requestSessionID(r.Context())}}
+		runtimecore.RecordAuthorizationDeniedAuditWithContext(a.auditRecorder, executionContext, actor, permission, jobID, err)
+		writeJSONResponse(w, http.StatusForbidden, operatorDeniedResult(operatorAction, jobID, err))
 		return
 	}
 	current, err := a.queue.Inspect(r.Context(), jobID)
@@ -1532,42 +1604,24 @@ func (a *runtimeApp) handleJobOperator(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), status)
 		return
 	}
-	if a.auditRecorder != nil {
-		entry := pluginsdk.AuditEntry{
-			Actor:         actor,
-			Permission:    permission,
-			Action:        "retry",
-			Target:        jobID,
-			Allowed:       true,
-			TraceID:       current.TraceID,
-			EventID:       current.EventID,
-			RunID:         current.RunID,
-			SessionID:     requestSessionID(r.Context()),
-			CorrelationID: current.Correlation,
-			ErrorCode:     "job_dead_letter_retried",
-			OccurredAt:    time.Now().UTC().Format(time.RFC3339),
-		}
-		entry.Reason = "job_dead_letter_retried"
-		_ = a.auditRecorder.RecordAudit(entry)
-	}
+	recordOperatorSuccessAudit(a.auditRecorder, r.Context(), eventmodel.ExecutionContext{
+		TraceID:       current.TraceID,
+		EventID:       current.EventID,
+		RunID:         current.RunID,
+		CorrelationID: current.Correlation,
+	}, actor, permission, operatorAction, jobID, "job_dead_letter_retried")
 	a.queue.DispatchReady(r.Context(), time.Now().UTC())
 	current, err = a.queue.Inspect(r.Context(), jobID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	response := map[string]any{
-		"status":      "ok",
-		"action":      action,
-		"target":      jobID,
-		"accepted":    true,
-		"reason":      "job_dead_letter_retried",
-		"job_id":      jobID,
-		"retried_job": retried,
-		"current_job": current,
-	}
-	_ = json.NewEncoder(w).Encode(response)
+	writeJSONResponse(w, http.StatusOK, operatorJobResponse{
+		operatorActionResult: operatorSuccessResult(operatorAction, jobID, "job_dead_letter_retried"),
+		JobID:                jobID,
+		RetriedJob:           &retried,
+		CurrentJob:           &current,
+	})
 }
 
 func (a *runtimeApp) handleAIMessage(w http.ResponseWriter, r *http.Request) {
@@ -1720,9 +1774,11 @@ func (a *runtimeApp) handleScheduleOperator(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	permission := scheduleOperatorPermission(action)
+	operatorAction := operatorActionName(action, permission)
 	if err := runtimecore.AuthorizeRBACActionWithProvider(a.authorizer, actor, permission, scheduleID); err != nil {
-		recordAuthorizationDeniedAuditWithContext(a.auditRecorder, eventmodel.ExecutionContext{CorrelationID: scheduleID, Metadata: map[string]any{"session_id": requestSessionID(r.Context())}}, actor, permission, scheduleID, err)
-		http.Error(w, err.Error(), http.StatusForbidden)
+		executionContext := eventmodel.ExecutionContext{CorrelationID: scheduleID, Metadata: map[string]any{"session_id": requestSessionID(r.Context())}}
+		runtimecore.RecordAuthorizationDeniedAuditWithContext(a.auditRecorder, executionContext, actor, permission, scheduleID, err)
+		writeJSONResponse(w, http.StatusForbidden, operatorDeniedResult(operatorAction, scheduleID, err))
 		return
 	}
 	if err := a.scheduler.Cancel(scheduleID); err != nil {
@@ -1747,33 +1803,17 @@ func (a *runtimeApp) handleScheduleOperator(w http.ResponseWriter, r *http.Reque
 		http.Error(w, err.Error(), status)
 		return
 	}
-	if a.auditRecorder != nil {
-		entry := pluginsdk.AuditEntry{
-			Actor:         actor,
-			Permission:    permission,
-			Action:        action,
-			Target:        scheduleID,
-			Allowed:       true,
-			SessionID:     requestSessionID(r.Context()),
-			CorrelationID: scheduleID,
-			ErrorCode:     "schedule_cancelled",
-			OccurredAt:    time.Now().UTC().Format(time.RFC3339),
-		}
-		entry.Reason = "schedule_cancelled"
-		_ = a.auditRecorder.RecordAudit(entry)
-	}
+	recordOperatorSuccessAudit(a.auditRecorder, r.Context(), eventmodel.ExecutionContext{CorrelationID: scheduleID}, actor, permission, operatorAction, scheduleID, "schedule_cancelled")
 	if a.logger != nil {
 		_ = a.logger.Log("info", "runtime schedule cancelled", runtimecore.LogContext{}, map[string]any{
 			"actor":       actor,
-			"action":      action,
+			"action":      operatorAction,
 			"schedule_id": scheduleID,
 		})
 	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"status":      "ok",
-		"schedule_id": scheduleID,
-		"action":      action,
+	writeJSONResponse(w, http.StatusOK, operatorScheduleResponse{
+		operatorActionResult: operatorSuccessResult(operatorAction, scheduleID, "schedule_cancelled"),
+		ScheduleID:           scheduleID,
 	})
 }
 
@@ -1828,13 +1868,17 @@ func (a *runtimeApp) handlePluginOperator(w http.ResponseWriter, r *http.Request
 		Arguments: []string{action, pluginID},
 		Metadata:  map[string]any{"actor": actor},
 	}
+	permission := pluginadminPermission(action)
+	operatorAction := operatorActionName(action, permission)
 	if sessionID := requestSessionID(r.Context()); sessionID != "" {
 		command.Metadata["session_id"] = sessionID
 	}
 	executionContext := eventmodel.ExecutionContext{
-		TraceID:  fmt.Sprintf("trace-admin-%d", time.Now().UTC().UnixNano()),
-		EventID:  fmt.Sprintf("evt-admin-%d", time.Now().UTC().UnixNano()),
-		Metadata: map[string]any{},
+		TraceID:       fmt.Sprintf("trace-admin-%d", time.Now().UTC().UnixNano()),
+		EventID:       fmt.Sprintf("evt-admin-%d", time.Now().UTC().UnixNano()),
+		PluginID:      pluginID,
+		CorrelationID: pluginID,
+		Metadata:      map[string]any{},
 	}
 	if sessionID := requestSessionID(r.Context()); sessionID != "" {
 		executionContext.Metadata["session_id"] = sessionID
@@ -1845,6 +1889,8 @@ func (a *runtimeApp) handlePluginOperator(w http.ResponseWriter, r *http.Request
 			status = http.StatusRequestTimeout
 		} else if strings.Contains(err.Error(), "permission denied") || strings.Contains(err.Error(), "plugin scope denied") {
 			status = http.StatusForbidden
+			writeJSONResponse(w, status, operatorDeniedResult(operatorAction, pluginID, err))
+			return
 		}
 		http.Error(w, err.Error(), status)
 		return
@@ -1854,13 +1900,11 @@ func (a *runtimeApp) handlePluginOperator(w http.ResponseWriter, r *http.Request
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"status":     "ok",
-		"plugin_id":  pluginID,
-		"action":     action,
-		"enabled":    state.Enabled,
-		"updated_at": state.UpdatedAt.UTC().Format(time.RFC3339),
+	writeJSONResponse(w, http.StatusOK, operatorPluginStateResponse{
+		operatorActionResult: operatorSuccessResult(operatorAction, pluginID, pluginEnablementReason(state.Enabled)),
+		PluginID:             pluginID,
+		Enabled:              boolPtr(state.Enabled),
+		UpdatedAt:            state.UpdatedAt.UTC().Format(time.RFC3339),
 	})
 }
 
@@ -1893,8 +1937,9 @@ func (a *runtimeApp) handlePluginConfigOperator(w http.ResponseWriter, r *http.R
 		return
 	}
 	if err := runtimecore.AuthorizeRBACActionWithProvider(a.authorizer, actor, pluginConfigPermission, pluginID); err != nil {
-		recordAuthorizationDeniedAuditWithContext(a.auditRecorder, eventmodel.ExecutionContext{PluginID: pluginID, CorrelationID: pluginID, Metadata: map[string]any{"session_id": requestSessionID(r.Context())}}, actor, pluginConfigPermission, pluginID, err)
-		http.Error(w, err.Error(), http.StatusForbidden)
+		executionContext := eventmodel.ExecutionContext{PluginID: pluginID, CorrelationID: pluginID, Metadata: map[string]any{"session_id": requestSessionID(r.Context())}}
+		runtimecore.RecordAuthorizationDeniedAuditWithContext(a.auditRecorder, executionContext, actor, pluginConfigPermission, pluginID, err)
+		writeJSONResponse(w, http.StatusForbidden, operatorDeniedResult(operatorActionName("config", pluginConfigPermission), pluginID, err))
 		return
 	}
 	rawBody, err := io.ReadAll(r.Body)
@@ -1911,41 +1956,39 @@ func (a *runtimeApp) handlePluginConfigOperator(w http.ResponseWriter, r *http.R
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	if a.auditRecorder != nil {
-		entry := pluginsdk.AuditEntry{
-			Actor:         actor,
-			Permission:    pluginConfigPermission,
-			Action:        "config.update",
-			Target:        pluginID,
-			Allowed:       true,
-			PluginID:      pluginID,
-			SessionID:     requestSessionID(r.Context()),
-			CorrelationID: pluginID,
-			ErrorCode:     "plugin_config_updated",
-			OccurredAt:    time.Now().UTC().Format(time.RFC3339),
-		}
-		entry.Reason = "plugin_config_updated"
-		_ = a.auditRecorder.RecordAudit(entry)
-	}
+	recordOperatorSuccessAudit(a.auditRecorder, r.Context(), eventmodel.ExecutionContext{PluginID: pluginID, CorrelationID: pluginID}, actor, pluginConfigPermission, operatorActionName("config", pluginConfigPermission), pluginID, "plugin_config_updated")
 	stored, err := a.controlState.LoadPluginConfig(r.Context(), pluginID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	response := map[string]any{
-		"status":      "ok",
-		"action":      "config.update",
-		"target":      pluginID,
-		"accepted":    true,
-		"reason":      "plugin_config_updated",
-		"plugin_id":   pluginID,
-		"config":      decoded.ResponseConfig,
-		"updated_at":  stored.UpdatedAt.UTC().Format(time.RFC3339),
-		"persisted":   true,
-		"config_path": binding.ConfigPath,
+	persisted := true
+	writeJSONResponse(w, http.StatusOK, operatorPluginConfigResponse{
+		operatorActionResult: operatorSuccessResult(operatorActionName("config", pluginConfigPermission), pluginID, "plugin_config_updated"),
+		PluginID:             pluginID,
+		Config:               decoded.ResponseConfig,
+		UpdatedAt:            stored.UpdatedAt.UTC().Format(time.RFC3339),
+		Persisted:            &persisted,
+		ConfigPath:           binding.ConfigPath,
+	})
+}
+
+func pluginadminPermission(action string) string {
+	switch strings.TrimSpace(action) {
+	case "enable":
+		return "plugin:enable"
+	case "disable":
+		return "plugin:disable"
+	default:
+		return ""
 	}
-	_ = json.NewEncoder(w).Encode(response)
+}
+
+func pluginEnablementReason(enabled bool) string {
+	if enabled {
+		return "plugin_enabled"
+	}
+	return "plugin_disabled"
 }
 
 func parsePluginOperatorPath(path string) (pluginID string, action string, ok bool) {
