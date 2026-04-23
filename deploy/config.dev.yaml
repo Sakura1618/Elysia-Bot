@@ -23,7 +23,30 @@ secrets:
   webhook_token_ref: BOT_PLATFORM_WEBHOOK_TOKEN
   ai_chat_api_key_ref: BOT_PLATFORM_AI_CHAT_API_KEY # required when ai_chat.provider=openai_compat
 
+operator_auth:
+  # Formal local operator entry path for console read and current /demo operator writes.
+  # Authorization: Bearer <token> only binds a request to a configured actor_id.
+  # This is a local bearer baseline, not JWT parsing, SSO, or a login product surface.
+  tokens:
+    - id: console-main
+      actor_id: admin-user
+      token_ref: BOT_PLATFORM_OPERATOR_TOKEN
+    - id: config-main
+      actor_id: config-operator
+      token_ref: BOT_PLATFORM_OPERATOR_CONFIG_TOKEN
+    - id: job-main
+      actor_id: job-operator
+      token_ref: BOT_PLATFORM_OPERATOR_JOB_TOKEN
+    - id: schedule-main
+      actor_id: schedule-admin
+      token_ref: BOT_PLATFORM_OPERATOR_SCHEDULE_TOKEN
+    - id: viewer-main
+      actor_id: viewer-user
+      token_ref: BOT_PLATFORM_OPERATOR_VIEWER_TOKEN
+
 rbac:
+  # Actor IDs, roles, permissions, and plugin scope still resolve from persisted snapshot state.
+  # X-Bot-Platform-Actor remains only as a compatibility fallback when operator_auth.tokens is unconfigured.
   console_read_permission: console:read
   actor_roles:
     admin-user: [admin, console-viewer]

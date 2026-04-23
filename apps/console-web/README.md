@@ -1,13 +1,14 @@
 # console-web
 
-`apps/console-web` 现在是一个 **本地 operator console**，而不再只是单页只读预览。
+`apps/console-web` 现在是一个 **读面优先的本地 operator console**，而不再只是单页只读预览。
 
 它仍然坚持当前仓库边界：
 
 - 读模型来自现有 `GET /api/console`
 - 写操作走现有 runtime `/demo/*` operator endpoints
-- 浏览器内的 operator identity 只是 **本地/dev actor ID**，通过现有 `X-Bot-Platform-Actor` header 传递
-- 不引入新的 backend auth / session / login 系统
+- 当前 repo 默认开发基线里，浏览器内的 operator identity 使用 **本地/dev bearer token**，通过 `Authorization: Bearer <token>` 传递
+- bearer token 是当前正式 operator entry path，只负责把请求绑定到 repo config 里已声明的 actor identity
+- 当前 actor ID、roles、permissions、plugin scope 仍从 runtime persisted snapshot state 解析，不引入 JWT 解析、SSO 或完整 login / session 系统
 
 ## 当前能力
 
@@ -19,9 +20,10 @@
   - `/adapters/:adapterId`
   - `/workflows/:workflowId`
 - 本地 operator identity 面板：
-  - browser-local actor ID
+  - browser-local bearer token
+  - token 绑定到当前 runtime 已配置的 actor identity
   - 当前 snapshot 中的 roles / permissions 可视化
-  - actor header 名称来自 runtime meta，而不是前端硬编码假装 auth
+  - 当前 RBAC 真值仍来自 persisted snapshot state 里的 actor ID / roles / permissions / plugin scope，不是前端自己解释 token claims
 - 刷新模型：
   - 手动 refresh
   - last fetched / runtime generated 时间显示
@@ -55,6 +57,17 @@ npm run dev --workspace @bot-platform/console-web
 
 Vite dev server 已做最小代理，默认把 `/api`、`/demo`、`/metrics`、`/healthz` 转到本地 runtime `http://127.0.0.1:8080`，方便浏览器手动 QA。
 
+当前本地开发基线需要在启动 runtime 的同一个 shell 中提供至少一个 operator token env，例如：
+
+```powershell
+$env:BOT_PLATFORM_OPERATOR_TOKEN = 'dev-operator-token'
+npm run dev:runtime
+```
+
+如果你要验证更细的权限边界，可以继续提供 `BOT_PLATFORM_OPERATOR_CONFIG_TOKEN`、`BOT_PLATFORM_OPERATOR_JOB_TOKEN`、`BOT_PLATFORM_OPERATOR_SCHEDULE_TOKEN`、`BOT_PLATFORM_OPERATOR_VIEWER_TOKEN`。这些 token 仍然只映射到 repo config 里声明的 actor ID，实际 roles / permissions 来自 runtime 持久化 RBAC snapshot。
+
+兼容性上，只有 runtime 没有配置 `operator_auth.tokens` 的时候，旧的 `X-Bot-Platform-Actor` header 才会继续作为回退路径存在。当前 repo 默认开发配置已经把 bearer token 写成正式基线，所以本地 QA 应按 bearer transport 的 operator console 来理解 Console Web。
+
 ## 验证
 
 ```bash
@@ -65,7 +78,8 @@ npm run build --workspace @bot-platform/console-web
 ## 设计边界
 
 - 这是 **本地 operator console**，不是完整控制台产品
-- browser-local actor identity 只是对当前 runtime actor-header 现实的诚实 UI 包装
+- browser-local bearer token 只是对当前 runtime 本地 operator auth 基线的诚实 UI 包装
 - plugin config editor 故意只收窄到 `plugin-echo` 当前已存在的 persisted config 合同
 - 所有写操作都走 read-after-write refetch，不做 optimistic authority 假象
 - 不扩展成新的 control-plane API，也不重构 runtime 为前端服务
+- 不在这一层伪装成 JWT、SSO、login UI、登录流程或完整 session 管理产品
