@@ -44,6 +44,7 @@ type runtimeApp struct {
 	audits          *runtimecore.InMemoryAuditLog
 	auditRecorder   runtimecore.AuditRecorder
 	state           *runtimecore.SQLiteStateStore
+	runtimeState    runtimecore.RuntimeStateStore
 	controlState    runtimeControlStateStore
 	smokeStore      runtimeSmokeStore
 	replay          *runtimeAppReplayService
@@ -80,6 +81,8 @@ type runtimeSmokeStore interface {
 	Counts(context.Context) (map[string]int, error)
 	Close() error
 }
+
+type runtimeExecutionStateStore = runtimecore.RuntimeStateStore
 
 type runtimeEventDispatcher interface {
 	DispatchEvent(context.Context, eventmodel.Event) error
@@ -746,17 +749,26 @@ func newRuntimeAppWithOutputAndOptions(configPath string, output io.Writer, opti
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite state store: %w", err)
 	}
+	runtimeState := runtimeExecutionStateStore(state)
 	pluginConfigs := newAppPluginConfigRegistry()
-	queue.SetStore(state)
-	queue.SetAlertSink(state)
-	if err := queue.Restore(context.Background()); err != nil {
-		_ = state.Close()
-		return nil, fmt.Errorf("restore job queue: %w", err)
-	}
 	smokeStore, err := openRuntimeSmokeStore(settings, state)
 	if err != nil {
 		_ = state.Close()
 		return nil, err
+	}
+	if selectedRuntimeState, err := runtimeSelectedExecutionStateStore(settings, smokeStore, state); err != nil {
+		_ = smokeStore.Close()
+		_ = state.Close()
+		return nil, fmt.Errorf("select execution state store: %w", err)
+	} else {
+		runtimeState = selectedRuntimeState
+	}
+	queue.SetStore(runtimeState)
+	queue.SetAlertSink(runtimeState)
+	if err := queue.Restore(context.Background()); err != nil {
+		_ = smokeStore.Close()
+		_ = state.Close()
+		return nil, fmt.Errorf("restore job queue: %w", err)
 	}
 	controlState, err := runtimeSelectedControlStateStore(settings, smokeStore, state)
 	if err != nil {
@@ -780,8 +792,8 @@ func newRuntimeAppWithOutputAndOptions(configPath string, output io.Writer, opti
 	}
 	scheduler := runtimecore.NewScheduler()
 	scheduler.SetObservability(logger, tracer, metrics)
-	scheduler.SetStore(state)
-	workflowRuntime := runtimecore.NewWorkflowRuntime(state)
+	scheduler.SetStore(runtimeState)
+	workflowRuntime := runtimecore.NewWorkflowRuntime(runtimeState)
 	if metricsAwareWorkflowRuntime, ok := any(workflowRuntime).(interface {
 		SetMetrics(*runtimecore.MetricsRegistry)
 	}); ok {
@@ -979,6 +991,7 @@ func newRuntimeAppWithOutputAndOptions(configPath string, output io.Writer, opti
 		audits:          inMemoryAudits,
 		auditRecorder:   persistedAuditRecorder,
 		state:           state,
+		runtimeState:    runtimeState,
 		controlState:    controlState,
 		smokeStore:      smokeStore,
 		replay:          replayService,
@@ -1159,12 +1172,12 @@ func (a *runtimeApp) handleConsole(w http.ResponseWriter, r *http.Request) {
 	consoleAudits := runtimeAuditLog{recorder: a.auditRecorder, reader: a.controlState}
 	console := runtimecore.NewConsoleAPI(a.runtimeRaw, a.queue, a.config, a.logs.Lines(), consoleAudits)
 	console.SetCurrentAuthorizerProvider(a.authorizer)
-	console.SetJobReader(runtimecore.NewSQLiteConsoleJobReader(a.state))
-	console.SetAlertReader(runtimecore.NewSQLiteConsoleAlertReader(a.state))
+	console.SetJobReader(runtimecore.NewSQLiteConsoleJobReader(a.runtimeState))
+	console.SetAlertReader(runtimecore.NewSQLiteConsoleAlertReader(a.runtimeState))
 	console.SetReplayOperationReader(runtimecore.NewSQLiteConsoleReplayOperationReader(a.controlState, runtimeControlStateSource(a.settings, "replay-operation-records")))
 	console.SetRolloutOperationReader(runtimecore.NewSQLiteConsoleRolloutOperationReader(a.controlState, runtimeControlStateSource(a.settings, "rollout-operation-records")))
-	console.SetScheduleReader(runtimecore.NewSQLiteConsoleScheduleReader(a.state))
-	console.SetWorkflowReader(runtimecore.NewSQLiteConsoleWorkflowReader(a.state))
+	console.SetScheduleReader(runtimecore.NewSQLiteConsoleScheduleReader(a.runtimeState))
+	console.SetWorkflowReader(runtimecore.NewSQLiteConsoleWorkflowReader(a.runtimeState, runtimeExecutionStateSource(a.settings, "workflow-instances")))
 	console.SetAdapterInstanceReader(runtimecore.NewSQLiteConsoleAdapterInstanceReader(a.controlState, runtimeControlStateSource(a.settings, "adapter-instances")))
 	console.SetPluginSnapshotReader(runtimecore.NewSQLiteConsolePluginSnapshotReader(a.controlState, runtimeControlStateSource(a.settings, "plugin-status-snapshot")))
 	console.SetPluginEnabledStateReader(runtimecore.NewSQLiteConsolePluginEnabledStateReader(a.controlState, runtimeControlStateSource(a.settings, "plugin-enabled-overlay")))
@@ -1246,8 +1259,8 @@ func (a *runtimeApp) handleConsole(w http.ResponseWriter, r *http.Request) {
 	meta["log_source"] = "runtime-log-buffer"
 	meta["trace_source"] = runtimeTraceSource(a.tracer, a.settings)
 	meta["metrics_source"] = "runtime-metrics-registry"
-	meta["job_read_model"] = "sqlite"
-	meta["job_status_source"] = "sqlite-jobs"
+	meta["job_read_model"] = runtimeExecutionBackend(a.settings)
+	meta["job_status_source"] = runtimeExecutionStateSource(a.settings, "jobs")
 	meta["job_status_persisted"] = true
 	meta["job_worker_model"] = "runtime-local-worker-lease"
 	meta["job_worker_identity"] = runtimeWorkerID()
@@ -1259,11 +1272,11 @@ func (a *runtimeApp) handleConsole(w http.ResponseWriter, r *http.Request) {
 	meta["job_recovery_total_jobs"] = recovery.TotalJobs
 	meta["job_operator_actions"] = []string{"/demo/jobs/{job-id}/retry"}
 	meta["job_operator_scope"] = "dead-letter jobs only"
-	meta["schedule_read_model"] = "sqlite"
-	meta["schedule_status_source"] = "sqlite-schedule-plans"
+	meta["schedule_read_model"] = runtimeExecutionBackend(a.settings)
+	meta["schedule_status_source"] = runtimeExecutionStateSource(a.settings, "schedule-plans")
 	meta["schedule_status_persisted"] = true
-	meta["workflow_read_model"] = "sqlite-workflow-instances"
-	meta["workflow_status_source"] = "sqlite-workflow-instances"
+	meta["workflow_read_model"] = runtimeExecutionStateSource(a.settings, "workflow-instances")
+	meta["workflow_status_source"] = runtimeExecutionStateSource(a.settings, "workflow-instances")
 	meta["workflow_status_persisted"] = true
 	meta["workflow_runtime_owner"] = "runtime-core"
 	meta["schedule_operator_actions"] = []string{"/demo/schedules/{schedule-id}/cancel"}
@@ -2012,6 +2025,17 @@ func (a *runtimeApp) runtimeStateCounts(ctx context.Context) (map[string]int, er
 	if err != nil {
 		return nil, err
 	}
+	if a.runtimeState != nil && a.runtimeState != a.state {
+		runtimeCounts, err := a.runtimeState.Counts(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("load %s execution counts: %w", runtimeExecutionBackend(a.settings), err)
+		}
+		for _, key := range []string{"jobs", "alerts", "schedule_plans", "workflow_instances"} {
+			if value, ok := runtimeCounts[key]; ok {
+				counts[key] = value
+			}
+		}
+	}
 	if a.smokeStore == nil {
 		if a.controlState != nil {
 			controlCounts, err := a.controlState.Counts(ctx)
@@ -2364,6 +2388,35 @@ func openRuntimeSmokeStore(settings appRuntimeSettings, sqliteState *runtimecore
 	default:
 		return nil, fmt.Errorf("open runtime smoke store: unsupported runtime.smoke_store_backend %q", settings.SmokeStoreBackend)
 	}
+}
+
+func runtimeSelectedExecutionStateStore(settings appRuntimeSettings, smokeStore runtimeSmokeStore, sqliteState *runtimecore.SQLiteStateStore) (runtimeExecutionStateStore, error) {
+	if runtimeExecutionBackend(settings) != "postgres" {
+		if sqliteState == nil {
+			return nil, fmt.Errorf("sqlite execution state store is required")
+		}
+		return sqliteState, nil
+	}
+	postgresStore, ok := smokeStore.(postgresRuntimeSmokeStore)
+	if !ok || postgresStore.store == nil {
+		return nil, fmt.Errorf("selected execution state store for backend %q is unavailable", strings.TrimSpace(settings.SmokeStoreBackend))
+	}
+	return postgresStore.store, nil
+}
+
+func runtimeExecutionBackend(settings appRuntimeSettings) string {
+	if strings.EqualFold(strings.TrimSpace(settings.SmokeStoreBackend), "postgres") {
+		return "postgres"
+	}
+	return "sqlite"
+}
+
+func runtimeExecutionStateSource(settings appRuntimeSettings, suffix string) string {
+	suffix = strings.TrimSpace(suffix)
+	if suffix == "" {
+		return runtimeExecutionBackend(settings)
+	}
+	return runtimeExecutionBackend(settings) + "-" + suffix
 }
 
 func buildAIProvider(ctx context.Context, cfg runtimecore.Config, secrets aiProviderSecretResolver, logger *runtimecore.Logger) (pluginaichat.AIProvider, error) {

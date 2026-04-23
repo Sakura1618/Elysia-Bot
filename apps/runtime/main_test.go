@@ -3148,6 +3148,131 @@ func TestRuntimeAppReplayUsesPostgresSelectedBackendEventJournal(t *testing.T) {
 	}
 }
 
+func TestRuntimeAppPostgresSelectedBackendOwnsExecutionStateMainPath(t *testing.T) {
+	dir := t.TempDir()
+	app, err := newRuntimeApp(writeTestConfigWithPostgresSmokeStoreAt(t, dir, runtimePostgresTestDSN(t)))
+	if err != nil {
+		t.Fatalf("new runtime app with postgres execution state: %v", err)
+	}
+	defer func() { _ = app.Close() }()
+
+	if _, ok := app.runtimeState.(*runtimecore.PostgresStore); !ok {
+		t.Fatalf("expected runtimeState to be postgres-backed when postgres selected, got %T", app.runtimeState)
+	}
+	if _, ok := app.smokeStore.(postgresRuntimeSmokeStore); !ok {
+		t.Fatalf("expected postgres-selected smoke store, got %T", app.smokeStore)
+	}
+
+	jobReq := httptest.NewRequest(http.MethodPost, "/demo/jobs/enqueue", strings.NewReader(`{"id":"job-postgres-main-path","type":"demo.echo","correlation_id":"corr-postgres-main-path"}`))
+	jobReq.Header.Set("Content-Type", "application/json")
+	jobResp := httptest.NewRecorder()
+	app.ServeHTTP(jobResp, jobReq)
+	if jobResp.Code != http.StatusOK {
+		t.Fatalf("expected enqueue 200, got %d: %s", jobResp.Code, jobResp.Body.String())
+	}
+
+	scheduleReq := httptest.NewRequest(http.MethodPost, "/demo/schedules/echo-delay", strings.NewReader(`{"id":"schedule-postgres-main-path","delay_ms":60000,"message":"hello postgres schedule"}`))
+	scheduleReq.Header.Set("Content-Type", "application/json")
+	scheduleResp := httptest.NewRecorder()
+	app.ServeHTTP(scheduleResp, scheduleReq)
+	if scheduleResp.Code != http.StatusOK {
+		t.Fatalf("expected schedule register 200, got %d: %s", scheduleResp.Code, scheduleResp.Body.String())
+	}
+
+	workflowResp := performRuntimeWorkflowMessageRequest(t, app, `{"actor_id":"postgres-user","message":"hello postgres workflow"}`)
+	if workflowResp.Code != http.StatusOK {
+		t.Fatalf("expected workflow start 200, got %d: %s", workflowResp.Code, workflowResp.Body.String())
+	}
+
+	console := readRuntimeConsoleResponse(t, app)
+	if got := consoleMetaString(t, console.Meta, "job_read_model"); got != "postgres" {
+		t.Fatalf("expected job_read_model=postgres, got %q", got)
+	}
+	if got := consoleMetaString(t, console.Meta, "schedule_read_model"); got != "postgres" {
+		t.Fatalf("expected schedule_read_model=postgres, got %q", got)
+	}
+	if got := consoleMetaString(t, console.Meta, "job_status_source"); got != "postgres-jobs" {
+		t.Fatalf("expected job_status_source=postgres-jobs, got %q", got)
+	}
+	if got := consoleMetaString(t, console.Meta, "schedule_status_source"); got != "postgres-schedule-plans" {
+		t.Fatalf("expected schedule_status_source=postgres-schedule-plans, got %q", got)
+	}
+	if got := consoleMetaString(t, console.Meta, "workflow_read_model"); got != "postgres-workflow-instances" {
+		t.Fatalf("expected workflow_read_model=postgres-workflow-instances, got %q", got)
+	}
+	if got := consoleMetaString(t, console.Meta, "workflow_status_source"); got != "postgres-workflow-instances" {
+		t.Fatalf("expected workflow_status_source=postgres-workflow-instances, got %q", got)
+	}
+
+	jobFound := false
+	for _, job := range console.Jobs {
+		if job.ID == "job-postgres-main-path" {
+			jobFound = true
+			break
+		}
+	}
+	if !jobFound {
+		t.Fatalf("expected postgres execution-state console to expose queued job, got %+v", console.Jobs)
+	}
+	if !hasConsoleSchedule(console, "schedule-postgres-main-path") {
+		t.Fatalf("expected postgres execution-state console to expose schedule, got %+v", console.Schedules)
+	}
+	workflowID := "workflow-postgres-user"
+	workflowFound := false
+	for _, workflow := range console.Workflows {
+		if workflow.ID != workflowID {
+			continue
+		}
+		workflowFound = true
+		if workflow.PluginID != "plugin-workflow-demo" || workflow.StatusSource != "postgres-workflow-instances" || !workflow.StatePersisted {
+			t.Fatalf("expected postgres workflow console provenance, got %+v", workflow)
+		}
+		break
+	}
+	if !workflowFound {
+		t.Fatalf("expected postgres execution-state console to expose workflow instance, got %+v", console.Workflows)
+	}
+
+	counts, err := app.runtimeStateCounts(t.Context())
+	if err != nil {
+		t.Fatalf("runtime state counts: %v", err)
+	}
+	if counts["jobs"] < 1 || counts["schedule_plans"] < 1 || counts["workflow_instances"] < 1 {
+		t.Fatalf("expected postgres execution-state counts for jobs/schedules/workflows, got %+v", counts)
+	}
+
+	sqliteCounts, err := app.state.Counts(t.Context())
+	if err != nil {
+		t.Fatalf("sqlite counts: %v", err)
+	}
+	if sqliteCounts["jobs"] != 0 || sqliteCounts["schedule_plans"] != 0 || sqliteCounts["workflow_instances"] != 0 {
+		t.Fatalf("expected sqlite execution-state tables to stay empty under postgres selection, got %+v", sqliteCounts)
+	}
+
+	postgresStore := app.runtimeState.(*runtimecore.PostgresStore)
+	storedJob, err := postgresStore.LoadJob(t.Context(), "job-postgres-main-path")
+	if err != nil {
+		t.Fatalf("load postgres execution-state job: %v", err)
+	}
+	if storedJob.ID != "job-postgres-main-path" || storedJob.Status != runtimecore.JobStatusPending {
+		t.Fatalf("expected postgres job persistence via main runtime path, got %+v", storedJob)
+	}
+	storedSchedule, err := postgresStore.LoadSchedulePlan(t.Context(), "schedule-postgres-main-path")
+	if err != nil {
+		t.Fatalf("load postgres execution-state schedule: %v", err)
+	}
+	if storedSchedule.Plan.ID != "schedule-postgres-main-path" || storedSchedule.Plan.EventType != "message.received" {
+		t.Fatalf("expected postgres schedule persistence via main runtime path, got %+v", storedSchedule)
+	}
+	storedWorkflow, err := postgresStore.LoadWorkflowInstance(t.Context(), workflowID)
+	if err != nil {
+		t.Fatalf("load postgres execution-state workflow: %v", err)
+	}
+	if storedWorkflow.WorkflowID != workflowID || storedWorkflow.PluginID != "plugin-workflow-demo" || storedWorkflow.Status != runtimecore.WorkflowRuntimeStatusWaitingEvent {
+		t.Fatalf("expected postgres workflow persistence via main runtime path, got %+v", storedWorkflow)
+	}
+}
+
 func TestRuntimeAppReplayMissingEventSurfacesSelectedBackendNotFound(t *testing.T) {
 	t.Parallel()
 

@@ -42,8 +42,17 @@ type fakePostgresPool struct {
 	queryRow     pgx.Row
 	closed       bool
 	commandTag   pgconn.CommandTag
+	tx           *fakePostgresTx
 	queryFunc    func(ctx context.Context, sql string, arguments ...any) (pgx.Rows, error)
 	queryRowFunc func(ctx context.Context, sql string, arguments ...any) pgx.Row
+}
+
+type fakePostgresTx struct {
+	execSQL    []string
+	execArgs   [][]any
+	execErr    error
+	committed  bool
+	rolledBack bool
 }
 
 func (r fakeRow) Scan(dest ...any) error {
@@ -122,9 +131,40 @@ func (p *fakePostgresPool) Query(ctx context.Context, sql string, arguments ...a
 	return nil, errors.New("unexpected query")
 }
 
+func (p *fakePostgresPool) Begin(_ context.Context) (pgx.Tx, error) {
+	if p.tx == nil {
+		p.tx = &fakePostgresTx{}
+	}
+	return p.tx, nil
+}
+
 func (p *fakePostgresPool) Close() {
 	p.closed = true
 }
+
+func (tx *fakePostgresTx) Begin(context.Context) (pgx.Tx, error)                   { return nil, errors.New("nested begin not implemented") }
+func (tx *fakePostgresTx) Commit(context.Context) error                            { tx.committed = true; return tx.execErr }
+func (tx *fakePostgresTx) Rollback(context.Context) error                          { tx.rolledBack = true; return nil }
+func (tx *fakePostgresTx) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
+	return 0, errors.New("copy from not implemented")
+}
+func (tx *fakePostgresTx) SendBatch(context.Context, *pgx.Batch) pgx.BatchResults { return nil }
+func (tx *fakePostgresTx) LargeObjects() pgx.LargeObjects                          { return pgx.LargeObjects{} }
+func (tx *fakePostgresTx) Prepare(context.Context, string, string) (*pgconn.StatementDescription, error) {
+	return nil, errors.New("prepare not implemented")
+}
+func (tx *fakePostgresTx) Exec(_ context.Context, sql string, arguments ...any) (pgconn.CommandTag, error) {
+	tx.execSQL = append(tx.execSQL, sql)
+	tx.execArgs = append(tx.execArgs, append([]any(nil), arguments...))
+	return pgconn.CommandTag{}, tx.execErr
+}
+func (tx *fakePostgresTx) Query(context.Context, string, ...any) (pgx.Rows, error) {
+	return nil, errors.New("query not implemented")
+}
+func (tx *fakePostgresTx) QueryRow(context.Context, string, ...any) pgx.Row {
+	return fakeRow{err: errors.New("query row not implemented")}
+}
+func (tx *fakePostgresTx) Conn() *pgx.Conn { return nil }
 
 func TestWritePostgresMigrationCreatesSchemaFile(t *testing.T) {
 	t.Parallel()
@@ -148,11 +188,13 @@ func TestWritePostgresMigrationCreatesSchemaFile(t *testing.T) {
 func TestPostgresStoreSaveMethodsIssueExpectedWrites(t *testing.T) {
 	t.Parallel()
 
-	pool := &fakePostgresPool{queryRow: fakeRow{err: pgx.ErrNoRows}}
+	pool := &fakePostgresPool{queryRow: fakeRow{err: pgx.ErrNoRows}, commandTag: pgconn.NewCommandTag("INSERT 0 1")}
 	store := &PostgresStore{pool: pool}
 	ctx := context.Background()
 	event := eventmodel.Event{EventID: "evt-pg", TraceID: "trace-pg", Source: "webhook", Type: "webhook.received", Timestamp: time.Date(2026, 4, 6, 10, 0, 0, 0, time.UTC), IdempotencyKey: "webhook:pg:1"}
-	job := Job{ID: "job-pg", Type: "ai.chat", Status: JobStatusPending, Payload: map[string]any{"prompt": "hi"}, MaxRetries: 3, Timeout: 30 * time.Second, CreatedAt: time.Date(2026, 4, 6, 10, 1, 0, 0, time.UTC)}
+	startedAt := time.Date(2026, 4, 6, 10, 1, 30, 0, time.UTC)
+	nextRunAt := startedAt.Add(30 * time.Second)
+	job := Job{ID: "job-pg", Type: "ai.chat", Status: JobStatusPending, Payload: map[string]any{"prompt": "hi"}, MaxRetries: 3, Timeout: 30 * time.Second, CreatedAt: time.Date(2026, 4, 6, 10, 1, 0, 0, time.UTC), StartedAt: &startedAt, NextRunAt: &nextRunAt, WorkerID: "runtime-local:postgres-test", LeaseAcquiredAt: &startedAt, LeaseExpiresAt: &nextRunAt, HeartbeatAt: &startedAt, TraceID: "trace-job-pg", EventID: "evt-job-pg", RunID: "run-job-pg", Correlation: "corr-job-pg", ReasonCode: JobReasonCodeExecutionRetry}
 	workflow := Workflow{ID: "wf-pg", CurrentIndex: 1, WaitingFor: "message.received", Completed: false, Compensated: false, State: map[string]any{"step": "wait"}}
 	manifest := pluginsdk.PluginManifest{ID: "plugin-echo", Name: "Echo Plugin", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess}
 	audit := pluginsdk.AuditEntry{
@@ -172,6 +214,10 @@ func TestPostgresStoreSaveMethodsIssueExpectedWrites(t *testing.T) {
 	}
 	setAuditEntryReason(&audit, "rollout_prepared")
 	adapterConfig := json.RawMessage(`{"mode":"demo-ingress"}`)
+	alert := AlertRecord{ID: "job.dead_letter:job-pg", ObjectType: "job", ObjectID: "job-pg", FailureType: "job.dead_letter", FirstOccurredAt: startedAt, LatestOccurredAt: startedAt, LatestReason: "timeout", TraceID: job.TraceID, EventID: job.EventID, RunID: job.RunID, Correlation: job.Correlation, CreatedAt: startedAt}
+	dueAt := time.Date(2026, 4, 6, 10, 5, 0, 0, time.UTC)
+	claimedAt := dueAt.Add(5 * time.Second)
+	workflowInstance := WorkflowInstanceState{WorkflowID: "wf-runtime-pg", PluginID: "plugin-workflow-demo", TraceID: "trace-workflow-pg", EventID: "evt-workflow-pg", RunID: "run-workflow-pg", CorrelationID: "corr-workflow-pg", Status: WorkflowRuntimeStatusWaitingEvent, Workflow: workflow, LastEventID: "evt-workflow-pg", LastEventType: "message.received", CreatedAt: time.Date(2026, 4, 6, 10, 6, 0, 0, time.UTC), UpdatedAt: time.Date(2026, 4, 6, 10, 6, 30, 0, time.UTC)}
 
 	if err := store.SaveEvent(ctx, event); err != nil {
 		t.Fatalf("save event: %v", err)
@@ -212,14 +258,39 @@ func TestPostgresStoreSaveMethodsIssueExpectedWrites(t *testing.T) {
 	if err := store.SaveRolloutOperationRecord(ctx, RolloutOperationRecord{OperationID: "rollout-op-1", PluginID: "plugin-echo", Action: "prepare", CurrentVersion: "0.1.0", CandidateVersion: "0.2.0-candidate", Status: "prepared"}); err != nil {
 		t.Fatalf("save rollout operation record: %v", err)
 	}
+	if err := store.RecordAlert(ctx, alert); err != nil {
+		t.Fatalf("record alert: %v", err)
+	}
+	if err := store.SaveSchedulePlan(ctx, storedSchedulePlan{Plan: SchedulePlan{ID: "schedule-pg", Kind: ScheduleKindDelay, Delay: 30 * time.Second, Source: "scheduler", EventType: "schedule.triggered", Metadata: map[string]any{"message_text": "hello"}}, DueAt: &dueAt, DueAtEvidence: scheduleDueAtEvidencePersisted, ClaimOwner: "runtime-local:scheduler", ClaimedAt: &claimedAt, CreatedAt: time.Date(2026, 4, 6, 10, 4, 30, 0, time.UTC), UpdatedAt: claimedAt}); err != nil {
+		t.Fatalf("save schedule plan: %v", err)
+	}
+	claimed, err := store.ClaimSchedulePlan(ctx, "schedule-pg", dueAt, schedulePlanClaim{ClaimOwner: "runtime-local:claiming-scheduler", ClaimedAt: claimedAt, UpdatedAt: claimedAt})
+	if err != nil {
+		t.Fatalf("claim schedule plan: %v", err)
+	}
+	if !claimed {
+		t.Fatal("expected claim schedule plan to report one claimed row")
+	}
+	if err := store.SaveWorkflowInstance(ctx, workflowInstance); err != nil {
+		t.Fatalf("save workflow instance: %v", err)
+	}
 	if err := store.ReplaceCurrentRBACState(ctx, []OperatorIdentityState{{ActorID: "viewer-user", Roles: []string{"viewer"}}}, RBACSnapshotState{SnapshotKey: CurrentRBACSnapshotKey, ConsoleReadPermission: "console:read", Policies: map[string]pluginsdk.AuthorizationPolicy{"viewer": {Permissions: []string{"console:read"}, PluginScope: []string{"console"}}}}); err != nil {
 		t.Fatalf("replace current rbac state: %v", err)
 	}
 
 	if len(pool.execSQL) != 17 {
-		t.Fatalf("expected 17 exec calls, got %d", len(pool.execSQL))
+		t.Fatalf("expected 17 direct exec calls, got %d", len(pool.execSQL))
 	}
-	for _, expected := range []string{"INSERT INTO event_log", "INSERT INTO job_state", "INSERT INTO workflow_state", "INSERT INTO plugin_registry_pg", "INSERT INTO idempotency_keys_pg", "INSERT INTO audit_log", "INSERT INTO plugin_enabled_overlays_pg", "INSERT INTO plugin_configs_pg", "INSERT INTO plugin_status_snapshots_pg", "INSERT INTO sessions_pg", "INSERT INTO adapter_instances_pg", "INSERT INTO replay_operation_records_pg", "INSERT INTO rollout_operation_records_pg", "INSERT INTO operator_identities_pg", "INSERT INTO rbac_snapshots_pg"} {
+	if pool.tx == nil {
+		t.Fatal("expected rbac replacement to use a transaction")
+	}
+	if !pool.tx.committed || pool.tx.rolledBack {
+		t.Fatalf("expected rbac transaction commit without rollback, got committed=%v rolledBack=%v", pool.tx.committed, pool.tx.rolledBack)
+	}
+	if len(pool.tx.execSQL) != 4 {
+		t.Fatalf("expected 4 transactional exec calls for rbac replacement, got %d", len(pool.tx.execSQL))
+	}
+	for _, expected := range []string{"INSERT INTO event_log", "INSERT INTO jobs_pg", "INSERT INTO workflow_state", "INSERT INTO plugin_registry_pg", "INSERT INTO idempotency_keys_pg", "INSERT INTO audit_log", "INSERT INTO plugin_enabled_overlays_pg", "INSERT INTO plugin_configs_pg", "INSERT INTO plugin_status_snapshots_pg", "INSERT INTO sessions_pg", "INSERT INTO adapter_instances_pg", "INSERT INTO replay_operation_records_pg", "INSERT INTO rollout_operation_records_pg", "INSERT INTO alerts_pg", "INSERT INTO schedule_plans_pg", "UPDATE schedule_plans_pg", "INSERT INTO workflow_instances_pg", "INSERT INTO operator_identities_pg", "INSERT INTO rbac_snapshots_pg"} {
 		matched := false
 		for _, sql := range pool.execSQL {
 			if strings.Contains(sql, expected) {
@@ -227,14 +298,20 @@ func TestPostgresStoreSaveMethodsIssueExpectedWrites(t *testing.T) {
 				break
 			}
 		}
+		for _, sql := range pool.tx.execSQL {
+			if strings.Contains(sql, expected) {
+				matched = true
+				break
+			}
+		}
 		if !matched {
-			t.Fatalf("expected exec statements to include %q, got %+v", expected, pool.execSQL)
+			t.Fatalf("expected exec statements to include %q, got direct=%+v tx=%+v", expected, pool.execSQL, pool.tx.execSQL)
 		}
 	}
 	if len(pool.execArgs[0]) != 6 || pool.execArgs[0][0] != event.EventID {
 		t.Fatalf("unexpected event exec args %+v", pool.execArgs[0])
 	}
-	if len(pool.execArgs[1]) != 13 || pool.execArgs[1][0] != job.ID || pool.execArgs[1][1] != job.Type {
+	if len(pool.execArgs[1]) != 23 || pool.execArgs[1][0] != job.ID || pool.execArgs[1][1] != job.Type {
 		t.Fatalf("unexpected job exec args %+v", pool.execArgs[1])
 	}
 	if len(pool.execArgs[4]) != 3 || pool.execArgs[4][0] != "idem-1" || pool.execArgs[4][1] != event.EventID {
@@ -242,6 +319,139 @@ func TestPostgresStoreSaveMethodsIssueExpectedWrites(t *testing.T) {
 	}
 	if len(pool.execArgs[5]) != 14 || pool.execArgs[5][1] != "plugin:enable" || pool.execArgs[5][5] != "rollout_prepared" || pool.execArgs[5][6] != "trace-pg-audit" || pool.execArgs[5][7] != "evt-pg-audit" || pool.execArgs[5][8] != "plugin-echo" || pool.execArgs[5][9] != "run-pg-audit" || pool.execArgs[5][10] != "corr-pg-audit" || pool.execArgs[5][11] != "operator" || pool.execArgs[5][12] != "rollout_prepared" {
 		t.Fatalf("unexpected audit exec args %+v", pool.execArgs[5])
+	}
+}
+
+func TestPostgresStoreExecutionStateTransactionsAndReadbacks(t *testing.T) {
+	t.Parallel()
+
+	createdAt := time.Date(2026, 4, 6, 12, 0, 0, 0, time.UTC)
+	startedAt := createdAt.Add(30 * time.Second)
+	nextRunAt := startedAt.Add(45 * time.Second)
+	finishedAt := nextRunAt.Add(15 * time.Second)
+	workflow := NewWorkflow("wf-runtime-pg", WorkflowStep{Kind: WorkflowStepKindPersist, Name: "greeting", Value: "hello"}, WorkflowStep{Kind: WorkflowStepKindWaitEvent, Name: "wait", Value: "message.received"})
+	workflow.State["greeting"] = "hello"
+	workflow.CurrentIndex = 1
+	workflow.WaitingFor = "message.received"
+	workflowJSON, _ := json.Marshal(workflow)
+	jobPayload, _ := json.Marshal(map[string]any{"prompt": "hello postgres"})
+	metadataJSON := []byte(`{"message_text":"hello scheduler"}`)
+	dueAt := createdAt.Add(5 * time.Minute)
+	claimedAt := dueAt.Add(5 * time.Second)
+	jobRow := []any{"job-pg-exec", "ai.chat", string(JobStatusDead), jobPayload, 1, 3, int64((45 * time.Second).Milliseconds()), "timeout", string(JobReasonCodeTimeout), createdAt, stdsql.NullTime{Time: startedAt, Valid: true}, stdsql.NullTime{Time: finishedAt, Valid: true}, stdsql.NullTime{Time: nextRunAt, Valid: true}, "runtime-local:worker-1", stdsql.NullTime{Time: startedAt, Valid: true}, stdsql.NullTime{Time: nextRunAt, Valid: true}, stdsql.NullTime{Time: startedAt, Valid: true}, true, "trace-job-pg-exec", "evt-job-pg-exec", "run-job-pg-exec", "corr-job-pg-exec"}
+	alertRow := []any{"job.dead_letter:job-pg-exec", alertObjectTypeJob, "job-pg-exec", alertFailureTypeJobDeadLetter, finishedAt, finishedAt, "timeout", "trace-job-pg-exec", "evt-job-pg-exec", "run-job-pg-exec", "corr-job-pg-exec", finishedAt}
+	scheduleRow := []any{"schedule-pg-exec", string(ScheduleKindDelay), "", int64((5 * time.Minute).Milliseconds()), stdsql.NullTime{}, stdsql.NullTime{Time: dueAt, Valid: true}, scheduleDueAtEvidencePersisted, "runtime-local:scheduler", stdsql.NullTime{Time: claimedAt, Valid: true}, "scheduler", "schedule.triggered", metadataJSON, createdAt, claimedAt}
+	workflowRow := []any{"wf-runtime-pg", "plugin-workflow-demo", "trace-workflow-pg-exec", "evt-workflow-pg-exec-origin", "run-workflow-pg-exec", "corr-workflow-pg-exec", string(WorkflowRuntimeStatusWaitingEvent), workflowJSON, "evt-workflow-pg-exec-last", "message.received", createdAt, claimedAt}
+	pool := &fakePostgresPool{
+		commandTag: pgconn.NewCommandTag("UPDATE 1"),
+		tx:         &fakePostgresTx{},
+		queryRowFunc: func(_ context.Context, query string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(query, "FROM jobs_pg"):
+				return fakeRow{values: jobRow}
+			case strings.Contains(query, "FROM schedule_plans_pg"):
+				return fakeRow{values: scheduleRow}
+			case strings.Contains(query, "FROM workflow_instances_pg"):
+				return fakeRow{values: workflowRow}
+			default:
+				return fakeRow{err: errors.New("unexpected query")}
+			}
+		},
+		queryFunc: func(_ context.Context, query string, _ ...any) (pgx.Rows, error) {
+			switch {
+			case strings.Contains(query, "FROM jobs_pg"):
+				return &fakeRows{rows: [][]any{jobRow}}, nil
+			case strings.Contains(query, "FROM alerts_pg"):
+				return &fakeRows{rows: [][]any{alertRow}}, nil
+			case strings.Contains(query, "FROM schedule_plans_pg"):
+				return &fakeRows{rows: [][]any{scheduleRow}}, nil
+			case strings.Contains(query, "FROM workflow_instances_pg"):
+				return &fakeRows{rows: [][]any{workflowRow}}, nil
+			default:
+				return nil, errors.New("unexpected query")
+			}
+		},
+	}
+	store := &PostgresStore{pool: pool}
+	ctx := context.Background()
+	deadJob := Job{ID: "job-pg-exec", Type: "ai.chat", Status: JobStatusDead, Payload: map[string]any{"prompt": "hello postgres"}, RetryCount: 1, MaxRetries: 3, Timeout: 45 * time.Second, LastError: "timeout", ReasonCode: JobReasonCodeTimeout, CreatedAt: createdAt, StartedAt: &startedAt, FinishedAt: &finishedAt, NextRunAt: &nextRunAt, WorkerID: "runtime-local:worker-1", LeaseAcquiredAt: &startedAt, LeaseExpiresAt: &nextRunAt, HeartbeatAt: &startedAt, DeadLetter: true, TraceID: "trace-job-pg-exec", EventID: "evt-job-pg-exec", RunID: "run-job-pg-exec", Correlation: "corr-job-pg-exec"}
+	if err := store.PersistJobDeadLetter(ctx, deadJob, jobDeadLetterAlert(deadJob)); err != nil {
+		t.Fatalf("persist dead-letter job: %v", err)
+	}
+	if err := store.PersistJobDeadLetterRetry(ctx, reviveDeadLetterJob(deadJob), deadLetterAlertID(deadJob.ID)); err != nil {
+		t.Fatalf("persist dead-letter retry: %v", err)
+	}
+	if pool.tx == nil || !pool.tx.committed || pool.tx.rolledBack {
+		t.Fatalf("expected transactional dead-letter writes to commit cleanly, got %+v", pool.tx)
+	}
+	for _, expected := range []string{"INSERT INTO jobs_pg", "INSERT INTO alerts_pg", "DELETE FROM alerts_pg"} {
+		matched := false
+		for _, sql := range pool.tx.execSQL {
+			if strings.Contains(sql, expected) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			t.Fatalf("expected dead-letter transaction SQL to include %q, got %+v", expected, pool.tx.execSQL)
+		}
+	}
+	loadedJob, err := store.LoadJob(ctx, "job-pg-exec")
+	if err != nil {
+		t.Fatalf("load job: %v", err)
+	}
+	if loadedJob.ID != "job-pg-exec" || loadedJob.Status != JobStatusDead || loadedJob.ReasonCode != JobReasonCodeTimeout || loadedJob.WorkerID != "runtime-local:worker-1" {
+		t.Fatalf("unexpected loaded job %+v", loadedJob)
+	}
+	if loadedJob.Payload["prompt"] != "hello postgres" {
+		t.Fatalf("expected loaded job payload, got %+v", loadedJob.Payload)
+	}
+	jobs, err := store.ListJobs(ctx)
+	if err != nil || len(jobs) != 1 || jobs[0].ID != "job-pg-exec" {
+		t.Fatalf("list jobs: jobs=%+v err=%v", jobs, err)
+	}
+	alerts, err := store.ListAlerts(ctx)
+	if err != nil || len(alerts) != 1 || alerts[0].ObjectID != "job-pg-exec" || alerts[0].FailureType != alertFailureTypeJobDeadLetter {
+		t.Fatalf("list alerts: alerts=%+v err=%v", alerts, err)
+	}
+	loadedSchedule, err := store.LoadSchedulePlan(ctx, "schedule-pg-exec")
+	if err != nil {
+		t.Fatalf("load schedule plan: %v", err)
+	}
+	if loadedSchedule.Plan.ID != "schedule-pg-exec" || loadedSchedule.DueAt == nil || !loadedSchedule.DueAt.Equal(dueAt) || loadedSchedule.ClaimOwner != "runtime-local:scheduler" {
+		t.Fatalf("unexpected loaded schedule %+v", loadedSchedule)
+	}
+	plans, err := store.ListSchedulePlans(ctx)
+	if err != nil || len(plans) != 1 || plans[0].Plan.ID != "schedule-pg-exec" {
+		t.Fatalf("list schedule plans: plans=%+v err=%v", plans, err)
+	}
+	loadedWorkflow, err := store.LoadWorkflowInstance(ctx, "wf-runtime-pg")
+	if err != nil {
+		t.Fatalf("load workflow instance: %v", err)
+	}
+	if loadedWorkflow.WorkflowID != "wf-runtime-pg" || loadedWorkflow.PluginID != "plugin-workflow-demo" || loadedWorkflow.Status != WorkflowRuntimeStatusWaitingEvent {
+		t.Fatalf("unexpected loaded workflow %+v", loadedWorkflow)
+	}
+	if loadedWorkflow.Workflow.State["greeting"] != "hello" || loadedWorkflow.LastEventType != "message.received" {
+		t.Fatalf("expected workflow runtime state to round-trip, got %+v", loadedWorkflow)
+	}
+	instances, err := store.ListWorkflowInstances(ctx)
+	if err != nil || len(instances) != 1 || instances[0].WorkflowID != "wf-runtime-pg" {
+		t.Fatalf("list workflow instances: instances=%+v err=%v", instances, err)
+	}
+}
+
+func TestPostgresStoreReplaceCurrentRBACStateRollsBackOnIdentityFailure(t *testing.T) {
+	t.Parallel()
+
+	pool := &fakePostgresPool{tx: &fakePostgresTx{execErr: errors.New("write failed")}}
+	store := &PostgresStore{pool: pool}
+	err := store.ReplaceCurrentRBACState(context.Background(), []OperatorIdentityState{{ActorID: "viewer-user", Roles: []string{"viewer"}}}, RBACSnapshotState{SnapshotKey: CurrentRBACSnapshotKey})
+	if err == nil || !strings.Contains(err.Error(), "clear operator identities") && !strings.Contains(err.Error(), "upsert operator identity") {
+		t.Fatalf("expected transactional rbac replace error, got %v", err)
+	}
+	if pool.tx == nil || !pool.tx.rolledBack || pool.tx.committed {
+		t.Fatalf("expected rollback without commit on rbac failure, got tx=%+v", pool.tx)
 	}
 }
 
@@ -414,6 +624,14 @@ func TestPostgresStoreCountsReadsSmokeTables(t *testing.T) {
 		switch {
 		case strings.Contains(query, "FROM event_log"):
 			return fakeRow{values: []any{3}}
+		case strings.Contains(query, "FROM jobs_pg"):
+			return fakeRow{values: []any{2}}
+		case strings.Contains(query, "FROM alerts_pg"):
+			return fakeRow{values: []any{1}}
+		case strings.Contains(query, "FROM schedule_plans_pg"):
+			return fakeRow{values: []any{4}}
+		case strings.Contains(query, "FROM workflow_instances_pg"):
+			return fakeRow{values: []any{1}}
 		case strings.Contains(query, "FROM plugin_registry_pg"):
 			return fakeRow{values: []any{1}}
 		case strings.Contains(query, "FROM plugin_enabled_overlays_pg"):
@@ -447,11 +665,11 @@ func TestPostgresStoreCountsReadsSmokeTables(t *testing.T) {
 	if err != nil {
 		t.Fatalf("count postgres smoke tables: %v", err)
 	}
-	if counts["event_journal"] != 3 || counts["idempotency_keys"] != 5 || counts["plugin_configs"] != 1 || counts["audit_log"] != 1 {
+	if counts["event_journal"] != 3 || counts["jobs"] != 2 || counts["alerts"] != 1 || counts["schedule_plans"] != 4 || counts["workflow_instances"] != 1 || counts["idempotency_keys"] != 5 || counts["plugin_configs"] != 1 || counts["audit_log"] != 1 {
 		t.Fatalf("unexpected counts %+v", counts)
 	}
-	if len(pool.querySQL) != 13 {
-		t.Fatalf("expected 2 count queries, got %+v", pool.querySQL)
+	if len(pool.querySQL) != 17 {
+		t.Fatalf("expected 17 count queries, got %+v", pool.querySQL)
 	}
 }
 
