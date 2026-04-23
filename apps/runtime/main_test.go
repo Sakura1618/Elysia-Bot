@@ -232,6 +232,43 @@ type runtimeHealthTestResponse struct {
 	} `json:"components"`
 }
 
+type operatorActionEnvelopePayload struct {
+	Status   string `json:"status"`
+	Action   string `json:"action"`
+	Target   string `json:"target"`
+	Accepted bool   `json:"accepted"`
+	Reason   string `json:"reason"`
+	Error    string `json:"error"`
+}
+
+type operatorPluginResponsePayload struct {
+	operatorActionEnvelopePayload
+	PluginID  string `json:"plugin_id"`
+	Enabled   *bool  `json:"enabled"`
+	UpdatedAt string `json:"updated_at"`
+}
+
+type operatorPluginConfigResponsePayload struct {
+	operatorActionEnvelopePayload
+	PluginID   string         `json:"plugin_id"`
+	Config     map[string]any `json:"config"`
+	UpdatedAt  string         `json:"updated_at"`
+	Persisted  *bool          `json:"persisted"`
+	ConfigPath string         `json:"config_path"`
+}
+
+type operatorJobResponsePayload struct {
+	operatorActionEnvelopePayload
+	JobID      string          `json:"job_id"`
+	RetriedJob runtimecore.Job `json:"retried_job"`
+	CurrentJob runtimecore.Job `json:"current_job"`
+}
+
+type operatorScheduleResponsePayload struct {
+	operatorActionEnvelopePayload
+	ScheduleID string `json:"schedule_id"`
+}
+
 type runtimeTestTraceExporter = runtimecore.InMemoryTraceExporter
 
 func decodeRuntimeHealthResponse(t *testing.T, raw []byte) runtimeHealthTestResponse {
@@ -1201,11 +1238,19 @@ func writeWriteActionRBACConfigWithBackendAt(t *testing.T, dir string, backend s
 	builder.WriteString("  scheduler_interval_ms: 20\n")
 	builder.WriteString("rbac:\n")
 	builder.WriteString("  actor_roles:\n")
+	builder.WriteString("    admin-user: [admin]\n")
+	builder.WriteString("    schedule-admin: [schedule-operator]\n")
 	builder.WriteString("    job-operator: [job-operator]\n")
 	builder.WriteString("    config-operator: [config-operator]\n")
 	builder.WriteString("    runtime-job-runner: [runtime-job-runner]\n")
 	builder.WriteString("    viewer-user: [viewer]\n")
 	builder.WriteString("  policies:\n")
+	builder.WriteString("    admin:\n")
+	builder.WriteString("      permissions: [plugin:enable, plugin:disable]\n")
+	builder.WriteString("      plugin_scope: ['*']\n")
+	builder.WriteString("    schedule-operator:\n")
+	builder.WriteString("      permissions: [schedule:cancel]\n")
+	builder.WriteString("      plugin_scope: ['*']\n")
 	builder.WriteString("    job-operator:\n")
 	builder.WriteString("      permissions: [job:retry]\n")
 	builder.WriteString("      plugin_scope: ['*']\n")
@@ -1228,6 +1273,121 @@ func writeWriteActionRBACConfigWithBackendAt(t *testing.T, dir string, backend s
 func writeWriteActionRBACConfigWithPostgresSmokeStoreAt(t *testing.T, dir string, dsn string) string {
 	t.Helper()
 	return writeWriteActionRBACConfigWithBackendAt(t, dir, "postgres", dsn)
+}
+
+func writeOperatorAuthConfig(t *testing.T, dir string) string {
+	t.Helper()
+	path := filepath.Join(dir, "config.yaml")
+	content := "runtime:\n" +
+		"  environment: test\n" +
+		"  log_level: debug\n" +
+		"  http_port: 18080\n" +
+		"  sqlite_path: " + filepath.ToSlash(filepath.Join(dir, "runtime.sqlite")) + "\n" +
+		"  scheduler_interval_ms: 20\n" +
+		"rbac:\n" +
+		"  actor_roles:\n" +
+		"    admin-user: [admin]\n" +
+		"  policies:\n" +
+		"    admin:\n" +
+		"      permissions: [console:read, plugin:enable, plugin:disable]\n" +
+		"      plugin_scope: ['*']\n" +
+		"  console_read_permission: console:read\n" +
+		"operator_auth:\n" +
+		"  tokens:\n" +
+		"    - id: console-main\n" +
+		"      actor_id: admin-user\n" +
+		"      token_ref: BOT_PLATFORM_OPERATOR_TOKEN\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write operator auth config: %v", err)
+	}
+	return path
+}
+
+func writeOperatorAuthConfigWithoutConsoleReadPermission(t *testing.T, dir string) string {
+	t.Helper()
+	path := filepath.Join(dir, "config.yaml")
+	content := "runtime:\n" +
+		"  environment: test\n" +
+		"  log_level: debug\n" +
+		"  http_port: 18080\n" +
+		"  sqlite_path: " + filepath.ToSlash(filepath.Join(dir, "runtime.sqlite")) + "\n" +
+		"  scheduler_interval_ms: 20\n" +
+		"rbac:\n" +
+		"  actor_roles:\n" +
+		"    admin-user: [admin]\n" +
+		"  policies:\n" +
+		"    admin:\n" +
+		"      permissions: [plugin:enable, plugin:disable]\n" +
+		"      plugin_scope: ['*']\n" +
+		"operator_auth:\n" +
+		"  tokens:\n" +
+		"    - id: console-main\n" +
+		"      actor_id: admin-user\n" +
+		"      token_ref: BOT_PLATFORM_OPERATOR_TOKEN\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write operator auth config without console read permission: %v", err)
+	}
+	return path
+}
+
+func writeWriteActionRBACOperatorAuthConfig(t *testing.T, dir string) string {
+	t.Helper()
+	path := filepath.Join(dir, "config.yaml")
+	content := "runtime:\n" +
+		"  environment: test\n" +
+		"  log_level: debug\n" +
+		"  http_port: 18080\n" +
+		"  sqlite_path: " + filepath.ToSlash(filepath.Join(dir, "runtime.sqlite")) + "\n" +
+		"  scheduler_interval_ms: 20\n" +
+		"rbac:\n" +
+		"  console_read_permission: console:read\n" +
+		"  actor_roles:\n" +
+		"    admin-user: [admin]\n" +
+		"    schedule-admin: [schedule-operator]\n" +
+		"    job-operator: [job-operator]\n" +
+		"    config-operator: [config-operator]\n" +
+		"    runtime-job-runner: [runtime-job-runner]\n" +
+		"    viewer-user: [viewer]\n" +
+		"  policies:\n" +
+		"    admin:\n" +
+		"      permissions: [console:read, plugin:enable, plugin:disable]\n" +
+		"      plugin_scope: ['*']\n" +
+		"    schedule-operator:\n" +
+		"      permissions: [schedule:cancel]\n" +
+		"      plugin_scope: ['*']\n" +
+		"    job-operator:\n" +
+		"      permissions: [job:retry]\n" +
+		"      plugin_scope: ['*']\n" +
+		"    config-operator:\n" +
+		"      permissions: [plugin:config]\n" +
+		"      plugin_scope: ['plugin-echo']\n" +
+		"    runtime-job-runner:\n" +
+		"      permissions: [job:run]\n" +
+		"      plugin_scope: ['plugin-ai-chat']\n" +
+		"    viewer:\n" +
+		"      permissions: [console:read]\n" +
+		"      plugin_scope: ['console']\n" +
+		"operator_auth:\n" +
+		"  tokens:\n" +
+		"    - id: console-main\n" +
+		"      actor_id: admin-user\n" +
+		"      token_ref: BOT_PLATFORM_OPERATOR_TOKEN\n" +
+		"    - id: config-main\n" +
+		"      actor_id: config-operator\n" +
+		"      token_ref: BOT_PLATFORM_OPERATOR_CONFIG_TOKEN\n" +
+		"    - id: job-main\n" +
+		"      actor_id: job-operator\n" +
+		"      token_ref: BOT_PLATFORM_OPERATOR_JOB_TOKEN\n" +
+		"    - id: schedule-main\n" +
+		"      actor_id: schedule-admin\n" +
+		"      token_ref: BOT_PLATFORM_OPERATOR_SCHEDULE_TOKEN\n" +
+		"    - id: viewer-main\n" +
+		"      actor_id: viewer-user\n" +
+		"      token_ref: BOT_PLATFORM_OPERATOR_VIEWER_TOKEN\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write operator-auth write-action config: %v", err)
+	}
+	return path
 }
 
 func consoleRequestWithViewer(path string) *http.Request {
@@ -2145,7 +2305,7 @@ func TestRuntimeAppConsoleReflectsRuntimeState(t *testing.T) {
 			t.Fatalf("expected console payload to include %s, got %s", expected, resp.Body.String())
 		}
 	}
-	for _, expected := range []string{`"admin-command-runtime-authorizer"`, `"event-metadata-runtime-authorizer"`, `"job-metadata-runtime-authorizer"`, `"schedule-metadata-runtime-authorizer"`, `"schedule-operator-runtime-authorizer"`, `"job-operator-runtime-authorizer"`, `"plugin-config-runtime-authorizer"`, `"plugin-admin-current-authorizer-provider"`, `"dispatch-manifest-permission-gate"`, `"job-target-plugin-filter"`, `"console-read-authorizer"`, `"permission_denied"`, `"plugin_scope_denied"`, `"unified-authentication"`, `"unified-resource-model"`, `"independent-authorization-read-model"`, `"actor"`, `"permission"`, `"target_plugin_id"`, `"console read authorization is optional and only enforced when rbac.console_read_permission is configured"`, `"console read authorization currently reads actor only from the X-Bot-Platform-Actor header"`, `"manifest permission gate remains a separate dispatch contract check and does not emit deny audit entries"`, `"target_plugin_id remains a dispatch filter, not a global RBAC resource kind"`, `"current slice persists and reloads a single runtime snapshot but does not add login/authn UX or a global resource hierarchy"`} {
+	for _, expected := range []string{`"admin-command-runtime-authorizer"`, `"event-metadata-runtime-authorizer"`, `"job-metadata-runtime-authorizer"`, `"schedule-metadata-runtime-authorizer"`, `"schedule-operator-runtime-authorizer"`, `"job-operator-runtime-authorizer"`, `"plugin-config-runtime-authorizer"`, `"plugin-admin-current-authorizer-provider"`, `"dispatch-manifest-permission-gate"`, `"job-target-plugin-filter"`, `"console-read-authorizer"`, `"permission_denied"`, `"plugin_scope_denied"`, `"unified-authentication"`, `"unified-resource-model"`, `"independent-authorization-read-model"`, `"actor"`, `"permission"`, `"target_plugin_id"`, `"console read authorization is optional and only enforced when rbac.console_read_permission is configured"`, `"console read authorization uses bearer-backed request identity when operator_auth.tokens is configured; otherwise it falls back to the X-Bot-Platform-Actor header"`, `"manifest permission gate remains a separate dispatch contract check and does not emit deny audit entries"`, `"target_plugin_id remains a dispatch filter, not a global RBAC resource kind"`, `"current slice persists and reloads a single runtime snapshot but does not add login/authn UX or a global resource hierarchy"`} {
 		if !strings.Contains(resp.Body.String(), expected) {
 			t.Fatalf("expected console payload to include RBAC declaration detail %s, got %s", expected, resp.Body.String())
 		}
@@ -2198,11 +2358,12 @@ func TestRuntimeAppOperatorDisablePersistsOverlaySkipsDispatchAndReEnables(t *te
 	if disableResp.Code != http.StatusOK {
 		t.Fatalf("expected disable operator 200, got %d: %s", disableResp.Code, disableResp.Body.String())
 	}
-	if !strings.Contains(disableResp.Body.String(), `"plugin_id":"plugin-echo"`) && !strings.Contains(disableResp.Body.String(), `"plugin_id": "plugin-echo"`) {
-		t.Fatalf("expected disable response to include plugin id, got %s", disableResp.Body.String())
+	var disablePayload operatorPluginResponsePayload
+	if err := json.Unmarshal(disableResp.Body.Bytes(), &disablePayload); err != nil {
+		t.Fatalf("decode disable response: %v", err)
 	}
-	if !strings.Contains(disableResp.Body.String(), `"enabled":false`) && !strings.Contains(disableResp.Body.String(), `"enabled": false`) {
-		t.Fatalf("expected disable response to confirm disabled state, got %s", disableResp.Body.String())
+	if disablePayload.Status != "ok" || disablePayload.Action != "plugin.disable" || disablePayload.Target != "plugin-echo" || !disablePayload.Accepted || disablePayload.Reason != "plugin_disabled" || disablePayload.PluginID != "plugin-echo" || disablePayload.Enabled == nil || *disablePayload.Enabled {
+		t.Fatalf("expected normalized disable response, got %+v", disablePayload)
 	}
 
 	state, err := app.state.LoadPluginEnabledState(t.Context(), "plugin-echo")
@@ -2253,8 +2414,12 @@ func TestRuntimeAppOperatorDisablePersistsOverlaySkipsDispatchAndReEnables(t *te
 	if enableResp.Code != http.StatusOK {
 		t.Fatalf("expected enable operator 200, got %d: %s", enableResp.Code, enableResp.Body.String())
 	}
-	if !strings.Contains(enableResp.Body.String(), `"enabled":true`) && !strings.Contains(enableResp.Body.String(), `"enabled": true`) {
-		t.Fatalf("expected enable response to confirm enabled state, got %s", enableResp.Body.String())
+	var enablePayload operatorPluginResponsePayload
+	if err := json.Unmarshal(enableResp.Body.Bytes(), &enablePayload); err != nil {
+		t.Fatalf("decode enable response: %v", err)
+	}
+	if enablePayload.Status != "ok" || enablePayload.Action != "plugin.enable" || enablePayload.Target != "plugin-echo" || !enablePayload.Accepted || enablePayload.Reason != "plugin_enabled" || enablePayload.PluginID != "plugin-echo" || enablePayload.Enabled == nil || !*enablePayload.Enabled {
+		t.Fatalf("expected normalized enable response, got %+v", enablePayload)
 	}
 
 	messageReq2 := httptest.NewRequest(http.MethodPost, "/demo/onebot/message", strings.NewReader(`{"post_type":"message","message_type":"group","time":1712034001,"user_id":10001,"group_id":42,"message_id":9102,"raw_message":"re-enabled plugin runs","sender":{"nickname":"alice"}}`))
@@ -2272,10 +2437,10 @@ func TestRuntimeAppOperatorDisablePersistsOverlaySkipsDispatchAndReEnables(t *te
 	if len(entries) < 2 {
 		t.Fatalf("expected admin operator audits for disable/enable, got %+v", entries)
 	}
-	if entries[0].Action != "disable" || entries[0].Target != "plugin-echo" || !entries[0].Allowed {
+	if entries[0].Actor != "admin-user" || entries[0].Permission != "plugin:disable" || entries[0].Action != "plugin.disable" || entries[0].Target != "plugin-echo" || !entries[0].Allowed || entries[0].Reason != "plugin_disabled" || entries[0].PluginID != "plugin-admin" || entries[0].CorrelationID != "plugin-echo" || entries[0].ErrorCategory != "operator" || entries[0].ErrorCode != "plugin_disabled" {
 		t.Fatalf("expected first audit entry for disable, got %+v", entries[0])
 	}
-	if entries[1].Action != "enable" || entries[1].Target != "plugin-echo" || !entries[1].Allowed {
+	if entries[1].Actor != "admin-user" || entries[1].Permission != "plugin:enable" || entries[1].Action != "plugin.enable" || entries[1].Target != "plugin-echo" || !entries[1].Allowed || entries[1].Reason != "plugin_enabled" || entries[1].PluginID != "plugin-admin" || entries[1].CorrelationID != "plugin-echo" || entries[1].ErrorCategory != "operator" || entries[1].ErrorCode != "plugin_enabled" {
 		t.Fatalf("expected second audit entry for enable, got %+v", entries[1])
 	}
 }
@@ -3139,6 +3304,13 @@ func TestRuntimeAppPluginOperatorHotReloadsPersistedRBACSnapshotWithoutRestart(t
 	if enableResp.Code != http.StatusForbidden {
 		t.Fatalf("expected same-process hot-reloaded plugin enable 403, got %d: %s", enableResp.Code, enableResp.Body.String())
 	}
+	var deniedEnablePayload operatorActionEnvelopePayload
+	if err := json.Unmarshal(enableResp.Body.Bytes(), &deniedEnablePayload); err != nil {
+		t.Fatalf("decode denied plugin enable response: %v", err)
+	}
+	if deniedEnablePayload.Status != "forbidden" || deniedEnablePayload.Action != "plugin.enable" || deniedEnablePayload.Target != "plugin-echo" || deniedEnablePayload.Accepted || deniedEnablePayload.Reason != "permission_denied" || deniedEnablePayload.Error != "permission denied" {
+		t.Fatalf("expected normalized denied plugin enable response, got %+v", deniedEnablePayload)
+	}
 	if !strings.Contains(enableResp.Body.String(), "permission denied") {
 		t.Fatalf("expected hot-reloaded plugin enable denial to mention permission denied, got %s", enableResp.Body.String())
 	}
@@ -3154,7 +3326,7 @@ func TestRuntimeAppPluginOperatorHotReloadsPersistedRBACSnapshotWithoutRestart(t
 		t.Fatalf("expected allow+deny plugin operator audit entries, got %+v", entries)
 	}
 	last := entries[len(entries)-1]
-	if last.Actor != "admin-user" || last.Action != "plugin.enable" || last.Permission != "plugin:enable" || last.Target != "plugin-echo" || last.Allowed || last.Reason != "permission_denied" {
+	if last.Actor != "admin-user" || last.Action != "plugin.enable" || last.Permission != "plugin:enable" || last.Target != "plugin-echo" || last.Allowed || last.Reason != "permission_denied" || last.PluginID != "plugin-echo" || last.CorrelationID != "plugin-echo" || last.ErrorCategory != "authorization" || last.ErrorCode != "permission_denied" {
 		t.Fatalf("expected hot-reload denied plugin enable audit entry, got %+v", last)
 	}
 }
@@ -3238,12 +3410,12 @@ func TestRuntimeAppRestartReloadsPersistedRBACSnapshotAndIdentities(t *testing.T
 		t.Fatalf("expected denied config audit after restart, got %+v", entries[0])
 	}
 	last := entries[len(entries)-1]
-	if last.Actor != "config-operator" || last.Action != "config.update" || last.Permission != "plugin:config" || last.Target != "plugin-echo" || !last.Allowed || last.Reason != "plugin_config_updated" {
+	if last.Actor != "config-operator" || last.Action != "plugin.config" || last.Permission != "plugin:config" || last.Target != "plugin-echo" || !last.Allowed || last.Reason != "plugin_config_updated" || last.ErrorCategory != "operator" || last.ErrorCode != "plugin_config_updated" {
 		t.Fatalf("expected allowed config audit after restart, got %+v", last)
 	}
 }
 
-func TestRuntimeAppPostgresSelectedOperatorWritePathsPersistControlStateAndDeleteSchedules(t *testing.T) {
+func TestRuntimeAppPostgresSelectedOperatorWritePathsCoverPersistedOperatorSurface(t *testing.T) {
 	dir := t.TempDir()
 	configPath := writeWriteActionRBACConfigWithPostgresSmokeStoreAt(t, dir, runtimePostgresTestDSN(t))
 
@@ -3258,6 +3430,67 @@ func TestRuntimeAppPostgresSelectedOperatorWritePathsPersistControlStateAndDelet
 		t.Fatalf("expected postgres runtime state for operator matrix, got %T", app.runtimeState)
 	}
 
+	disableReq := httptest.NewRequest(http.MethodPost, "/demo/plugins/plugin-echo/disable", nil)
+	disableReq.Header.Set(runtimecore.ConsoleReadActorHeader, "admin-user")
+	disableResp := httptest.NewRecorder()
+	app.ServeHTTP(disableResp, disableReq)
+	if disableResp.Code != http.StatusOK {
+		t.Fatalf("expected postgres disable operator 200, got %d: %s", disableResp.Code, disableResp.Body.String())
+	}
+	var postgresDisablePayload operatorPluginResponsePayload
+	if err := json.Unmarshal(disableResp.Body.Bytes(), &postgresDisablePayload); err != nil {
+		t.Fatalf("decode postgres disable response: %v", err)
+	}
+	if postgresDisablePayload.Status != "ok" || postgresDisablePayload.Action != "plugin.disable" || postgresDisablePayload.Target != "plugin-echo" || !postgresDisablePayload.Accepted || postgresDisablePayload.Reason != "plugin_disabled" || postgresDisablePayload.PluginID != "plugin-echo" || postgresDisablePayload.Enabled == nil || *postgresDisablePayload.Enabled {
+		t.Fatalf("expected normalized postgres disable response, got %+v", postgresDisablePayload)
+	}
+	disabledState, err := postgresStore.LoadPluginEnabledState(t.Context(), "plugin-echo")
+	if err != nil {
+		t.Fatalf("load postgres disabled plugin state: %v", err)
+	}
+	if disabledState.Enabled {
+		t.Fatalf("expected postgres plugin enabled overlay to persist disabled state, got %+v", disabledState)
+	}
+	if _, err := app.state.LoadPluginEnabledState(t.Context(), "plugin-echo"); err == nil {
+		t.Fatal("expected sqlite plugin enabled overlay table to stay empty under postgres selection")
+	}
+
+	messageReq := httptest.NewRequest(http.MethodPost, "/demo/onebot/message", strings.NewReader(`{"post_type":"message","message_type":"group","time":1712034000,"user_id":10001,"group_id":42,"message_id":9101,"raw_message":"disabled plugin should skip","sender":{"nickname":"alice"}}`))
+	messageReq.Header.Set("Content-Type", "application/json")
+	messageResp := httptest.NewRecorder()
+	app.ServeHTTP(messageResp, messageReq)
+	if messageResp.Code != http.StatusOK {
+		t.Fatalf("expected postgres disabled-plugin dispatch 200, got %d: %s", messageResp.Code, messageResp.Body.String())
+	}
+	if strings.Contains(messageResp.Body.String(), "echo: disabled plugin should skip") {
+		t.Fatalf("expected disabled postgres plugin not to emit echo reply, got %s", messageResp.Body.String())
+	}
+	if app.replies.Count() != 0 {
+		t.Fatalf("expected disabled postgres plugin to suppress replies, got %+v", app.replies.Since(0))
+	}
+
+	enableReq := httptest.NewRequest(http.MethodPost, "/demo/plugins/plugin-echo/enable", nil)
+	enableReq.Header.Set(runtimecore.ConsoleReadActorHeader, "admin-user")
+	enableResp := httptest.NewRecorder()
+	app.ServeHTTP(enableResp, enableReq)
+	if enableResp.Code != http.StatusOK {
+		t.Fatalf("expected postgres enable operator 200, got %d: %s", enableResp.Code, enableResp.Body.String())
+	}
+	var postgresEnablePayload operatorPluginResponsePayload
+	if err := json.Unmarshal(enableResp.Body.Bytes(), &postgresEnablePayload); err != nil {
+		t.Fatalf("decode postgres enable response: %v", err)
+	}
+	if postgresEnablePayload.Status != "ok" || postgresEnablePayload.Action != "plugin.enable" || postgresEnablePayload.Target != "plugin-echo" || !postgresEnablePayload.Accepted || postgresEnablePayload.Reason != "plugin_enabled" || postgresEnablePayload.PluginID != "plugin-echo" || postgresEnablePayload.Enabled == nil || !*postgresEnablePayload.Enabled {
+		t.Fatalf("expected normalized postgres enable response, got %+v", postgresEnablePayload)
+	}
+	enabledState, err := postgresStore.LoadPluginEnabledState(t.Context(), "plugin-echo")
+	if err != nil {
+		t.Fatalf("load postgres re-enabled plugin state: %v", err)
+	}
+	if !enabledState.Enabled {
+		t.Fatalf("expected postgres plugin enabled overlay to persist enabled state, got %+v", enabledState)
+	}
+
 	configReq := httptest.NewRequest(http.MethodPost, "/demo/plugins/plugin-echo/config", strings.NewReader(`{"prefix":"postgres persisted: "}`))
 	configReq.Header.Set("Content-Type", "application/json")
 	configReq.Header.Set(runtimecore.ConsoleReadActorHeader, "config-operator")
@@ -3266,10 +3499,12 @@ func TestRuntimeAppPostgresSelectedOperatorWritePathsPersistControlStateAndDelet
 	if configResp.Code != http.StatusOK {
 		t.Fatalf("expected postgres config operator 200, got %d: %s", configResp.Code, configResp.Body.String())
 	}
-	for _, expected := range []string{`"status":"ok"`, `"action":"config.update"`, `"target":"plugin-echo"`, `"accepted":true`, `"reason":"plugin_config_updated"`, `"plugin_id":"plugin-echo"`} {
-		if !strings.Contains(configResp.Body.String(), expected) && !strings.Contains(configResp.Body.String(), strings.ReplaceAll(expected, `:`, `: `)) {
-			t.Fatalf("expected postgres config response to include %s, got %s", expected, configResp.Body.String())
-		}
+	var postgresConfigPayload operatorPluginConfigResponsePayload
+	if err := json.Unmarshal(configResp.Body.Bytes(), &postgresConfigPayload); err != nil {
+		t.Fatalf("decode postgres config response: %v", err)
+	}
+	if postgresConfigPayload.Status != "ok" || postgresConfigPayload.Action != "plugin.config" || postgresConfigPayload.Target != "plugin-echo" || !postgresConfigPayload.Accepted || postgresConfigPayload.Reason != "plugin_config_updated" || postgresConfigPayload.PluginID != "plugin-echo" || postgresConfigPayload.Persisted == nil || !*postgresConfigPayload.Persisted {
+		t.Fatalf("expected normalized postgres config response, got %+v", postgresConfigPayload)
 	}
 
 	configState, err := postgresStore.LoadPluginConfig(t.Context(), "plugin-echo")
@@ -3281,6 +3516,65 @@ func TestRuntimeAppPostgresSelectedOperatorWritePathsPersistControlStateAndDelet
 	}
 	if _, err := app.state.LoadPluginConfig(t.Context(), "plugin-echo"); err == nil {
 		t.Fatal("expected sqlite plugin config table to stay empty under postgres selection")
+	}
+
+	job := runtimecore.NewJob("job-postgres-dead-retry", "ai.chat", 0, 30*time.Second)
+	job.TraceID = "trace-job-postgres-dead-retry"
+	job.EventID = "evt-job-postgres-dead-retry"
+	job.Correlation = "runtime-ai:user-postgres-retry:hello retry"
+	if err := applyDemoAIJobContract(&job, "hello retry", "user-postgres-retry"); err != nil {
+		t.Fatalf("apply demo ai job contract: %v", err)
+	}
+	if err := app.queue.Enqueue(t.Context(), job); err != nil {
+		t.Fatalf("enqueue postgres retry seed job: %v", err)
+	}
+	timeoutReq := httptest.NewRequest(http.MethodPost, "/demo/jobs/timeout?id=job-postgres-dead-retry", nil)
+	timeoutResp := httptest.NewRecorder()
+	app.ServeHTTP(timeoutResp, timeoutReq)
+	if timeoutResp.Code != http.StatusOK {
+		t.Fatalf("expected postgres timeout 200, got %d: %s", timeoutResp.Code, timeoutResp.Body.String())
+	}
+	retryReq := httptest.NewRequest(http.MethodPost, "/demo/jobs/job-postgres-dead-retry/retry", nil)
+	retryReq.Header.Set(runtimecore.ConsoleReadActorHeader, "job-operator")
+	retryResp := httptest.NewRecorder()
+	app.ServeHTTP(retryResp, retryReq)
+	if retryResp.Code != http.StatusOK {
+		t.Fatalf("expected postgres retry operator 200, got %d: %s", retryResp.Code, retryResp.Body.String())
+	}
+	var postgresRetryPayload operatorJobResponsePayload
+	if err := json.Unmarshal(retryResp.Body.Bytes(), &postgresRetryPayload); err != nil {
+		t.Fatalf("decode postgres retry response: %v", err)
+	}
+	if postgresRetryPayload.Status != "ok" || postgresRetryPayload.Action != "job.retry" || postgresRetryPayload.Target != "job-postgres-dead-retry" || !postgresRetryPayload.Accepted || postgresRetryPayload.Reason != "job_dead_letter_retried" || postgresRetryPayload.JobID != "job-postgres-dead-retry" {
+		t.Fatalf("expected normalized postgres retry response, got %+v", postgresRetryPayload)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		stored, inspectErr := app.queue.Inspect(t.Context(), "job-postgres-dead-retry")
+		if inspectErr != nil {
+			t.Fatalf("inspect postgres retried job: %v", inspectErr)
+		}
+		if stored.Status == runtimecore.JobStatusDone {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	retriedJob, err := app.queue.Inspect(t.Context(), "job-postgres-dead-retry")
+	if err != nil {
+		t.Fatalf("inspect postgres retried job after dispatch: %v", err)
+	}
+	if retriedJob.Status != runtimecore.JobStatusDone || retriedJob.DeadLetter {
+		t.Fatalf("expected retried postgres job to leave dead-letter state and complete, got %+v", retriedJob)
+	}
+	storedJob, err := postgresStore.LoadJob(t.Context(), "job-postgres-dead-retry")
+	if err != nil {
+		t.Fatalf("load postgres retried job: %v", err)
+	}
+	if storedJob.Status != runtimecore.JobStatusDone || storedJob.DeadLetter {
+		t.Fatalf("expected postgres retried job persistence after operator retry, got %+v", storedJob)
+	}
+	if len(app.replies.Since(0)) == 0 {
+		t.Fatal("expected postgres retried ai job to record a reply through runtime/plugin path")
 	}
 
 	createReq := httptest.NewRequest(http.MethodPost, "/demo/schedules/echo-delay", strings.NewReader(`{"id":"schedule-postgres-cancel","delay_ms":60000,"message":"cancel in postgres"}`))
@@ -3301,10 +3595,12 @@ func TestRuntimeAppPostgresSelectedOperatorWritePathsPersistControlStateAndDelet
 	if cancelResp.Code != http.StatusOK {
 		t.Fatalf("expected postgres cancel operator 200, got %d: %s", cancelResp.Code, cancelResp.Body.String())
 	}
-	for _, expected := range []string{`"status":"ok"`, `"schedule_id":"schedule-postgres-cancel"`, `"action":"cancel"`} {
-		if !strings.Contains(cancelResp.Body.String(), expected) && !strings.Contains(cancelResp.Body.String(), strings.ReplaceAll(expected, `:`, `: `)) {
-			t.Fatalf("expected postgres cancel response to include %s, got %s", expected, cancelResp.Body.String())
-		}
+	var postgresCancelPayload operatorScheduleResponsePayload
+	if err := json.Unmarshal(cancelResp.Body.Bytes(), &postgresCancelPayload); err != nil {
+		t.Fatalf("decode postgres cancel response: %v", err)
+	}
+	if postgresCancelPayload.Status != "ok" || postgresCancelPayload.Action != "schedule.cancel" || postgresCancelPayload.Target != "schedule-postgres-cancel" || !postgresCancelPayload.Accepted || postgresCancelPayload.Reason != "schedule_cancelled" || postgresCancelPayload.ScheduleID != "schedule-postgres-cancel" {
+		t.Fatalf("expected normalized postgres cancel response, got %+v", postgresCancelPayload)
 	}
 	if _, err := postgresStore.LoadSchedulePlan(t.Context(), "schedule-postgres-cancel"); err == nil {
 		t.Fatal("expected cancelled postgres schedule to be deleted from selected backend")
@@ -3317,8 +3613,17 @@ func TestRuntimeAppPostgresSelectedOperatorWritePathsPersistControlStateAndDelet
 	if err != nil {
 		t.Fatalf("runtime state counts after postgres operator writes: %v", err)
 	}
+	if counts["plugin_enabled_overlays"] != 1 {
+		t.Fatalf("expected postgres control state to persist one plugin enabled overlay, got %+v", counts)
+	}
 	if counts["plugin_configs"] != 1 {
 		t.Fatalf("expected postgres control state to persist one plugin config, got %+v", counts)
+	}
+	if counts["jobs"] < 1 {
+		t.Fatalf("expected postgres execution state to persist retried job, got %+v", counts)
+	}
+	if counts["alerts"] != 0 {
+		t.Fatalf("expected postgres retry path to clear persisted alerts, got %+v", counts)
 	}
 	if counts["schedule_plans"] != 0 {
 		t.Fatalf("expected postgres schedule count to return to zero after cancel, got %+v", counts)
@@ -3327,13 +3632,22 @@ func TestRuntimeAppPostgresSelectedOperatorWritePathsPersistControlStateAndDelet
 	if err != nil {
 		t.Fatalf("sqlite counts after postgres operator writes: %v", err)
 	}
-	if sqliteCounts["plugin_configs"] != 0 || sqliteCounts["schedule_plans"] != 0 {
+	if sqliteCounts["plugin_enabled_overlays"] != 0 || sqliteCounts["plugin_configs"] != 0 || sqliteCounts["jobs"] != 0 || sqliteCounts["alerts"] != 0 || sqliteCounts["schedule_plans"] != 0 {
 		t.Fatalf("expected sqlite control/runtime tables to stay empty under postgres operator paths, got %+v", sqliteCounts)
 	}
 
 	console := readRuntimeConsoleResponseAsViewer(t, app, "/api/console?plugin_id=plugin-echo")
+	if got := consoleMetaString(t, console.Meta, "plugin_enabled_state_read_model"); got != "runtime-registry+postgres-plugin-enabled-overlay" {
+		t.Fatalf("expected plugin_enabled_state_read_model=runtime-registry+postgres-plugin-enabled-overlay, got %q", got)
+	}
 	if got := consoleMetaString(t, console.Meta, "plugin_config_read_model"); got != "postgres-plugin-config" {
 		t.Fatalf("expected plugin_config_read_model=postgres-plugin-config, got %q", got)
+	}
+	if got := consoleMetaString(t, console.Meta, "job_read_model"); got != "postgres" {
+		t.Fatalf("expected job_read_model=postgres, got %q", got)
+	}
+	if got := consoleMetaString(t, console.Meta, "job_status_source"); got != "postgres-jobs" {
+		t.Fatalf("expected job_status_source=postgres-jobs, got %q", got)
 	}
 	if got := consoleMetaString(t, console.Meta, "schedule_read_model"); got != "postgres" {
 		t.Fatalf("expected schedule_read_model=postgres, got %q", got)
@@ -3347,6 +3661,9 @@ func TestRuntimeAppPostgresSelectedOperatorWritePathsPersistControlStateAndDelet
 			continue
 		}
 		pluginFound = true
+		if plugin.EnabledStateSource != "postgres-plugin-enabled-overlay" || !plugin.EnabledStatePersisted {
+			t.Fatalf("expected postgres console plugin enabled-state provenance, got %+v", plugin)
+		}
 		if plugin.ConfigStateKind != "plugin-owned-persisted-input" || plugin.ConfigSource != "postgres-plugin-config" || !plugin.ConfigPersisted || plugin.ConfigUpdatedAt == "" {
 			t.Fatalf("expected postgres console plugin config provenance, got %+v", plugin)
 		}
@@ -3363,26 +3680,56 @@ func TestRuntimeAppPostgresSelectedOperatorWritePathsPersistControlStateAndDelet
 	if !strings.Contains(consoleResp.Body.String(), `"prefix": "postgres persisted: "`) && !strings.Contains(consoleResp.Body.String(), `"prefix":"postgres persisted: "`) {
 		t.Fatalf("expected postgres console payload to expose persisted plugin config value, got %s", consoleResp.Body.String())
 	}
+	for _, expected := range []string{`"enabled": true`, `"enabledStateSource": "postgres-plugin-enabled-overlay"`, `"enabledStatePersisted": true`} {
+		if !strings.Contains(consoleResp.Body.String(), expected) && !strings.Contains(consoleResp.Body.String(), strings.ReplaceAll(expected, `:`, `: `)) {
+			t.Fatalf("expected postgres console payload to expose persisted plugin enabled value %s, got %s", expected, consoleResp.Body.String())
+		}
+	}
 	if hasConsoleSchedule(console, "schedule-postgres-cancel") {
 		t.Fatalf("expected cancelled postgres schedule to disappear from console read model, got %+v", console.Schedules)
 	}
+	jobFound := false
+	for _, job := range console.Jobs {
+		if job.ID == "job-postgres-dead-retry" && job.Status == "done" && !job.DeadLetter {
+			jobFound = true
+			break
+		}
+	}
+	if !jobFound {
+		t.Fatalf("expected postgres console payload to expose retried job, got %+v", console.Jobs)
+	}
+	if strings.Contains(consoleResp.Body.String(), `"objectId": "job-postgres-dead-retry"`) || strings.Contains(consoleResp.Body.String(), `"objectId":"job-postgres-dead-retry"`) {
+		t.Fatalf("expected postgres retry path to clear console alert, got %s", consoleResp.Body.String())
+	}
 
 	audits := app.audits.AuditEntries()
-	if len(audits) < 2 {
+	if len(audits) < 5 {
 		t.Fatalf("expected postgres operator writes to record audit evidence, got %+v", audits)
 	}
+	disableAuditFound := false
+	enableAuditFound := false
 	configAuditFound := false
+	retryAuditFound := false
 	cancelAuditFound := false
 	for _, entry := range audits {
-		if entry.Actor == "config-operator" && entry.Action == "config.update" && entry.Permission == "plugin:config" && entry.Target == "plugin-echo" && entry.Allowed && entry.Reason == "plugin_config_updated" {
+		if entry.Actor == "admin-user" && entry.Action == "plugin.disable" && entry.Permission == "plugin:disable" && entry.Target == "plugin-echo" && entry.PluginID == "plugin-admin" && entry.CorrelationID == "plugin-echo" && entry.Allowed && entry.Reason == "plugin_disabled" && entry.ErrorCategory == "operator" && entry.ErrorCode == "plugin_disabled" {
+			disableAuditFound = true
+		}
+		if entry.Actor == "admin-user" && entry.Action == "plugin.enable" && entry.Permission == "plugin:enable" && entry.Target == "plugin-echo" && entry.PluginID == "plugin-admin" && entry.CorrelationID == "plugin-echo" && entry.Allowed && entry.Reason == "plugin_enabled" && entry.ErrorCategory == "operator" && entry.ErrorCode == "plugin_enabled" {
+			enableAuditFound = true
+		}
+		if entry.Actor == "config-operator" && entry.Action == "plugin.config" && entry.Permission == "plugin:config" && entry.Target == "plugin-echo" && entry.Allowed && entry.Reason == "plugin_config_updated" && entry.ErrorCategory == "operator" && entry.ErrorCode == "plugin_config_updated" {
 			configAuditFound = true
 		}
-		if entry.Actor == "schedule-admin" && entry.Action == "cancel" && entry.Permission == "schedule:cancel" && entry.Target == "schedule-postgres-cancel" && entry.Allowed && entry.Reason == "schedule_cancelled" {
+		if entry.Actor == "job-operator" && entry.Action == "job.retry" && entry.Permission == "job:retry" && entry.Target == "job-postgres-dead-retry" && entry.Allowed && entry.Reason == "job_dead_letter_retried" && entry.ErrorCategory == "operator" && entry.ErrorCode == "job_dead_letter_retried" {
+			retryAuditFound = true
+		}
+		if entry.Actor == "schedule-admin" && entry.Action == "schedule.cancel" && entry.Permission == "schedule:cancel" && entry.Target == "schedule-postgres-cancel" && entry.Allowed && entry.Reason == "schedule_cancelled" && entry.ErrorCategory == "operator" && entry.ErrorCode == "schedule_cancelled" {
 			cancelAuditFound = true
 		}
 	}
-	if !configAuditFound || !cancelAuditFound {
-		t.Fatalf("expected postgres operator audit entries for config+cancel, got %+v", audits)
+	if !disableAuditFound || !enableAuditFound || !configAuditFound || !retryAuditFound || !cancelAuditFound {
+		t.Fatalf("expected postgres operator audit entries for disable+enable+config+retry+cancel, got %+v", audits)
 	}
 }
 
@@ -3858,10 +4205,12 @@ func TestRuntimeAppRetryDeadLetterOperatorRequeuesJobClearsConsoleAlertAndRecord
 	if retryResp.Code != http.StatusOK {
 		t.Fatalf("expected retry operator 200, got %d: %s", retryResp.Code, retryResp.Body.String())
 	}
-	for _, expected := range []string{`"status":"ok"`, `"action":"retry"`, `"target":"job-dead-retry-console"`, `"accepted":true`, `"reason":"job_dead_letter_retried"`, `"job_id":"job-dead-retry-console"`} {
-		if !strings.Contains(retryResp.Body.String(), expected) && !strings.Contains(retryResp.Body.String(), strings.ReplaceAll(expected, `:`, `: `)) {
-			t.Fatalf("expected retry response to include %s, got %s", expected, retryResp.Body.String())
-		}
+	var retryPayload operatorJobResponsePayload
+	if err := json.Unmarshal(retryResp.Body.Bytes(), &retryPayload); err != nil {
+		t.Fatalf("decode retry response: %v", err)
+	}
+	if retryPayload.Status != "ok" || retryPayload.Action != "job.retry" || retryPayload.Target != "job-dead-retry-console" || !retryPayload.Accepted || retryPayload.Reason != "job_dead_letter_retried" || retryPayload.JobID != "job-dead-retry-console" {
+		t.Fatalf("expected normalized retry response, got %+v", retryPayload)
 	}
 
 	deadline := time.Now().Add(2 * time.Second)
@@ -3913,6 +4262,7 @@ func TestRuntimeAppRetryDeadLetterOperatorRequeuesJobClearsConsoleAlertAndRecord
 			PluginID      string `json:"plugin_id"`
 			RunID         string `json:"run_id"`
 			CorrelationID string `json:"correlation_id"`
+			ErrorCategory string `json:"error_category"`
 			ErrorCode     string `json:"error_code"`
 		} `json:"audits"`
 	}
@@ -3936,7 +4286,7 @@ func TestRuntimeAppRetryDeadLetterOperatorRequeuesJobClearsConsoleAlertAndRecord
 	}
 	auditVisible := false
 	for _, entry := range payload.Audits {
-		if entry.Actor == "job-operator" && entry.Action == "retry" && entry.Target == "job-dead-retry-console" && entry.Allowed && entry.Reason == "job_dead_letter_retried" && entry.TraceID == "trace-job-dead-retry-console" && entry.EventID == "evt-job-dead-retry-console" && entry.PluginID == "" && entry.RunID == "" && entry.CorrelationID == "runtime-ai:user-retry:hello retry" && entry.ErrorCode == "job_dead_letter_retried" {
+		if entry.Actor == "job-operator" && entry.Action == "job.retry" && entry.Target == "job-dead-retry-console" && entry.Allowed && entry.Reason == "job_dead_letter_retried" && entry.TraceID == "trace-job-dead-retry-console" && entry.EventID == "evt-job-dead-retry-console" && entry.PluginID == "" && entry.RunID == "run-evt-job-dead-retry-console" && entry.CorrelationID == "runtime-ai:user-retry:hello retry" && entry.ErrorCategory == "operator" && entry.ErrorCode == "job_dead_letter_retried" {
 			auditVisible = true
 			break
 		}
@@ -3949,10 +4299,10 @@ func TestRuntimeAppRetryDeadLetterOperatorRequeuesJobClearsConsoleAlertAndRecord
 		t.Fatal("expected retry operator to record audit evidence")
 	}
 	lastEntry := entries[len(entries)-1]
-	if lastEntry.Actor != "job-operator" || lastEntry.Permission != "job:retry" || lastEntry.Action != "retry" || lastEntry.Target != "job-dead-retry-console" || !lastEntry.Allowed || lastEntry.Reason != "job_dead_letter_retried" {
+	if lastEntry.Actor != "job-operator" || lastEntry.Permission != "job:retry" || lastEntry.Action != "job.retry" || lastEntry.Target != "job-dead-retry-console" || !lastEntry.Allowed || lastEntry.Reason != "job_dead_letter_retried" || lastEntry.ErrorCategory != "operator" || lastEntry.ErrorCode != "job_dead_letter_retried" {
 		t.Fatalf("expected distinct retry audit entry, got %+v", lastEntry)
 	}
-	if lastEntry.TraceID != "trace-job-dead-retry-console" || lastEntry.EventID != "evt-job-dead-retry-console" || lastEntry.RunID != "" || lastEntry.CorrelationID != "runtime-ai:user-retry:hello retry" || lastEntry.ErrorCode != "job_dead_letter_retried" {
+	if lastEntry.TraceID != "trace-job-dead-retry-console" || lastEntry.EventID != "evt-job-dead-retry-console" || lastEntry.RunID != "run-evt-job-dead-retry-console" || lastEntry.CorrelationID != "runtime-ai:user-retry:hello retry" {
 		t.Fatalf("expected retry audit observability fields, got %+v", lastEntry)
 	}
 	if lastEntry.Action == "replay" || strings.Contains(lastEntry.Reason, "replay") {
@@ -3979,7 +4329,7 @@ func TestRuntimeAppConsoleReadsPersistedAuditEntriesFromSQLiteState(t *testing.T
 	entry := pluginsdk.AuditEntry{
 		Actor:         "schedule-admin",
 		Permission:    "schedule:cancel",
-		Action:        "cancel",
+		Action:        "schedule.cancel",
 		Target:        "schedule-persisted-audit",
 		Allowed:       true,
 		Reason:        "schedule_cancelled",
@@ -4068,7 +4418,7 @@ func TestRuntimeAppRetryDeadLetterOperatorRejectsDuplicateAndInvalidRequestsSafe
 	entries := app.audits.AuditEntries()
 	allowedRetries := 0
 	for _, entry := range entries {
-		if entry.Action == "retry" && entry.Target == "job-dead-retry-once" && entry.Allowed {
+		if entry.Action == "job.retry" && entry.Target == "job-dead-retry-once" && entry.Allowed {
 			allowedRetries++
 		}
 	}
@@ -4111,6 +4461,13 @@ func TestRuntimeAppRetryDeadLetterOperatorReturnsForbiddenAndRecordsDeniedAudit(
 	if retryResp.Code != http.StatusForbidden {
 		t.Fatalf("expected denied retry 403, got %d: %s", retryResp.Code, retryResp.Body.String())
 	}
+	var deniedRetryPayload operatorActionEnvelopePayload
+	if err := json.Unmarshal(retryResp.Body.Bytes(), &deniedRetryPayload); err != nil {
+		t.Fatalf("decode denied retry response: %v", err)
+	}
+	if deniedRetryPayload.Status != "forbidden" || deniedRetryPayload.Action != "job.retry" || deniedRetryPayload.Target != "job-dead-retry-denied" || deniedRetryPayload.Accepted || deniedRetryPayload.Reason != "permission_denied" || deniedRetryPayload.Error != "permission denied" {
+		t.Fatalf("expected normalized denied retry response, got %+v", deniedRetryPayload)
+	}
 	if !strings.Contains(retryResp.Body.String(), "permission denied") {
 		t.Fatalf("expected denied retry response to mention permission denied, got %s", retryResp.Body.String())
 	}
@@ -4125,8 +4482,11 @@ func TestRuntimeAppRetryDeadLetterOperatorReturnsForbiddenAndRecordsDeniedAudit(
 	if len(entries) != 1 {
 		t.Fatalf("expected one denied retry audit entry, got %+v", entries)
 	}
-	if entries[0].Actor != "viewer-user" || entries[0].Action != "job.retry" || entries[0].Permission != "job:retry" || entries[0].Target != "job-dead-retry-denied" || entries[0].Allowed || entries[0].Reason != "permission_denied" {
+	if entries[0].Actor != "viewer-user" || entries[0].Action != "job.retry" || entries[0].Permission != "job:retry" || entries[0].Target != "job-dead-retry-denied" || entries[0].Allowed || entries[0].Reason != "permission_denied" || entries[0].ErrorCategory != "authorization" || entries[0].ErrorCode != "permission_denied" {
 		t.Fatalf("expected denied retry audit entry, got %+v", entries[0])
+	}
+	if entries[0].SessionID != "" {
+		t.Fatalf("expected denied retry without bearer auth to omit session id, got %+v", entries[0])
 	}
 }
 
@@ -4170,6 +4530,9 @@ func TestRuntimeAppRetryDeadLetterOperatorFailsClosedWithoutActorHeaderUnderConf
 	if len(entries) != 1 || entries[0].Actor != "" || entries[0].Action != "job.retry" || entries[0].Permission != "job:retry" || entries[0].Target != "job-dead-retry-missing-actor" || entries[0].Allowed || entries[0].Reason != "permission_denied" {
 		t.Fatalf("expected headerless retry deny audit entry, got %+v", entries)
 	}
+	if len(entries) == 1 && entries[0].SessionID != "" {
+		t.Fatalf("expected headerless retry deny audit entry to omit session id, got %+v", entries[0])
+	}
 }
 
 func TestRuntimeAppPluginEchoConfigOperatorPersistsConfigWithStableEnvelopeAndAllowAudit(t *testing.T) {
@@ -4190,10 +4553,12 @@ func TestRuntimeAppPluginEchoConfigOperatorPersistsConfigWithStableEnvelopeAndAl
 	if configResp.Code != http.StatusOK {
 		t.Fatalf("expected config operator 200, got %d: %s", configResp.Code, configResp.Body.String())
 	}
-	for _, expected := range []string{`"status":"ok"`, `"action":"config.update"`, `"target":"plugin-echo"`, `"accepted":true`, `"reason":"plugin_config_updated"`, `"plugin_id":"plugin-echo"`} {
-		if !strings.Contains(configResp.Body.String(), expected) && !strings.Contains(configResp.Body.String(), strings.ReplaceAll(expected, `:`, `: `)) {
-			t.Fatalf("expected config response to include %s, got %s", expected, configResp.Body.String())
-		}
+	var configPayload operatorPluginConfigResponsePayload
+	if err := json.Unmarshal(configResp.Body.Bytes(), &configPayload); err != nil {
+		t.Fatalf("decode config response: %v", err)
+	}
+	if configPayload.Status != "ok" || configPayload.Action != "plugin.config" || configPayload.Target != "plugin-echo" || !configPayload.Accepted || configPayload.Reason != "plugin_config_updated" || configPayload.PluginID != "plugin-echo" || configPayload.Persisted == nil || !*configPayload.Persisted {
+		t.Fatalf("expected normalized config response, got %+v", configPayload)
 	}
 	stored, err := app.state.LoadPluginConfig(t.Context(), "plugin-echo")
 	if err != nil {
@@ -4206,8 +4571,72 @@ func TestRuntimeAppPluginEchoConfigOperatorPersistsConfigWithStableEnvelopeAndAl
 	if len(entries) != 1 {
 		t.Fatalf("expected one allow audit entry for config update, got %+v", entries)
 	}
-	if entries[0].Actor != "config-operator" || entries[0].Action != "config.update" || entries[0].Permission != "plugin:config" || entries[0].Target != "plugin-echo" || !entries[0].Allowed || entries[0].Reason != "plugin_config_updated" {
+	if entries[0].Actor != "config-operator" || entries[0].Action != "plugin.config" || entries[0].Permission != "plugin:config" || entries[0].Target != "plugin-echo" || !entries[0].Allowed || entries[0].Reason != "plugin_config_updated" || entries[0].ErrorCategory != "operator" || entries[0].ErrorCode != "plugin_config_updated" {
 		t.Fatalf("expected config update audit entry, got %+v", entries[0])
+	}
+	if entries[0].SessionID != "" {
+		t.Fatalf("expected actor-header config update to omit session id without bearer auth, got %+v", entries[0])
+	}
+}
+
+func TestRuntimeAppConsoleReadsPersistedAuditSessionIDFromSQLiteState(t *testing.T) {
+	t.Parallel()
+
+	app, err := newRuntimeApp(writeTestConfig(t))
+	if err != nil {
+		t.Fatalf("new runtime app: %v", err)
+	}
+	defer func() { _ = app.Close() }()
+
+	entry := pluginsdk.AuditEntry{
+		Actor:         "schedule-admin",
+		Permission:    "schedule:cancel",
+		Action:        "schedule.cancel",
+		Target:        "schedule-persisted-audit-session",
+		Allowed:       true,
+		Reason:        "schedule_cancelled",
+		TraceID:       "trace-persisted-console-audit-session",
+		EventID:       "evt-persisted-console-audit-session",
+		PluginID:      "plugin-scheduler",
+		RunID:         "run-persisted-console-audit-session",
+		SessionID:     "session-operator-bearer-schedule-admin",
+		CorrelationID: "corr-persisted-console-audit-session",
+		ErrorCategory: "operator",
+		ErrorCode:     "schedule_cancelled",
+		OccurredAt:    "2026-04-21T09:10:00Z",
+	}
+	if err := app.auditRecorder.RecordAudit(entry); err != nil {
+		t.Fatalf("save persisted audit with session: %v", err)
+	}
+
+	consoleReq := httptest.NewRequest(http.MethodGet, "/api/console", nil)
+	consoleResp := httptest.NewRecorder()
+	app.ServeHTTP(consoleResp, consoleReq)
+	if consoleResp.Code != http.StatusOK {
+		t.Fatalf("expected console 200, got %d: %s", consoleResp.Code, consoleResp.Body.String())
+	}
+	if !strings.Contains(consoleResp.Body.String(), `"session_id": "session-operator-bearer-schedule-admin"`) {
+		t.Fatalf("expected console persisted audit payload to include session_id, got %s", consoleResp.Body.String())
+	}
+
+	var payload struct {
+		Audits []struct {
+			Target    string `json:"target"`
+			SessionID string `json:"session_id"`
+		} `json:"audits"`
+	}
+	if err := json.Unmarshal(consoleResp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode console payload with audits: %v", err)
+	}
+	found := false
+	for _, audit := range payload.Audits {
+		if audit.Target == entry.Target && audit.SessionID == entry.SessionID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected console audits to round-trip persisted session_id, got %+v", payload.Audits)
 	}
 }
 
@@ -4228,6 +4657,13 @@ func TestRuntimeAppPluginEchoConfigOperatorReturnsForbiddenAndRecordsDeniedAudit
 	if configResp.Code != http.StatusForbidden {
 		t.Fatalf("expected denied config update 403, got %d: %s", configResp.Code, configResp.Body.String())
 	}
+	var deniedConfigPayload operatorActionEnvelopePayload
+	if err := json.Unmarshal(configResp.Body.Bytes(), &deniedConfigPayload); err != nil {
+		t.Fatalf("decode denied config response: %v", err)
+	}
+	if deniedConfigPayload.Status != "forbidden" || deniedConfigPayload.Action != "plugin.config" || deniedConfigPayload.Target != "plugin-echo" || deniedConfigPayload.Accepted || deniedConfigPayload.Reason != "permission_denied" || deniedConfigPayload.Error != "permission denied" {
+		t.Fatalf("expected normalized denied config response, got %+v", deniedConfigPayload)
+	}
 	if !strings.Contains(configResp.Body.String(), "permission denied") {
 		t.Fatalf("expected denied config update response to mention permission denied, got %s", configResp.Body.String())
 	}
@@ -4238,8 +4674,376 @@ func TestRuntimeAppPluginEchoConfigOperatorReturnsForbiddenAndRecordsDeniedAudit
 	if len(entries) != 1 {
 		t.Fatalf("expected one denied config audit entry, got %+v", entries)
 	}
-	if entries[0].Actor != "viewer-user" || entries[0].Action != "plugin.config" || entries[0].Permission != "plugin:config" || entries[0].Target != "plugin-echo" || entries[0].Allowed || entries[0].Reason != "permission_denied" {
+	if entries[0].Actor != "viewer-user" || entries[0].Action != "plugin.config" || entries[0].Permission != "plugin:config" || entries[0].Target != "plugin-echo" || entries[0].Allowed || entries[0].Reason != "permission_denied" || entries[0].ErrorCategory != "authorization" || entries[0].ErrorCode != "permission_denied" {
 		t.Fatalf("expected denied config audit entry, got %+v", entries[0])
+	}
+	if entries[0].SessionID != "" {
+		t.Fatalf("expected denied config audit without bearer auth to omit session id, got %+v", entries[0])
+	}
+}
+
+func TestRuntimeAppBindsBearerOperatorIdentityIntoSessionStoreAndAudit(t *testing.T) {
+	t.Setenv("BOT_PLATFORM_OPERATOR_TOKEN", "opaque-operator-token")
+	app, err := newRuntimeApp(writeOperatorAuthConfig(t, t.TempDir()))
+	if err != nil {
+		t.Fatalf("new runtime app: %v", err)
+	}
+	defer func() { _ = app.Close() }()
+
+	req := httptest.NewRequest(http.MethodGet, "/api/console", nil)
+	req.Header.Set("Authorization", "Bearer opaque-operator-token")
+	req.Header.Set(runtimecore.ConsoleReadActorHeader, "admin-user")
+	resp := httptest.NewRecorder()
+	app.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected bearer-bound console read 200, got %d: %s", resp.Code, resp.Body.String())
+	}
+
+	stored, err := app.state.LoadSession(t.Context(), runtimecore.OperatorBearerSessionID("admin-user"))
+	if err != nil {
+		t.Fatalf("load persisted operator session: %v", err)
+	}
+	if stored.SessionID != runtimecore.OperatorBearerSessionID("admin-user") || stored.PluginID != runtimecore.OperatorAuthSessionPluginID {
+		t.Fatalf("unexpected persisted operator session identity %+v", stored)
+	}
+	if stored.State["actor_id"] != "admin-user" || stored.State["token_id"] != "console-main" || stored.State["auth_method"] != runtimecore.RequestIdentityAuthMethodBearer {
+		t.Fatalf("unexpected persisted operator session state %+v", stored.State)
+	}
+	listed, err := app.state.ListSessions(t.Context())
+	if err != nil {
+		t.Fatalf("list persisted sessions: %v", err)
+	}
+	if len(listed) != 1 || listed[0].SessionID != stored.SessionID {
+		t.Fatalf("expected one persisted bearer-bound session, got %+v", listed)
+	}
+	counts, err := app.state.Counts(t.Context())
+	if err != nil {
+		t.Fatalf("sqlite counts after bearer-bound console read: %v", err)
+	}
+	if counts["sessions"] != 1 {
+		t.Fatalf("expected one persisted operator-auth session row, got %+v", counts)
+	}
+
+	allowReq := httptest.NewRequest(http.MethodPost, "/demo/plugins/plugin-echo/disable", nil)
+	allowReq.Header.Set("Authorization", "Bearer opaque-operator-token")
+	allowReq.Header.Set(runtimecore.ConsoleReadActorHeader, "admin-user")
+	allowResp := httptest.NewRecorder()
+	app.ServeHTTP(allowResp, allowReq)
+	if allowResp.Code != http.StatusOK {
+		t.Fatalf("expected bearer-bound plugin disable 200, got %d: %s", allowResp.Code, allowResp.Body.String())
+	}
+	entries := app.audits.AuditEntries()
+	if len(entries) == 0 {
+		t.Fatal("expected bearer-bound plugin disable to record audit evidence")
+	}
+	last := entries[len(entries)-1]
+	if last.Action != "plugin.disable" || last.Target != "plugin-echo" || !last.Allowed || last.SessionID != runtimecore.OperatorBearerSessionID("admin-user") || last.Reason != "plugin_disabled" || last.ErrorCategory != "operator" || last.ErrorCode != "plugin_disabled" {
+		t.Fatalf("expected allowed operator audit to carry bearer session id, got %+v", last)
+	}
+
+	denyReq := httptest.NewRequest(http.MethodGet, "/api/console", nil)
+	denyReq.Header.Set("Authorization", "Bearer opaque-operator-token")
+	denyReq.Header.Set(runtimecore.ConsoleReadActorHeader, "admin-user")
+	replaceRuntimeCurrentRBACState(t, app, []runtimecore.OperatorIdentityState{{ActorID: "admin-user", Roles: []string{"admin"}}}, runtimecore.RBACSnapshotState{SnapshotKey: runtimecore.CurrentRBACSnapshotKey, ConsoleReadPermission: "console:read", Policies: map[string]pluginsdk.AuthorizationPolicy{"admin": {Permissions: []string{"plugin:enable", "plugin:disable"}, PluginScope: []string{"*"}}}})
+	denyResp := httptest.NewRecorder()
+	app.ServeHTTP(denyResp, denyReq)
+	if denyResp.Code != http.StatusForbidden {
+		t.Fatalf("expected bearer-bound console read deny 403, got %d: %s", denyResp.Code, denyResp.Body.String())
+	}
+	entries = app.audits.AuditEntries()
+	if len(entries) == 0 {
+		t.Fatal("expected bearer-bound denied console read to record audit evidence")
+	}
+	last = entries[len(entries)-1]
+	if last.Action != "console.read" || last.SessionID != runtimecore.OperatorBearerSessionID("admin-user") {
+		t.Fatalf("expected denied console audit to carry bearer session id, got %+v", last)
+	}
+	if !strings.Contains(denyResp.Body.String(), "permission denied") {
+		t.Fatalf("expected bearer-bound denied console read response to mention permission denied, got %s", denyResp.Body.String())
+	}
+}
+
+func TestRuntimeAppConsoleRequiresBearerAuthWhenOperatorAuthConfigured(t *testing.T) {
+	t.Setenv("BOT_PLATFORM_OPERATOR_TOKEN", "opaque-operator-token")
+	app, err := newRuntimeApp(writeOperatorAuthConfig(t, t.TempDir()))
+	if err != nil {
+		t.Fatalf("new runtime app: %v", err)
+	}
+	defer func() { _ = app.Close() }()
+	baselineAudits := len(app.audits.AuditEntries())
+
+	missingReq := httptest.NewRequest(http.MethodGet, "/api/console", nil)
+	missingReq.Header.Set(runtimecore.ConsoleReadActorHeader, "admin-user")
+	missingResp := httptest.NewRecorder()
+	app.ServeHTTP(missingResp, missingReq)
+	if missingResp.Code != http.StatusUnauthorized {
+		t.Fatalf("expected header-only console read 401 when operator auth is configured, got %d: %s", missingResp.Code, missingResp.Body.String())
+	}
+	if !strings.Contains(missingResp.Body.String(), "unauthorized") {
+		t.Fatalf("expected header-only console read response to mention unauthorized, got %s", missingResp.Body.String())
+	}
+	if len(app.audits.AuditEntries()) != baselineAudits {
+		t.Fatalf("expected unauthorized console read not to add deny audit entries, got %+v", app.audits.AuditEntries())
+	}
+
+	invalidReq := httptest.NewRequest(http.MethodGet, "/api/console", nil)
+	invalidReq.Header.Set("Authorization", "Bearer invalid-operator-token")
+	invalidReq.Header.Set(runtimecore.ConsoleReadActorHeader, "admin-user")
+	invalidResp := httptest.NewRecorder()
+	app.ServeHTTP(invalidResp, invalidReq)
+	if invalidResp.Code != http.StatusUnauthorized {
+		t.Fatalf("expected invalid bearer console read 401, got %d: %s", invalidResp.Code, invalidResp.Body.String())
+	}
+	if !strings.Contains(invalidResp.Body.String(), "unauthorized") {
+		t.Fatalf("expected invalid bearer console read response to mention unauthorized, got %s", invalidResp.Body.String())
+	}
+	if len(app.audits.AuditEntries()) != baselineAudits {
+		t.Fatalf("expected invalid bearer console read not to add deny audit entries, got %+v", app.audits.AuditEntries())
+	}
+	counts, err := app.state.Counts(t.Context())
+	if err != nil {
+		t.Fatalf("sqlite counts after unauthorized console reads: %v", err)
+	}
+	if counts["sessions"] != 0 {
+		t.Fatalf("expected unauthorized console reads not to persist operator sessions, got %+v", counts)
+	}
+}
+
+func TestRuntimeAppConsoleRequiresBearerAuthWhenOperatorAuthConfiguredWithoutConsoleReadPermission(t *testing.T) {
+	t.Setenv("BOT_PLATFORM_OPERATOR_TOKEN", "opaque-operator-token")
+	app, err := newRuntimeApp(writeOperatorAuthConfigWithoutConsoleReadPermission(t, t.TempDir()))
+	if err != nil {
+		t.Fatalf("new runtime app: %v", err)
+	}
+	defer func() { _ = app.Close() }()
+	baselineAudits := len(app.audits.AuditEntries())
+
+	missingReq := httptest.NewRequest(http.MethodGet, "/api/console", nil)
+	missingReq.Header.Set(runtimecore.ConsoleReadActorHeader, "admin-user")
+	missingResp := httptest.NewRecorder()
+	app.ServeHTTP(missingResp, missingReq)
+	if missingResp.Code != http.StatusUnauthorized {
+		t.Fatalf("expected console read without console_read_permission and without bearer auth to return 401, got %d: %s", missingResp.Code, missingResp.Body.String())
+	}
+
+	invalidReq := httptest.NewRequest(http.MethodGet, "/api/console", nil)
+	invalidReq.Header.Set("Authorization", "Bearer invalid-operator-token")
+	invalidResp := httptest.NewRecorder()
+	app.ServeHTTP(invalidResp, invalidReq)
+	if invalidResp.Code != http.StatusUnauthorized {
+		t.Fatalf("expected console read without console_read_permission and with invalid bearer auth to return 401, got %d: %s", invalidResp.Code, invalidResp.Body.String())
+	}
+
+	allowedReq := httptest.NewRequest(http.MethodGet, "/api/console", nil)
+	allowedReq.Header.Set("Authorization", "Bearer opaque-operator-token")
+	allowedResp := httptest.NewRecorder()
+	app.ServeHTTP(allowedResp, allowedReq)
+	if allowedResp.Code != http.StatusOK {
+		t.Fatalf("expected console read without console_read_permission and with valid bearer auth to return 200, got %d: %s", allowedResp.Code, allowedResp.Body.String())
+	}
+	if len(app.audits.AuditEntries()) != baselineAudits {
+		t.Fatalf("expected missing/invalid bearer console requests without console_read_permission not to add audit entries, got %+v", app.audits.AuditEntries())
+	}
+}
+
+func TestRuntimeAppOperatorWriteRoutesRequireBearerAuthWhenOperatorAuthConfigured(t *testing.T) {
+	t.Setenv("BOT_PLATFORM_OPERATOR_TOKEN", "opaque-operator-token")
+	t.Setenv("BOT_PLATFORM_OPERATOR_CONFIG_TOKEN", "opaque-config-token")
+	t.Setenv("BOT_PLATFORM_OPERATOR_JOB_TOKEN", "opaque-job-token")
+	t.Setenv("BOT_PLATFORM_OPERATOR_SCHEDULE_TOKEN", "opaque-schedule-token")
+	t.Setenv("BOT_PLATFORM_OPERATOR_VIEWER_TOKEN", "opaque-viewer-token")
+	app, err := newRuntimeApp(writeWriteActionRBACOperatorAuthConfig(t, t.TempDir()))
+	if err != nil {
+		t.Fatalf("new runtime app: %v", err)
+	}
+	defer func() { _ = app.Close() }()
+
+	createScheduleReq := httptest.NewRequest(http.MethodPost, "/demo/schedules/echo-delay", strings.NewReader(`{"id":"schedule-operator-auth","delay_ms":500,"message":"cancel me"}`))
+	createScheduleReq.Header.Set("Content-Type", "application/json")
+	createScheduleResp := httptest.NewRecorder()
+	app.ServeHTTP(createScheduleResp, createScheduleReq)
+	if createScheduleResp.Code != http.StatusOK {
+		t.Fatalf("expected schedule seed create 200, got %d: %s", createScheduleResp.Code, createScheduleResp.Body.String())
+	}
+
+	job := runtimecore.NewJob("job-operator-auth-retry", "ai.chat", 0, 30*time.Second)
+	job.TraceID = "trace-job-operator-auth-retry"
+	job.EventID = "evt-job-operator-auth-retry"
+	job.Correlation = "runtime-ai:user-operator-auth:retry"
+	if err := applyDemoAIJobContract(&job, "retry operator auth", "user-operator-auth"); err != nil {
+		t.Fatalf("apply demo ai job contract: %v", err)
+	}
+	if err := app.queue.Enqueue(t.Context(), job); err != nil {
+		t.Fatalf("enqueue operator-auth retry seed job: %v", err)
+	}
+	timeoutReq := httptest.NewRequest(http.MethodPost, "/demo/jobs/timeout?id="+job.ID, nil)
+	timeoutResp := httptest.NewRecorder()
+	app.ServeHTTP(timeoutResp, timeoutReq)
+	if timeoutResp.Code != http.StatusOK {
+		t.Fatalf("expected retry seed timeout 200, got %d: %s", timeoutResp.Code, timeoutResp.Body.String())
+	}
+	baselineAudits := len(app.audits.AuditEntries())
+
+	tests := []struct {
+		name string
+		path string
+		body string
+	}{
+		{name: "plugin disable", path: "/demo/plugins/plugin-echo/disable"},
+		{name: "plugin config", path: "/demo/plugins/plugin-echo/config", body: `{"prefix":"unauthorized: "}`},
+		{name: "job retry", path: "/demo/jobs/" + job.ID + "/retry"},
+		{name: "schedule cancel", path: "/demo/schedules/schedule-operator-auth/cancel"},
+	}
+	for _, tc := range tests {
+		req := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body))
+		if tc.body != "" {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		req.Header.Set(runtimecore.ConsoleReadActorHeader, "admin-user")
+		resp := httptest.NewRecorder()
+		app.ServeHTTP(resp, req)
+		if resp.Code != http.StatusUnauthorized {
+			t.Fatalf("expected %s without bearer auth to return 401, got %d: %s", tc.name, resp.Code, resp.Body.String())
+		}
+		if !strings.Contains(resp.Body.String(), "unauthorized") {
+			t.Fatalf("expected %s without bearer auth to mention unauthorized, got %s", tc.name, resp.Body.String())
+		}
+	}
+	if len(app.audits.AuditEntries()) != baselineAudits {
+		t.Fatalf("expected unauthorized operator writes not to add deny audit entries, got %+v", app.audits.AuditEntries())
+	}
+	counts, err := app.state.Counts(t.Context())
+	if err != nil {
+		t.Fatalf("sqlite counts after unauthorized operator writes: %v", err)
+	}
+	if counts["sessions"] != 0 {
+		t.Fatalf("expected unauthorized operator writes not to persist operator sessions, got %+v", counts)
+	}
+}
+
+func TestRuntimeAppOperatorWriteRoutesReturnForbiddenForAuthenticatedRBACDenials(t *testing.T) {
+	t.Setenv("BOT_PLATFORM_OPERATOR_TOKEN", "opaque-operator-token")
+	t.Setenv("BOT_PLATFORM_OPERATOR_CONFIG_TOKEN", "opaque-config-token")
+	t.Setenv("BOT_PLATFORM_OPERATOR_JOB_TOKEN", "opaque-job-token")
+	t.Setenv("BOT_PLATFORM_OPERATOR_SCHEDULE_TOKEN", "opaque-schedule-token")
+	t.Setenv("BOT_PLATFORM_OPERATOR_VIEWER_TOKEN", "opaque-viewer-token")
+	app, err := newRuntimeApp(writeWriteActionRBACOperatorAuthConfig(t, t.TempDir()))
+	if err != nil {
+		t.Fatalf("new runtime app: %v", err)
+	}
+	defer func() { _ = app.Close() }()
+
+	createScheduleReq := httptest.NewRequest(http.MethodPost, "/demo/schedules/echo-delay", strings.NewReader(`{"id":"schedule-bearer-denied","delay_ms":500,"message":"cancel denied"}`))
+	createScheduleReq.Header.Set("Content-Type", "application/json")
+	createScheduleResp := httptest.NewRecorder()
+	app.ServeHTTP(createScheduleResp, createScheduleReq)
+	if createScheduleResp.Code != http.StatusOK {
+		t.Fatalf("expected schedule seed create 200, got %d: %s", createScheduleResp.Code, createScheduleResp.Body.String())
+	}
+
+	job := runtimecore.NewJob("job-bearer-denied-retry", "ai.chat", 0, 30*time.Second)
+	job.TraceID = "trace-job-bearer-denied-retry"
+	job.EventID = "evt-job-bearer-denied-retry"
+	job.Correlation = "runtime-ai:user-bearer-denied:retry"
+	if err := applyDemoAIJobContract(&job, "retry bearer denied", "user-bearer-denied"); err != nil {
+		t.Fatalf("apply demo ai job contract: %v", err)
+	}
+	if err := app.queue.Enqueue(t.Context(), job); err != nil {
+		t.Fatalf("enqueue bearer-denied retry seed job: %v", err)
+	}
+	timeoutReq := httptest.NewRequest(http.MethodPost, "/demo/jobs/timeout?id="+job.ID, nil)
+	timeoutResp := httptest.NewRecorder()
+	app.ServeHTTP(timeoutResp, timeoutReq)
+	if timeoutResp.Code != http.StatusOK {
+		t.Fatalf("expected retry seed timeout 200, got %d: %s", timeoutResp.Code, timeoutResp.Body.String())
+	}
+
+	consoleReq := httptest.NewRequest(http.MethodGet, "/api/console", nil)
+	consoleReq.Header.Set("Authorization", "Bearer opaque-viewer-token")
+	consoleResp := httptest.NewRecorder()
+	app.ServeHTTP(consoleResp, consoleReq)
+	if consoleResp.Code != http.StatusOK {
+		t.Fatalf("expected viewer bearer console read 200, got %d: %s", consoleResp.Code, consoleResp.Body.String())
+	}
+	baselineAudits := len(app.audits.AuditEntries())
+
+	pluginReq := httptest.NewRequest(http.MethodPost, "/demo/plugins/plugin-echo/disable", nil)
+	pluginReq.Header.Set("Authorization", "Bearer opaque-viewer-token")
+	pluginReq.Header.Set(runtimecore.ConsoleReadActorHeader, "admin-user")
+	pluginResp := httptest.NewRecorder()
+	app.ServeHTTP(pluginResp, pluginReq)
+	if pluginResp.Code != http.StatusForbidden {
+		t.Fatalf("expected bearer-authenticated plugin disable denial 403, got %d: %s", pluginResp.Code, pluginResp.Body.String())
+	}
+	var deniedPluginPayload operatorActionEnvelopePayload
+	if err := json.Unmarshal(pluginResp.Body.Bytes(), &deniedPluginPayload); err != nil {
+		t.Fatalf("decode bearer-authenticated plugin disable denial: %v", err)
+	}
+	if deniedPluginPayload.Status != "forbidden" || deniedPluginPayload.Action != "plugin.disable" || deniedPluginPayload.Target != "plugin-echo" || deniedPluginPayload.Accepted || deniedPluginPayload.Reason != "permission_denied" || deniedPluginPayload.Error != "permission denied" {
+		t.Fatalf("expected normalized bearer-authenticated plugin disable denial, got %+v", deniedPluginPayload)
+	}
+
+	configReq := httptest.NewRequest(http.MethodPost, "/demo/plugins/plugin-echo/config", strings.NewReader(`{"prefix":"forbidden: "}`))
+	configReq.Header.Set("Content-Type", "application/json")
+	configReq.Header.Set("Authorization", "Bearer opaque-viewer-token")
+	configReq.Header.Set(runtimecore.ConsoleReadActorHeader, "config-operator")
+	configResp := httptest.NewRecorder()
+	app.ServeHTTP(configResp, configReq)
+	if configResp.Code != http.StatusForbidden {
+		t.Fatalf("expected bearer-authenticated config denial 403, got %d: %s", configResp.Code, configResp.Body.String())
+	}
+
+	retryReq := httptest.NewRequest(http.MethodPost, "/demo/jobs/"+job.ID+"/retry", nil)
+	retryReq.Header.Set("Authorization", "Bearer opaque-viewer-token")
+	retryReq.Header.Set(runtimecore.ConsoleReadActorHeader, "job-operator")
+	retryResp := httptest.NewRecorder()
+	app.ServeHTTP(retryResp, retryReq)
+	if retryResp.Code != http.StatusForbidden {
+		t.Fatalf("expected bearer-authenticated retry denial 403, got %d: %s", retryResp.Code, retryResp.Body.String())
+	}
+
+	cancelReq := httptest.NewRequest(http.MethodPost, "/demo/schedules/schedule-bearer-denied/cancel", nil)
+	cancelReq.Header.Set("Authorization", "Bearer opaque-viewer-token")
+	cancelReq.Header.Set(runtimecore.ConsoleReadActorHeader, "schedule-admin")
+	cancelResp := httptest.NewRecorder()
+	app.ServeHTTP(cancelResp, cancelReq)
+	if cancelResp.Code != http.StatusForbidden {
+		t.Fatalf("expected bearer-authenticated cancel denial 403, got %d: %s", cancelResp.Code, cancelResp.Body.String())
+	}
+
+	for name, resp := range map[string]*httptest.ResponseRecorder{
+		"plugin disable": pluginResp,
+		"plugin config":  configResp,
+		"job retry":      retryResp,
+		"schedule cancel": cancelResp,
+	} {
+		if !strings.Contains(resp.Body.String(), "permission denied") {
+			t.Fatalf("expected %s denial to mention permission denied, got %s", name, resp.Body.String())
+		}
+	}
+
+	entries := app.audits.AuditEntries()
+	deniedEntries := entries[baselineAudits:]
+	if len(deniedEntries) != 4 {
+		t.Fatalf("expected four bearer-authenticated denied operator audits, got %+v", entries)
+	}
+	for _, entry := range deniedEntries {
+		if entry.Actor != "viewer-user" || entry.SessionID != runtimecore.OperatorBearerSessionID("viewer-user") || entry.Allowed || entry.Reason != "permission_denied" || entry.ErrorCategory != "authorization" || entry.ErrorCode != "permission_denied" {
+			t.Fatalf("expected bearer-authenticated deny audit to use viewer request identity, got %+v", entry)
+		}
+	}
+	if _, err := app.state.LoadPluginConfig(t.Context(), "plugin-echo"); err == nil {
+		t.Fatal("expected forbidden bearer config update not to persist plugin config")
+	}
+	storedJob, err := app.queue.Inspect(t.Context(), job.ID)
+	if err != nil {
+		t.Fatalf("inspect bearer-denied retry job: %v", err)
+	}
+	if storedJob.Status != runtimecore.JobStatusDead || !storedJob.DeadLetter {
+		t.Fatalf("expected forbidden bearer retry to preserve dead-letter job, got %+v", storedJob)
+	}
+	if _, err := app.state.LoadSchedulePlan(t.Context(), "schedule-bearer-denied"); err != nil {
+		t.Fatalf("expected forbidden bearer cancel to preserve schedule, got %v", err)
 	}
 }
 
@@ -4263,6 +5067,46 @@ func TestRuntimeAppPluginConfigOperatorReturnsNotFoundForUnboundPlugin(t *testin
 	}
 	if len(app.audits.AuditEntries()) != 0 {
 		t.Fatalf("expected unbound plugin config operator not to record auth or allow audit, got %+v", app.audits.AuditEntries())
+	}
+}
+
+func TestRuntimeAppPluginConfigOperatorRequiresBearerAuthBeforeUnboundPluginLookup(t *testing.T) {
+	t.Setenv("BOT_PLATFORM_OPERATOR_TOKEN", "opaque-operator-token")
+	t.Setenv("BOT_PLATFORM_OPERATOR_CONFIG_TOKEN", "opaque-config-token")
+	t.Setenv("BOT_PLATFORM_OPERATOR_JOB_TOKEN", "opaque-job-token")
+	t.Setenv("BOT_PLATFORM_OPERATOR_SCHEDULE_TOKEN", "opaque-schedule-token")
+	t.Setenv("BOT_PLATFORM_OPERATOR_VIEWER_TOKEN", "opaque-viewer-token")
+	app, err := newRuntimeApp(writeWriteActionRBACOperatorAuthConfig(t, t.TempDir()))
+	if err != nil {
+		t.Fatalf("new runtime app: %v", err)
+	}
+	defer func() { _ = app.Close() }()
+	baselineAudits := len(app.audits.AuditEntries())
+
+	unauthReq := httptest.NewRequest(http.MethodPost, "/demo/plugins/plugin-admin/config", strings.NewReader(`{"prefix":"ignored: "}`))
+	unauthReq.Header.Set("Content-Type", "application/json")
+	unauthResp := httptest.NewRecorder()
+	app.ServeHTTP(unauthResp, unauthReq)
+	if unauthResp.Code != http.StatusUnauthorized {
+		t.Fatalf("expected unbound plugin config without bearer auth to return 401, got %d: %s", unauthResp.Code, unauthResp.Body.String())
+	}
+	if !strings.Contains(unauthResp.Body.String(), "unauthorized") {
+		t.Fatalf("expected unbound plugin config without bearer auth to mention unauthorized, got %s", unauthResp.Body.String())
+	}
+	if len(app.audits.AuditEntries()) != baselineAudits {
+		t.Fatalf("expected unauthorized unbound plugin config request not to add audit entries, got %+v", app.audits.AuditEntries())
+	}
+
+	authReq := httptest.NewRequest(http.MethodPost, "/demo/plugins/plugin-admin/config", strings.NewReader(`{"prefix":"ignored: "}`))
+	authReq.Header.Set("Content-Type", "application/json")
+	authReq.Header.Set("Authorization", "Bearer opaque-config-token")
+	authResp := httptest.NewRecorder()
+	app.ServeHTTP(authResp, authReq)
+	if authResp.Code != http.StatusNotFound {
+		t.Fatalf("expected authenticated unbound plugin config request to return 404, got %d: %s", authResp.Code, authResp.Body.String())
+	}
+	if len(app.audits.AuditEntries()) != baselineAudits {
+		t.Fatalf("expected authenticated unbound plugin config request not to add audit entries, got %+v", app.audits.AuditEntries())
 	}
 }
 
@@ -4374,10 +5218,12 @@ func TestRuntimeAppCancelScheduleOperatorRemovesPersistedPlanFromConsoleAndRecor
 	if cancelResp.Code != http.StatusOK {
 		t.Fatalf("expected cancel operator 200, got %d: %s", cancelResp.Code, cancelResp.Body.String())
 	}
-	for _, expected := range []string{`"status":"ok"`, `"schedule_id":"schedule-cancel-1"`, `"action":"cancel"`} {
-		if !strings.Contains(cancelResp.Body.String(), expected) && !strings.Contains(cancelResp.Body.String(), strings.ReplaceAll(expected, `:`, `: `)) {
-			t.Fatalf("expected cancel response to include %s, got %s", expected, cancelResp.Body.String())
-		}
+	var cancelPayload operatorScheduleResponsePayload
+	if err := json.Unmarshal(cancelResp.Body.Bytes(), &cancelPayload); err != nil {
+		t.Fatalf("decode cancel response: %v", err)
+	}
+	if cancelPayload.Status != "ok" || cancelPayload.Action != "schedule.cancel" || cancelPayload.Target != "schedule-cancel-1" || !cancelPayload.Accepted || cancelPayload.Reason != "schedule_cancelled" || cancelPayload.ScheduleID != "schedule-cancel-1" {
+		t.Fatalf("expected normalized cancel response, got %+v", cancelPayload)
 	}
 
 	if _, err := app.state.LoadSchedulePlan(t.Context(), "schedule-cancel-1"); err == nil {
@@ -4401,7 +5247,7 @@ func TestRuntimeAppCancelScheduleOperatorRemovesPersistedPlanFromConsoleAndRecor
 		t.Fatal("expected cancel operator to record audit evidence")
 	}
 	lastEntry := entries[len(entries)-1]
-	if lastEntry.Action != "cancel" || lastEntry.Target != "schedule-cancel-1" || !lastEntry.Allowed || lastEntry.Actor != "schedule-admin" || lastEntry.Permission != "schedule:cancel" || lastEntry.Reason != "schedule_cancelled" {
+	if lastEntry.Action != "schedule.cancel" || lastEntry.Target != "schedule-cancel-1" || !lastEntry.Allowed || lastEntry.Actor != "schedule-admin" || lastEntry.Permission != "schedule:cancel" || lastEntry.Reason != "schedule_cancelled" || lastEntry.ErrorCategory != "operator" || lastEntry.ErrorCode != "schedule_cancelled" {
 		t.Fatalf("expected cancel audit entry, got %+v", lastEntry)
 	}
 	logs := app.logs.Lines()
@@ -4452,6 +5298,13 @@ func TestRuntimeAppCancelScheduleOperatorReturnsForbiddenAndRecordsDeniedAudit(t
 	if cancelResp.Code != http.StatusForbidden {
 		t.Fatalf("expected cancel operator 403, got %d: %s", cancelResp.Code, cancelResp.Body.String())
 	}
+	var deniedCancelPayload operatorActionEnvelopePayload
+	if err := json.Unmarshal(cancelResp.Body.Bytes(), &deniedCancelPayload); err != nil {
+		t.Fatalf("decode denied cancel response: %v", err)
+	}
+	if deniedCancelPayload.Status != "forbidden" || deniedCancelPayload.Action != "schedule.cancel" || deniedCancelPayload.Target != "schedule-cancel-denied" || deniedCancelPayload.Accepted || deniedCancelPayload.Reason != "permission_denied" || deniedCancelPayload.Error != "permission denied" {
+		t.Fatalf("expected normalized denied cancel response, got %+v", deniedCancelPayload)
+	}
 	if !strings.Contains(cancelResp.Body.String(), "permission denied") {
 		t.Fatalf("expected forbidden cancel response to mention permission denied, got %s", cancelResp.Body.String())
 	}
@@ -4468,7 +5321,7 @@ func TestRuntimeAppCancelScheduleOperatorReturnsForbiddenAndRecordsDeniedAudit(t
 	if len(entries) != 1 {
 		t.Fatalf("expected one denied cancel audit entry, got %+v", entries)
 	}
-	if entries[0].Actor != "viewer-user" || entries[0].Action != "schedule.cancel" || entries[0].Permission != "schedule:cancel" || entries[0].Target != "schedule-cancel-denied" || entries[0].Allowed || entries[0].Reason != "permission_denied" {
+	if entries[0].Actor != "viewer-user" || entries[0].Action != "schedule.cancel" || entries[0].Permission != "schedule:cancel" || entries[0].Target != "schedule-cancel-denied" || entries[0].Allowed || entries[0].Reason != "permission_denied" || entries[0].ErrorCategory != "authorization" || entries[0].ErrorCode != "permission_denied" {
 		t.Fatalf("expected denied cancel audit entry, got %+v", entries[0])
 	}
 	for _, line := range app.logs.Lines() {
@@ -4501,11 +5354,18 @@ func TestRuntimeAppCancelScheduleOperatorFailsClosedWithoutActorHeaderUnderConfi
 	if cancelResp.Code != http.StatusForbidden {
 		t.Fatalf("expected headerless cancel 403, got %d: %s", cancelResp.Code, cancelResp.Body.String())
 	}
+	var headerlessCancelPayload operatorActionEnvelopePayload
+	if err := json.Unmarshal(cancelResp.Body.Bytes(), &headerlessCancelPayload); err != nil {
+		t.Fatalf("decode headerless cancel response: %v", err)
+	}
+	if headerlessCancelPayload.Status != "forbidden" || headerlessCancelPayload.Action != "schedule.cancel" || headerlessCancelPayload.Target != "schedule-cancel-missing-actor" || headerlessCancelPayload.Accepted || headerlessCancelPayload.Reason != "permission_denied" || headerlessCancelPayload.Error != "permission denied" {
+		t.Fatalf("expected normalized headerless cancel response, got %+v", headerlessCancelPayload)
+	}
 	if !strings.Contains(cancelResp.Body.String(), "permission denied") {
 		t.Fatalf("expected headerless cancel response to mention permission denied, got %s", cancelResp.Body.String())
 	}
 	entries := app.audits.AuditEntries()
-	if len(entries) != 1 || entries[0].Actor != "" || entries[0].Action != "schedule.cancel" || entries[0].Permission != "schedule:cancel" || entries[0].Target != "schedule-cancel-missing-actor" || entries[0].Allowed || entries[0].Reason != "permission_denied" {
+	if len(entries) != 1 || entries[0].Actor != "" || entries[0].Action != "schedule.cancel" || entries[0].Permission != "schedule:cancel" || entries[0].Target != "schedule-cancel-missing-actor" || entries[0].Allowed || entries[0].Reason != "permission_denied" || entries[0].ErrorCategory != "authorization" || entries[0].ErrorCode != "permission_denied" {
 		t.Fatalf("expected headerless cancel deny audit entry, got %+v", entries)
 	}
 }

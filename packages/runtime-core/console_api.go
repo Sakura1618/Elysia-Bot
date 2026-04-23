@@ -2242,6 +2242,10 @@ func (a requestIdentityConsoleReadAuthorizer) AuthorizeConsoleRead(ctx context.C
 	if isNilCurrentAuthorizerProvider(a.provider) {
 		return nil
 	}
+	actor, err := RequestActorID(ctx, a.operatorAuthConfigured, request.Header.Get(ConsoleReadActorHeader))
+	if err != nil {
+		return err
+	}
 	snapshot := a.provider.CurrentSnapshot()
 	if snapshot == nil || snapshot.Authorizer == nil {
 		return errors.New("permission denied")
@@ -2249,10 +2253,6 @@ func (a requestIdentityConsoleReadAuthorizer) AuthorizeConsoleRead(ctx context.C
 	permission := strings.TrimSpace(snapshot.ConsoleReadPermission)
 	if permission == "" {
 		return nil
-	}
-	actor, err := RequestActorID(ctx, a.operatorAuthConfigured, request.Header.Get(ConsoleReadActorHeader))
-	if err != nil {
-		return err
 	}
 	decision := snapshot.Authorizer.Authorize(actor, permission, consoleReadTarget)
 	if decision.Allowed {
