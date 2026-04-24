@@ -41,6 +41,7 @@ type SubprocessPluginHost struct {
 	aiChatQueueCallback           func(context.Context, SubprocessAIChatQueueRequest) (SubprocessAIChatQueueResult, error)
 	aiChatSessionCallback         func(context.Context, SubprocessAIChatSessionRequest) error
 	aiChatProviderCallback        func(context.Context, SubprocessAIChatProviderRequest) (SubprocessAIChatProviderResult, error)
+	workflowLoadCallback          func(context.Context, SubprocessWorkflowLoadRequest) (WorkflowInstanceState, error)
 	workflowStartOrResumeCallback func(context.Context, SubprocessWorkflowStartOrResumeRequest) (WorkflowTransition, error)
 	now                           func() time.Time
 	maxCaptureLines               int
@@ -81,6 +82,7 @@ type hostResponse struct {
 	AIChatQueue           *subprocessAIChatQueueCallback           `json:"ai_chat_queue,omitempty"`
 	AIChatSession         *subprocessAIChatSessionCallback         `json:"ai_chat_session,omitempty"`
 	AIChatProvider        *subprocessAIChatProviderCallback        `json:"ai_chat_provider,omitempty"`
+	WorkflowLoad          *subprocessWorkflowLoadCallback          `json:"workflow_load,omitempty"`
 	WorkflowStartOrResume *subprocessWorkflowStartOrResumeCallback `json:"workflow_start_or_resume,omitempty"`
 }
 
@@ -169,6 +171,16 @@ type subprocessAIChatProviderCallbackResult struct {
 	Text string `json:"text,omitempty"`
 }
 
+type SubprocessWorkflowLoadRequest struct {
+	WorkflowID string `json:"workflow_id"`
+	PluginID   string `json:"plugin_id,omitempty"`
+}
+
+type subprocessWorkflowLoadCallback struct {
+	WorkflowID string `json:"workflow_id"`
+	PluginID   string `json:"plugin_id,omitempty"`
+}
+
 type SubprocessWorkflowStartOrResumeRequest struct {
 	WorkflowID    string   `json:"workflow_id"`
 	PluginID      string   `json:"plugin_id,omitempty"`
@@ -198,6 +210,7 @@ type hostCallbackResult struct {
 	AdminRequest          *subprocessAdminCallbackResult          `json:"admin_request,omitempty"`
 	AIChatQueue           *subprocessAIChatQueueCallbackResult    `json:"ai_chat_queue,omitempty"`
 	AIChatProvider        *subprocessAIChatProviderCallbackResult `json:"ai_chat_provider,omitempty"`
+	WorkflowLoad          *WorkflowInstanceState                  `json:"workflow_load,omitempty"`
 	WorkflowStartOrResume *WorkflowTransition                     `json:"workflow_start_or_resume,omitempty"`
 }
 
@@ -205,6 +218,7 @@ type subprocessCallbackResultPayload struct {
 	AdminRequest          *subprocessAdminCallbackResult
 	AIChatQueue           *subprocessAIChatQueueCallbackResult
 	AIChatProvider        *subprocessAIChatProviderCallbackResult
+	WorkflowLoad          *WorkflowInstanceState
 	WorkflowStartOrResume *WorkflowTransition
 }
 
@@ -335,6 +349,12 @@ func (h *SubprocessPluginHost) SetAIChatProviderCallback(callback func(context.C
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.aiChatProviderCallback = callback
+}
+
+func (h *SubprocessPluginHost) SetWorkflowLoadCallback(callback func(context.Context, SubprocessWorkflowLoadRequest) (WorkflowInstanceState, error)) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.workflowLoadCallback = callback
 }
 
 func (h *SubprocessPluginHost) SetWorkflowStartOrResumeCallback(callback func(context.Context, SubprocessWorkflowStartOrResumeRequest) (WorkflowTransition, error)) {
@@ -1478,6 +1498,8 @@ func (h *SubprocessPluginHost) handleCallback(ctx context.Context, pluginID stri
 		return h.handleAIChatSessionCallback(ctx, pluginID, executionContext, response)
 	case "ai_chat_provider":
 		return h.handleAIChatProviderCallback(ctx, pluginID, executionContext, response)
+	case "workflow_load":
+		return h.handleWorkflowLoadCallback(ctx, pluginID, executionContext, response)
 	case "workflow_start_or_resume":
 		return h.handleWorkflowStartOrResumeCallback(ctx, pluginID, executionContext, response)
 	default:
@@ -1600,6 +1622,30 @@ func (h *SubprocessPluginHost) handleAIChatProviderCallback(ctx context.Context,
 	})
 }
 
+func (h *SubprocessPluginHost) handleWorkflowLoadCallback(ctx context.Context, pluginID string, executionContext eventmodel.ExecutionContext, response hostResponse) error {
+	if response.WorkflowLoad == nil {
+		return fmt.Errorf("subprocess callback %q missing payload", "workflow_load")
+	}
+	request := SubprocessWorkflowLoadRequest{
+		WorkflowID: strings.TrimSpace(response.WorkflowLoad.WorkflowID),
+		PluginID:   firstNonEmptyTrimmed(strings.TrimSpace(response.WorkflowLoad.PluginID), pluginID),
+	}
+	ctx = withSubprocessExecutionContext(ctx, executionContext, pluginID)
+	var (
+		callbackErr error
+		instance    WorkflowInstanceState
+	)
+	if h.workflowLoadCallback == nil {
+		callbackErr = errors.New("subprocess workflow_load callback is not configured")
+	} else {
+		instance, callbackErr = h.workflowLoadCallback(ctx, request)
+	}
+	if callbackErr != nil {
+		return h.writeCallbackResult(pluginID, callbackErr, nil)
+	}
+	return h.writeCallbackResult(pluginID, nil, &subprocessCallbackResultPayload{WorkflowLoad: &instance})
+}
+
 func (h *SubprocessPluginHost) handleWorkflowStartOrResumeCallback(ctx context.Context, pluginID string, executionContext eventmodel.ExecutionContext, response hostResponse) error {
 	if response.WorkflowStartOrResume == nil {
 		return fmt.Errorf("subprocess callback %q missing payload", "workflow_start_or_resume")
@@ -1672,6 +1718,10 @@ func (h *SubprocessPluginHost) writeCallbackResult(pluginID string, callbackErr 
 		}
 		if payload.AIChatProvider != nil {
 			result.AIChatProvider = payload.AIChatProvider
+		}
+		if payload.WorkflowLoad != nil {
+			cloned := *payload.WorkflowLoad
+			result.WorkflowLoad = &cloned
 		}
 		if payload.WorkflowStartOrResume != nil {
 			cloned := *payload.WorkflowStartOrResume

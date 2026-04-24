@@ -387,6 +387,73 @@ func (q *JobQueue) RetryDeadLetter(ctx context.Context, id string) (Job, error) 
 	return updated, nil
 }
 
+func (q *JobQueue) Pause(ctx context.Context, id string) (Job, error) {
+	q.mu.Lock()
+
+	job, exists := q.jobs[id]
+	if !exists {
+		q.mu.Unlock()
+		return Job{}, errors.New("job not found")
+	}
+	if job.Status != JobStatusPending && job.Status != JobStatusRetrying {
+		q.mu.Unlock()
+		return Job{}, fmt.Errorf("job %q cannot be paused from status %s", id, job.Status)
+	}
+
+	updated, err := job.Transition(JobStatusPaused, q.now(), "")
+	if err != nil {
+		q.mu.Unlock()
+		return Job{}, err
+	}
+	updated = clearJobOwnership(updated)
+	if err := persistJob(ctx, q.store, updated); err != nil {
+		q.mu.Unlock()
+		return Job{}, err
+	}
+	q.jobs[id] = updated
+	q.syncMetricsLocked()
+	q.mu.Unlock()
+	q.observeLifecycle("job.paused", updated)
+	return updated, nil
+}
+
+func (q *JobQueue) Resume(ctx context.Context, id string) (Job, error) {
+	q.mu.Lock()
+
+	job, exists := q.jobs[id]
+	if !exists {
+		q.mu.Unlock()
+		return Job{}, errors.New("job not found")
+	}
+	if job.Status != JobStatusPaused {
+		q.mu.Unlock()
+		return Job{}, fmt.Errorf("job %q cannot be resumed from status %s", id, job.Status)
+	}
+
+	next := JobStatusPending
+	if job.NextRunAt != nil && !job.NextRunAt.IsZero() {
+		next = JobStatusRetrying
+	}
+	updated, err := job.Transition(next, q.now(), "")
+	if err != nil {
+		q.mu.Unlock()
+		return Job{}, err
+	}
+	if next == JobStatusPending {
+		updated.ReasonCode = ""
+	}
+	updated = clearJobOwnership(updated)
+	if err := persistJob(ctx, q.store, updated); err != nil {
+		q.mu.Unlock()
+		return Job{}, err
+	}
+	q.jobs[id] = updated
+	q.syncMetricsLocked()
+	q.mu.Unlock()
+	q.observeLifecycle("job.resumed", updated)
+	return updated, nil
+}
+
 func (q *JobQueue) Cancel(ctx context.Context, id string) (Job, error) {
 	q.mu.Lock()
 
@@ -458,6 +525,8 @@ func (q *JobQueue) ReadyJobs(at time.Time) []Job {
 			if job.NextRunAt == nil || !job.NextRunAt.After(at) {
 				items = append(items, job)
 			}
+		case JobStatusPaused:
+			continue
 		}
 	}
 	sort.Slice(items, func(i, j int) bool {
@@ -773,6 +842,7 @@ func (q *JobQueue) syncMetricsLocked() {
 		JobStatusPending:   0,
 		JobStatusRunning:   0,
 		JobStatusRetrying:  0,
+		JobStatusPaused:    0,
 		JobStatusCancelled: 0,
 		JobStatusFailed:    0,
 		JobStatusDead:      0,

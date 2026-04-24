@@ -303,6 +303,12 @@ func (b runtimeSubprocessAIChatCallbackBridge) HandleQueue(ctx context.Context, 
 			return runtimecore.SubprocessAIChatQueueResult{}, err
 		}
 		return runtimecore.SubprocessAIChatQueueResult{Job: &stored}, nil
+	case "cancel":
+		stored, err := b.queue.Cancel(ctx, strings.TrimSpace(request.JobID))
+		if err != nil {
+			return runtimecore.SubprocessAIChatQueueResult{}, err
+		}
+		return runtimecore.SubprocessAIChatQueueResult{Job: &stored}, nil
 	case "fail":
 		stored, err := b.queue.Fail(ctx, strings.TrimSpace(request.JobID), strings.TrimSpace(request.Reason))
 		if err != nil {
@@ -606,6 +612,9 @@ func (s *runtimeAppReplayService) ReplayEvent(eventID string) (eventmodel.Event,
 const (
 	scheduleCancelPermission = "schedule:cancel"
 	jobRetryPermission       = "job:retry"
+	jobPausePermission       = "job:pause"
+	jobResumePermission      = "job:resume"
+	jobCancelPermission      = "job:cancel"
 	pluginConfigPermission   = "plugin:config"
 )
 
@@ -657,6 +666,12 @@ func operatorActionName(action, permission string) string {
 		return "plugin.config"
 	case jobRetryPermission:
 		return "job.retry"
+	case jobPausePermission:
+		return "job.pause"
+	case jobResumePermission:
+		return "job.resume"
+	case jobCancelPermission:
+		return "job.cancel"
 	case scheduleCancelPermission:
 		return "schedule.cancel"
 	}
@@ -669,8 +684,12 @@ func operatorActionName(action, permission string) string {
 		return "plugin.config"
 	case "retry":
 		return "job.retry"
+	case "pause":
+		return "job.pause"
+	case "resume":
+		return "job.resume"
 	case "cancel":
-		return "schedule.cancel"
+		return "cancel"
 	default:
 		if permission != "" {
 			return strings.ReplaceAll(permission, ":", ".")
@@ -1014,6 +1033,9 @@ func runtimeDemoPaths(settings appRuntimeSettings) []string {
 		"/demo/ai/message",
 		"/demo/jobs/enqueue",
 		"/demo/jobs/timeout",
+		"/demo/jobs/{job-id}/pause",
+		"/demo/jobs/{job-id}/resume",
+		"/demo/jobs/{job-id}/cancel",
 		"/demo/jobs/{job-id}/retry",
 		"/demo/schedules/echo-delay",
 		"/demo/schedules/{schedule-id}/cancel",
@@ -1247,6 +1269,17 @@ func newRuntimeAppWithOutputAndOptions(configPath string, output io.Writer, opti
 		if adminSubprocessHost, ok := routed.hostForPlugin("plugin-admin").(*runtimecore.SubprocessPluginHost); ok {
 			adminSubprocessHost.SetAdminRequestCallback(adminBridge.Handle)
 		}
+		if workflowSubprocessHost, ok := routed.hostForPlugin("plugin-workflow-demo").(*runtimecore.SubprocessPluginHost); ok {
+			aiChatBridge := runtimeSubprocessAIChatCallbackBridge{
+				queue:    queue,
+				sessions: controlState,
+				provider: aiProvider,
+			}
+			workflowSubprocessHost.SetAIChatQueueCallback(aiChatBridge.HandleQueue)
+			workflowSubprocessHost.SetWorkflowLoadCallback(func(ctx context.Context, request runtimecore.SubprocessWorkflowLoadRequest) (runtimecore.WorkflowInstanceState, error) {
+				return workflowRuntime.Load(ctx, strings.TrimSpace(request.WorkflowID))
+			})
+		}
 		if aiChatSubprocessHost, ok := routed.hostForPlugin("plugin-ai-chat").(*runtimecore.SubprocessPluginHost); ok {
 			aiChatBridge := runtimeSubprocessAIChatCallbackBridge{
 				queue:    queue,
@@ -1270,7 +1303,7 @@ func newRuntimeAppWithOutputAndOptions(configPath string, output io.Writer, opti
 		_ = state.Close()
 		return nil, fmt.Errorf("save admin plugin manifest: %w", err)
 	}
-	workflowPlugin := pluginworkflowdemo.New(replies, workflowRuntime)
+	workflowPlugin := pluginworkflowdemo.New(replies, queue, workflowRuntime)
 	workflowDefinition := workflowPlugin.Definition()
 	workflowDefinition.Handlers.Event = sourceScopedEventHandler{allowed: allowedSources("runtime-workflow-demo"), inner: workflowPlugin}
 	if err := runtime.RegisterPlugin(workflowDefinition); err != nil {
@@ -1373,7 +1406,7 @@ func newRuntimeAppWithOutputAndOptions(configPath string, output io.Writer, opti
 			"ai_job_dispatcher":       "runtime-job-queue",
 			"ai_chat_provider":        config.AIChat.Provider,
 			"runtime_worker_id":       runtimeWorkerID(),
-			"console_mode":            "read+operator-plugin-enable-disable+plugin-config+job-retry+schedule-cancel",
+			"console_mode":            "read+operator-plugin-enable-disable+plugin-config+job-control+schedule-cancel",
 			"trace_exporter_enabled":  tracer.ExporterEnabled(),
 			"trace_exporter_kind":     settings.TraceExporter.Kind,
 		},
@@ -1387,7 +1420,7 @@ func newRuntimeAppWithOutputAndOptions(configPath string, output io.Writer, opti
 		cancel()
 		return nil, fmt.Errorf("start scheduler: %w", err)
 	}
-	if err := queue.RegisterDispatcher("ai.chat", queuedRuntimeJobDispatcher{runtime: runtime, queue: queue}); err != nil {
+	if err := queue.RegisterDispatcher("ai.chat", queuedRuntimeJobDispatcher{runtime: runtime, queue: queue, workflows: workflowRuntime}); err != nil {
 		_ = smokeStore.Close()
 		_ = state.Close()
 		cancel()
@@ -1642,8 +1675,9 @@ func (a *runtimeApp) handleConsole(w http.ResponseWriter, r *http.Request) {
 	meta["job_recovery_reason"] = "running jobs are retried or dead-lettered after restart"
 	meta["job_recovery_recovered_jobs"] = recovery.RecoveredJobs
 	meta["job_recovery_total_jobs"] = recovery.TotalJobs
-	meta["job_operator_actions"] = []string{"/demo/jobs/{job-id}/retry"}
-	meta["job_operator_scope"] = "dead-letter jobs only"
+	meta["job_operator_actions"] = []string{"/demo/jobs/{job-id}/pause", "/demo/jobs/{job-id}/resume", "/demo/jobs/{job-id}/cancel", "/demo/jobs/{job-id}/retry"}
+	meta["job_operator_scope"] = "queued jobs for pause|resume|cancel, dead-letter jobs for retry"
+	meta["job_control_surface"] = "pause|resume|cancel|retry via runtime operator path with persisted queue semantics"
 	meta["schedule_read_model"] = runtimeExecutionBackend(a.settings)
 	meta["schedule_status_source"] = runtimeExecutionStateSource(a.settings, "schedule-plans")
 	meta["schedule_status_persisted"] = true
@@ -1651,6 +1685,8 @@ func (a *runtimeApp) handleConsole(w http.ResponseWriter, r *http.Request) {
 	meta["workflow_status_source"] = runtimeExecutionStateSource(a.settings, "workflow-instances")
 	meta["workflow_status_persisted"] = true
 	meta["workflow_runtime_owner"] = "runtime-core"
+	meta["workflow_child_job_resume_path"] = "runtime-owned queued job terminal outcome -> workflow resume"
+	meta["workflow_reference_demo"] = "event trigger -> workflow wait -> child job -> suspend/restore -> compensation"
 	meta["schedule_operator_actions"] = []string{"/demo/schedules/{schedule-id}/cancel"}
 	meta["schedule_operator_scope"] = "currently-registered schedules only"
 	meta["schedule_recovery_source"] = "runtime-startup-restore"
@@ -1815,10 +1851,6 @@ func (a *runtimeApp) handleJobOperator(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if action != "retry" {
-		http.NotFound(w, r)
-		return
-	}
 	if err := a.reloadCurrentRBACAuthorizer(r.Context()); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -1849,7 +1881,27 @@ func (a *runtimeApp) handleJobOperator(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), status)
 		return
 	}
-	retried, err := a.queue.RetryDeadLetter(r.Context(), jobID)
+	var (
+		mutated runtimecore.Job
+		reason  string
+	)
+	switch action {
+	case "pause":
+		mutated, err = a.queue.Pause(r.Context(), jobID)
+		reason = "job_paused"
+	case "resume":
+		mutated, err = a.queue.Resume(r.Context(), jobID)
+		reason = "job_resumed"
+	case "cancel":
+		mutated, err = a.queue.Cancel(r.Context(), jobID)
+		reason = "job_cancelled"
+	case "retry":
+		mutated, err = a.queue.RetryDeadLetter(r.Context(), jobID)
+		reason = "job_dead_letter_retried"
+	default:
+		http.NotFound(w, r)
+		return
+	}
 	if err != nil {
 		status := http.StatusBadRequest
 		if strings.Contains(err.Error(), "job not found") {
@@ -1863,17 +1915,23 @@ func (a *runtimeApp) handleJobOperator(w http.ResponseWriter, r *http.Request) {
 		EventID:       current.EventID,
 		RunID:         current.RunID,
 		CorrelationID: current.Correlation,
-	}, actor, permission, operatorAction, jobID, "job_dead_letter_retried")
-	a.queue.DispatchReady(r.Context(), time.Now().UTC())
+	}, actor, permission, operatorAction, jobID, reason)
+	if action == "retry" || action == "resume" {
+		a.queue.DispatchReady(r.Context(), time.Now().UTC())
+	}
+	if err := resumeWorkflowFromTerminalChildJob(r.Context(), a.workflowRuntime, mutated); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	current, err = a.queue.Inspect(r.Context(), jobID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	writeJSONResponse(w, http.StatusOK, operatorJobResponse{
-		operatorActionResult: operatorSuccessResult(operatorAction, jobID, "job_dead_letter_retried"),
+		operatorActionResult: operatorSuccessResult(operatorAction, jobID, reason),
 		JobID:                jobID,
-		RetriedJob:           &retried,
+		RetriedJob:           &mutated,
 		CurrentJob:           &current,
 	})
 }
@@ -1949,6 +2007,10 @@ func (a *runtimeApp) handleJobTimeout(w http.ResponseWriter, r *http.Request) {
 	job, err = a.queue.Timeout(r.Context(), id)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := resumeWorkflowFromTerminalChildJob(r.Context(), a.workflowRuntime, job); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -2273,7 +2335,9 @@ func parseJobOperatorPath(path string) (jobID string, action string, ok bool) {
 	if jobID == "" {
 		return "", "", false
 	}
-	if action != "retry" {
+	switch action {
+	case "pause", "resume", "cancel", "retry":
+	default:
 		return "", "", false
 	}
 	return jobID, action, true
@@ -2351,6 +2415,12 @@ func scheduleOperatorPermission(action string) string {
 
 func jobOperatorPermission(action string) string {
 	switch action {
+	case "pause":
+		return jobPausePermission
+	case "resume":
+		return jobResumePermission
+	case "cancel":
+		return jobCancelPermission
 	case "retry":
 		return jobRetryPermission
 	default:
@@ -2516,12 +2586,70 @@ func (a *runtimeApp) dispatchScheduledEvent(event eventmodel.Event) error {
 }
 
 type queuedRuntimeJobDispatcher struct {
-	runtime *runtimecore.InMemoryRuntime
-	queue   *runtimecore.JobQueue
+	runtime   *runtimecore.InMemoryRuntime
+	queue     *runtimecore.JobQueue
+	workflows *runtimecore.WorkflowRuntime
 }
 
 func (d queuedRuntimeJobDispatcher) DispatchQueuedJob(ctx context.Context, job runtimecore.Job) error {
-	return d.runtime.DispatchQueuedJob(ctx, d.queue, job)
+	err := d.runtime.DispatchQueuedJob(ctx, d.queue, job)
+	if d.workflows != nil {
+		if resumeErr := d.resumeWorkflowFromChildJob(ctx, job.ID); resumeErr != nil {
+			if err != nil {
+				return errors.Join(err, resumeErr)
+			}
+			return resumeErr
+		}
+	}
+	return err
+}
+
+func (d queuedRuntimeJobDispatcher) resumeWorkflowFromChildJob(ctx context.Context, jobID string) error {
+	if d.queue == nil || d.workflows == nil {
+		return nil
+	}
+	stored, err := d.queue.Inspect(ctx, jobID)
+	if err != nil {
+		return nil
+	}
+	return resumeWorkflowFromTerminalChildJob(ctx, d.workflows, stored)
+}
+
+func queuedWorkflowOwner(payload map[string]any) (workflowID string, pluginID string, ok bool) {
+	workflow, _ := payload["workflow"].(map[string]any)
+	workflowID, _ = workflow["workflow_id"].(string)
+	pluginID, _ = workflow["plugin_id"].(string)
+	workflowID = strings.TrimSpace(workflowID)
+	pluginID = strings.TrimSpace(pluginID)
+	if workflowID == "" || pluginID == "" {
+		return "", "", false
+	}
+	return workflowID, pluginID, true
+}
+
+func resumeWorkflowFromTerminalChildJob(ctx context.Context, workflows *runtimecore.WorkflowRuntime, job runtimecore.Job) error {
+	if workflows == nil {
+		return nil
+	}
+	workflowID, pluginID, ok := queuedWorkflowOwner(job.Payload)
+	if !ok {
+		return nil
+	}
+	switch job.Status {
+	case runtimecore.JobStatusDone, runtimecore.JobStatusCancelled, runtimecore.JobStatusFailed, runtimecore.JobStatusDead:
+	default:
+		return nil
+	}
+	_, err := workflows.ResumeFromChildJob(ctx, workflowID, pluginID, runtimecore.WorkflowChildJobResume{
+		JobID:      job.ID,
+		Status:     job.Status,
+		ReasonCode: job.ReasonCode,
+		LastError:  strings.TrimSpace(job.LastError),
+	})
+	if err != nil && (strings.Contains(err.Error(), "is not waiting for child job result") || strings.Contains(err.Error(), "workflow has no current step")) {
+		return nil
+	}
+	return err
 }
 
 func aiEvent(prompt, userID string) eventmodel.Event {

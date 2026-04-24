@@ -341,6 +341,8 @@ type ConsoleWorkflow struct {
 	Status         string         `json:"status"`
 	CurrentIndex   int            `json:"currentIndex"`
 	WaitingFor     string         `json:"waitingFor,omitempty"`
+	WaitingForJob  map[string]any `json:"waitingForJob,omitempty"`
+	LastJobResult  map[string]any `json:"lastJobResult,omitempty"`
 	SleepingUntil  *time.Time     `json:"sleepingUntil,omitempty"`
 	Completed      bool           `json:"completed"`
 	Compensated    bool           `json:"compensated"`
@@ -1475,6 +1477,15 @@ func toConsoleWorkflowWithSource(instance WorkflowInstanceState, source string) 
 		CreatedAt:      instance.CreatedAt,
 		UpdatedAt:      instance.UpdatedAt,
 	}
+	if instance.Workflow.WaitingForJob != nil {
+		item.WaitingForJob = map[string]any{
+			"stepName": instance.Workflow.WaitingForJob.StepName,
+			"jobId":    instance.Workflow.WaitingForJob.JobID,
+		}
+	}
+	if instance.Workflow.LastJobResult != nil {
+		item.LastJobResult = instance.Workflow.LastJobResult.StateValue()
+	}
 	if instance.Workflow.SleepingUntil != nil {
 		sleepingUntil := instance.Workflow.SleepingUntil.UTC()
 		item.SleepingUntil = &sleepingUntil
@@ -1540,6 +1551,16 @@ func consoleWorkflowSummary(item ConsoleWorkflow) string {
 	summary := fmt.Sprintf(`workflow %s for %s is %s via %s`, item.ID, item.PluginID, item.Status, item.StatusSource)
 	if item.WaitingFor != `` {
 		summary += `; waiting_for=` + item.WaitingFor
+	}
+	if item.WaitingForJob != nil {
+		if jobID, _ := item.WaitingForJob[`jobId`].(string); strings.TrimSpace(jobID) != `` {
+			summary += `; waiting_job=` + jobID
+		}
+	}
+	if item.LastJobResult != nil {
+		if status, _ := item.LastJobResult[`status`].(string); strings.TrimSpace(status) != `` {
+			summary += `; last_child_job_status=` + status
+		}
 	}
 	if item.StatePersisted {
 		summary += `; persisted state survives restart`

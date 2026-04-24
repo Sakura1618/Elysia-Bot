@@ -78,6 +78,7 @@ const (
 	JobStatusPending   JobStatus = "pending"
 	JobStatusRunning   JobStatus = "running"
 	JobStatusRetrying  JobStatus = "retrying"
+	JobStatusPaused    JobStatus = "paused"
 	JobStatusCancelled JobStatus = "cancelled"
 	JobStatusFailed    JobStatus = "failed"
 	JobStatusDead      JobStatus = "dead"
@@ -140,7 +141,7 @@ func (j Job) Validate() error {
 		status = JobStatusPending
 	}
 	switch status {
-	case JobStatusPending, JobStatusRunning, JobStatusRetrying, JobStatusCancelled, JobStatusFailed, JobStatusDead, JobStatusDone:
+	case JobStatusPending, JobStatusRunning, JobStatusRetrying, JobStatusPaused, JobStatusCancelled, JobStatusFailed, JobStatusDead, JobStatusDone:
 	default:
 		return fmt.Errorf("unsupported job status %q", j.Status)
 	}
@@ -158,9 +159,10 @@ func (j Job) Validate() error {
 
 func (j Job) CanTransitionTo(next JobStatus) bool {
 	allowed := map[JobStatus][]JobStatus{
-		JobStatusPending:   {JobStatusRunning, JobStatusCancelled, JobStatusDead},
+		JobStatusPending:   {JobStatusRunning, JobStatusPaused, JobStatusCancelled, JobStatusDead},
 		JobStatusRunning:   {JobStatusRetrying, JobStatusFailed, JobStatusDead, JobStatusDone},
-		JobStatusRetrying:  {JobStatusRunning, JobStatusCancelled, JobStatusDead},
+		JobStatusRetrying:  {JobStatusRunning, JobStatusPaused, JobStatusCancelled, JobStatusDead},
+		JobStatusPaused:    {JobStatusPending, JobStatusRetrying},
 		JobStatusCancelled: {},
 		JobStatusFailed:    {JobStatusRetrying, JobStatusDead},
 		JobStatusDead:      {},
@@ -185,12 +187,31 @@ func (j Job) Transition(next JobStatus, at time.Time, lastError string) (Job, er
 	updated.LastError = lastError
 
 	switch next {
+	case JobStatusPending:
+		updated.NextRunAt = nil
 	case JobStatusRunning:
 		updated.StartedAt = &at
 		updated.NextRunAt = nil
 	case JobStatusRetrying:
-		updated.RetryCount++
-		updated.NextRunAt = &at
+		if j.Status == JobStatusPaused {
+			if updated.NextRunAt == nil || updated.NextRunAt.IsZero() {
+				nextRunAt := at
+				updated.NextRunAt = &nextRunAt
+			}
+			if strings.TrimSpace(lastError) == "" {
+				updated.LastError = j.LastError
+			}
+		} else {
+			updated.RetryCount++
+			updated.NextRunAt = &at
+		}
+	case JobStatusPaused:
+		if j.Status != JobStatusRetrying {
+			updated.NextRunAt = nil
+		}
+		if j.Status == JobStatusRetrying && strings.TrimSpace(lastError) == "" {
+			updated.LastError = j.LastError
+		}
 	case JobStatusCancelled:
 		updated.NextRunAt = nil
 		updated.FinishedAt = &at
@@ -214,6 +235,8 @@ func (j Job) ExplainStatus() string {
 		return "job is actively executing"
 	case JobStatusRetrying:
 		return fmt.Sprintf("job is waiting for retry #%d", j.RetryCount)
+	case JobStatusPaused:
+		return "job is paused before dispatch"
 	case JobStatusCancelled:
 		return "job was cancelled before execution completed"
 	case JobStatusFailed:
@@ -256,15 +279,65 @@ type WorkflowStep struct {
 	Value string           `json:"value,omitempty"`
 }
 
+type WorkflowCallJobState struct {
+	StepName string `json:"stepName,omitempty"`
+	JobID    string `json:"jobId,omitempty"`
+}
+
+type WorkflowJobResult struct {
+	StepName   string        `json:"stepName,omitempty"`
+	JobID      string        `json:"jobId,omitempty"`
+	Status     JobStatus     `json:"status,omitempty"`
+	ReasonCode JobReasonCode `json:"reasonCode,omitempty"`
+	LastError  string        `json:"lastError,omitempty"`
+}
+
+func (r WorkflowJobResult) IsTerminal() bool {
+	switch r.Status {
+	case JobStatusDone, JobStatusCancelled, JobStatusFailed, JobStatusDead:
+		return true
+	default:
+		return false
+	}
+}
+
+func (r WorkflowJobResult) RequiresCompensation() bool {
+	switch r.Status {
+	case JobStatusCancelled, JobStatusFailed, JobStatusDead:
+		return true
+	default:
+		return false
+	}
+}
+
+func (r WorkflowJobResult) StateValue() map[string]any {
+	state := map[string]any{
+		"job_id": string(r.JobID),
+		"status": string(r.Status),
+	}
+	if strings.TrimSpace(r.StepName) != "" {
+		state["step_name"] = r.StepName
+	}
+	if strings.TrimSpace(string(r.ReasonCode)) != "" {
+		state["reason_code"] = string(r.ReasonCode)
+	}
+	if strings.TrimSpace(r.LastError) != "" {
+		state["last_error"] = r.LastError
+	}
+	return state
+}
+
 type Workflow struct {
-	ID            string         `json:"id"`
-	Steps         []WorkflowStep `json:"steps"`
-	CurrentIndex  int            `json:"currentIndex"`
-	State         map[string]any `json:"state,omitempty"`
-	WaitingFor    string         `json:"waitingFor,omitempty"`
-	SleepingUntil *time.Time     `json:"sleepingUntil,omitempty"`
-	Completed     bool           `json:"completed"`
-	Compensated   bool           `json:"compensated"`
+	ID            string                `json:"id"`
+	Steps         []WorkflowStep        `json:"steps"`
+	CurrentIndex  int                   `json:"currentIndex"`
+	State         map[string]any        `json:"state,omitempty"`
+	WaitingFor    string                `json:"waitingFor,omitempty"`
+	WaitingForJob *WorkflowCallJobState `json:"waitingForJob,omitempty"`
+	LastJobResult *WorkflowJobResult    `json:"lastJobResult,omitempty"`
+	SleepingUntil *time.Time            `json:"sleepingUntil,omitempty"`
+	Completed     bool                  `json:"completed"`
+	Compensated   bool                  `json:"compensated"`
 }
 
 func NewWorkflow(id string, steps ...WorkflowStep) Workflow {
@@ -297,19 +370,25 @@ func (w Workflow) Advance(now time.Time) (Workflow, error) {
 		until := now.Add(parseWorkflowDuration(step.Value))
 		next.SleepingUntil = &until
 	case WorkflowStepKindCallJob:
-		next.State[step.Name] = step.Value
-		next.CurrentIndex++
+		jobID := strings.TrimSpace(step.Value)
+		if jobID == "" {
+			return Workflow{}, errors.New("workflow call_job step requires job id value")
+		}
+		next.WaitingForJob = &WorkflowCallJobState{StepName: strings.TrimSpace(step.Name), JobID: jobID}
+		next.LastJobResult = nil
 	case WorkflowStepKindPersist:
 		next.State[step.Name] = step.Value
 		next.CurrentIndex++
 	case WorkflowStepKindCompensate:
-		next.Compensated = true
+		if next.LastJobResult == nil || next.LastJobResult.RequiresCompensation() {
+			next.Compensated = true
+		}
 		next.CurrentIndex++
 	default:
 		return Workflow{}, fmt.Errorf("unsupported workflow step kind %q", step.Kind)
 	}
 
-	if next.CurrentIndex >= len(next.Steps) && next.WaitingFor == "" && next.SleepingUntil == nil {
+	if next.CurrentIndex >= len(next.Steps) && next.WaitingFor == "" && next.WaitingForJob == nil && next.SleepingUntil == nil {
 		next.Completed = true
 	}
 	return next, nil
@@ -348,6 +427,50 @@ func (w Workflow) ResumeAfterSleep(now time.Time) (Workflow, error) {
 	}
 	next := w
 	next.SleepingUntil = nil
+	next.CurrentIndex++
+	if next.CurrentIndex >= len(next.Steps) {
+		next.Completed = true
+	}
+	return next, nil
+}
+
+func (w Workflow) ResumeWithChildJob(result WorkflowJobResult) (Workflow, error) {
+	step, err := w.CurrentStep()
+	if err != nil {
+		return Workflow{}, err
+	}
+	if step.Kind != WorkflowStepKindCallJob || w.WaitingForJob == nil {
+		return Workflow{}, errors.New("workflow is not waiting for child job result")
+	}
+	result.JobID = strings.TrimSpace(result.JobID)
+	if result.JobID == "" {
+		return Workflow{}, errors.New("workflow child job result requires job id")
+	}
+	if !result.IsTerminal() {
+		return Workflow{}, fmt.Errorf("workflow child job %q is not terminal: %s", result.JobID, result.Status)
+	}
+	expectedJobID := strings.TrimSpace(w.WaitingForJob.JobID)
+	if expectedJobID == "" {
+		expectedJobID = strings.TrimSpace(step.Value)
+	}
+	if expectedJobID == "" {
+		return Workflow{}, errors.New("workflow waiting child job id is missing")
+	}
+	if result.JobID != expectedJobID {
+		return Workflow{}, fmt.Errorf("unexpected child job %q, waiting for %q", result.JobID, expectedJobID)
+	}
+	if strings.TrimSpace(result.StepName) == "" {
+		result.StepName = strings.TrimSpace(step.Name)
+	}
+	next := w
+	if next.State == nil {
+		next.State = map[string]any{}
+	}
+	next.WaitingForJob = nil
+	next.LastJobResult = &result
+	if strings.TrimSpace(step.Name) != "" {
+		next.State[step.Name] = result.StateValue()
+	}
 	next.CurrentIndex++
 	if next.CurrentIndex >= len(next.Steps) {
 		next.Completed = true

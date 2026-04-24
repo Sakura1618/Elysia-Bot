@@ -19,6 +19,7 @@ import (
 	pluginadmin "github.com/ohmyopencode/bot-platform/plugins/plugin-admin"
 	pluginaichat "github.com/ohmyopencode/bot-platform/plugins/plugin-ai-chat"
 	pluginecho "github.com/ohmyopencode/bot-platform/plugins/plugin-echo"
+	pluginworkflowdemo "github.com/ohmyopencode/bot-platform/plugins/plugin-workflow-demo"
 )
 
 type runtimeAppBuildOptions struct {
@@ -500,6 +501,7 @@ type runtimePluginEchoCallbackEnvelope struct {
 	AIChatQueue           *runtimecore.SubprocessAIChatQueueRequest       `json:"ai_chat_queue,omitempty"`
 	AIChatSession         *runtimecore.SubprocessAIChatSessionRequest     `json:"ai_chat_session,omitempty"`
 	AIChatProvider        *runtimecore.SubprocessAIChatProviderRequest    `json:"ai_chat_provider,omitempty"`
+	WorkflowLoad          *runtimecore.SubprocessWorkflowLoadRequest      `json:"workflow_load,omitempty"`
 	WorkflowStartOrResume *runtimePluginEchoWorkflowStartOrResumeCallback `json:"workflow_start_or_resume,omitempty"`
 }
 
@@ -515,6 +517,7 @@ type runtimePluginEchoCallbackResult struct {
 	AdminRequest          *runtimecore.SubprocessAdminResult          `json:"admin_request,omitempty"`
 	AIChatQueue           *runtimecore.SubprocessAIChatQueueResult    `json:"ai_chat_queue,omitempty"`
 	AIChatProvider        *runtimecore.SubprocessAIChatProviderResult `json:"ai_chat_provider,omitempty"`
+	WorkflowLoad          *runtimecore.WorkflowInstanceState          `json:"workflow_load,omitempty"`
 	WorkflowStartOrResume json.RawMessage                             `json:"workflow_start_or_resume,omitempty"`
 }
 
@@ -695,6 +698,26 @@ func (b runtimePluginEchoReplyBridge) AIChatProvider(request runtimecore.Subproc
 		return runtimecore.SubprocessAIChatProviderResult{}, fmt.Errorf("ai_chat_provider callback missing result")
 	}
 	return *result.AIChatProvider, nil
+}
+
+func (b runtimePluginEchoReplyBridge) WorkflowLoad(request runtimecore.SubprocessWorkflowLoadRequest) (runtimecore.WorkflowInstanceState, error) {
+	result, err := b.requestCallback(runtimePluginEchoCallbackEnvelope{Type: "callback", Callback: "workflow_load", WorkflowLoad: &request})
+	if err != nil {
+		return runtimecore.WorkflowInstanceState{}, fmt.Errorf("workflow_load callback: %w", err)
+	}
+	if result.Type != "callback_result" {
+		return runtimecore.WorkflowInstanceState{}, fmt.Errorf("unexpected workflow_load callback result type %q", result.Type)
+	}
+	if result.Status != "ok" {
+		if strings.TrimSpace(result.Error) == "" {
+			return runtimecore.WorkflowInstanceState{}, fmt.Errorf("workflow_load callback failed")
+		}
+		return runtimecore.WorkflowInstanceState{}, fmt.Errorf("workflow_load callback failed: %s", result.Error)
+	}
+	if result.WorkflowLoad == nil {
+		return runtimecore.WorkflowInstanceState{}, fmt.Errorf("workflow_load callback missing result")
+	}
+	return *result.WorkflowLoad, nil
 }
 
 func (b runtimePluginEchoReplyBridge) requestCallback(envelope runtimePluginEchoCallbackEnvelope) (runtimePluginEchoCallbackResult, error) {
@@ -910,6 +933,10 @@ func (b runtimeSubprocessAIChatQueueBridge) Inspect(_ context.Context, jobID str
 	return b.queueAction("inspect", jobID, "")
 }
 
+func (b runtimeSubprocessAIChatQueueBridge) Cancel(_ context.Context, jobID string) (pluginsdk.Job, error) {
+	return b.queueAction("cancel", jobID, "")
+}
+
 func (b runtimeSubprocessAIChatQueueBridge) queueAction(action string, jobID string, reason string) (pluginsdk.Job, error) {
 	result, err := b.bridge.AIChatQueue(runtimecore.SubprocessAIChatQueueRequest{Action: action, JobID: strings.TrimSpace(jobID), Reason: strings.TrimSpace(reason)})
 	if err != nil {
@@ -975,43 +1002,35 @@ func handleRuntimePluginWorkflowDemoEvent(reader *bufio.Reader, stdout *os.File,
 		return nil
 	}
 	bridge := runtimePluginEchoReplyBridge{reader: reader, stdout: stdout}
-	workflowID := "workflow-anon"
-	if payload.Event.Actor != nil && strings.TrimSpace(payload.Event.Actor.ID) != "" {
-		workflowID = "workflow-" + payload.Event.Actor.ID
-	}
-	transition, observability, err := bridge.WorkflowStartOrResumeDetailed(
-		workflowID,
-		"plugin-workflow-demo",
-		payload.Ctx.TraceID,
-		payload.Event.Type,
-		payload.Event.EventID,
-		payload.Ctx.RunID,
-		payload.Ctx.CorrelationID,
-		runtimecore.NewWorkflow(
-			workflowID,
-			runtimecore.WorkflowStep{Kind: runtimecore.WorkflowStepKindPersist, Name: "greeting", Value: payload.Event.Message.Text},
-			runtimecore.WorkflowStep{Kind: runtimecore.WorkflowStepKindWaitEvent, Name: "wait-confirm", Value: "message.received"},
-			runtimecore.WorkflowStep{Kind: runtimecore.WorkflowStepKindCompensate, Name: "complete"},
-		),
-	)
-	if err != nil {
+	plugin := pluginworkflowdemo.New(bridge, runtimeSubprocessAIChatQueueBridge{bridge: bridge}, runtimeSubprocessWorkflowServiceBridge{bridge: bridge})
+	if err := plugin.OnEvent(payload.Event, payload.Ctx); err != nil {
 		return err
-	}
-	if !transition.Started && !transition.Resumed {
-		return fmt.Errorf("workflow_start_or_resume callback returned empty transition")
-	}
-	replyText := "workflow started, please send another message to continue"
-	if transition.Resumed {
-		replyText = "workflow resumed and completed"
-	}
-	if payload.Ctx.Reply != nil {
-		reply := withRuntimeReplyObservabilityMetadata(*payload.Ctx.Reply, observability)
-		if err := bridge.ReplyText(reply, replyText); err != nil {
-			return err
-		}
 	}
 	_, _ = stdout.WriteString("{\"type\":\"event\",\"status\":\"ok\",\"message\":\"event-ok\"}\n")
 	return nil
+}
+
+type runtimeSubprocessWorkflowServiceBridge struct {
+	bridge runtimePluginEchoReplyBridge
+}
+
+func (b runtimeSubprocessWorkflowServiceBridge) StartOrResume(ctx context.Context, workflowID string, pluginID string, eventType string, eventID string, initial runtimecore.Workflow) (runtimecore.WorkflowTransition, error) {
+	if loader, ok := any(b).(interface {
+		Load(context.Context, string) (runtimecore.WorkflowInstanceState, error)
+	}); ok {
+		_ = loader
+	}
+	observability := runtimecore.WorkflowObservabilityContextFromContext(ctx)
+	transition, _, err := b.bridge.WorkflowStartOrResumeDetailed(workflowID, pluginID, observability.TraceID, eventType, eventID, observability.RunID, observability.CorrelationID, initial)
+	return transition, err
+}
+
+func (b runtimeSubprocessWorkflowServiceBridge) ResumeFromChildJob(ctx context.Context, workflowID string, pluginID string, child runtimecore.WorkflowChildJobResume) (runtimecore.WorkflowTransition, error) {
+	return runtimecore.WorkflowTransition{}, fmt.Errorf("subprocess workflow child-job resume is runtime-owned and must be delivered from queued job terminal outcomes")
+}
+
+func (b runtimeSubprocessWorkflowServiceBridge) Load(ctx context.Context, workflowID string) (runtimecore.WorkflowInstanceState, error) {
+	return b.bridge.WorkflowLoad(runtimecore.SubprocessWorkflowLoadRequest{WorkflowID: strings.TrimSpace(workflowID)})
 }
 
 func handleRuntimePluginAIChatEvent(reader *bufio.Reader, stdout *os.File, rawPayload json.RawMessage) error {

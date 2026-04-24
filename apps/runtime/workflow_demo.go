@@ -44,13 +44,26 @@ func (a *runtimeApp) handleWorkflowMessage(w http.ResponseWriter, r *http.Reques
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	workflowID := `workflow-` + actorID
+	if a.workflowRuntime != nil {
+		instances, listErr := a.workflowRuntime.List(r.Context())
+		if listErr == nil {
+			for i := len(instances) - 1; i >= 0; i-- {
+				instance := instances[i]
+				if strings.HasPrefix(instance.WorkflowID, `workflow-`+actorID) {
+					workflowID = instance.WorkflowID
+					break
+				}
+			}
+		}
+	}
 	w.Header().Set(`Content-Type`, `application/json`)
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		`status`:      `ok`,
 		`duplicate`:   duplicate,
 		`event_id`:    event.EventID,
 		`trace_id`:    event.TraceID,
-		`workflow_id`: `workflow-` + actorID,
+		`workflow_id`: workflowID,
 		`replies`:     a.replies.Since(before),
 	})
 }

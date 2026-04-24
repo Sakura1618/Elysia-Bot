@@ -194,19 +194,21 @@ type runtimeConsoleResponse struct {
 		ID string `json:"id"`
 	} `json:"schedules"`
 	Workflows []struct {
-		ID             string `json:"id"`
-		PluginID       string `json:"pluginId"`
-		TraceID        string `json:"traceId"`
-		EventID        string `json:"eventId"`
-		RunID          string `json:"runId"`
-		CorrelationID  string `json:"correlationId"`
-		Status         string `json:"status"`
-		WaitingFor     string `json:"waitingFor"`
-		Completed      bool   `json:"completed"`
-		Compensated    bool   `json:"compensated"`
-		StatusSource   string `json:"statusSource"`
-		StatePersisted bool   `json:"statePersisted"`
-		RuntimeOwner   string `json:"runtimeOwner"`
+		ID             string         `json:"id"`
+		PluginID       string         `json:"pluginId"`
+		TraceID        string         `json:"traceId"`
+		EventID        string         `json:"eventId"`
+		RunID          string         `json:"runId"`
+		CorrelationID  string         `json:"correlationId"`
+		Status         string         `json:"status"`
+		WaitingFor     string         `json:"waitingFor"`
+		WaitingForJob  map[string]any `json:"waitingForJob"`
+		LastJobResult  map[string]any `json:"lastJobResult"`
+		Completed      bool           `json:"completed"`
+		Compensated    bool           `json:"compensated"`
+		StatusSource   string         `json:"statusSource"`
+		StatePersisted bool           `json:"statePersisted"`
+		RuntimeOwner   string         `json:"runtimeOwner"`
 	} `json:"workflows"`
 	Status struct {
 		Adapters  int `json:"adapters"`
@@ -705,15 +707,18 @@ func TestRuntimeAppDefaultPluginHostRoutingRoutesOfficialS4PluginsThroughSubproc
 	if workflowResp.Code != http.StatusOK {
 		t.Fatalf("expected workflow start 200, got %d: %s", workflowResp.Code, workflowResp.Body.String())
 	}
-	if !strings.Contains(workflowResp.Body.String(), `workflow started, please send another message to continue`) {
+	if !strings.Contains(workflowResp.Body.String(), `workflow started, child job queued; wait for its result, then send another message to continue`) {
 		t.Fatalf("expected workflow start reply through subprocess path, got %s", workflowResp.Body.String())
 	}
 	stored, err := app.state.LoadWorkflowInstance(t.Context(), "workflow-user-wave4")
 	if err != nil {
 		t.Fatalf("load subprocess-routed workflow instance: %v", err)
 	}
-	if stored.PluginID != "plugin-workflow-demo" || stored.Status != runtimecore.WorkflowRuntimeStatusWaitingEvent || stored.Workflow.State["greeting"] != "start workflow" {
+	if stored.PluginID != "plugin-workflow-demo" || stored.Status != runtimecore.WorkflowRuntimeStatusWaitingJob || stored.Workflow.State["greeting"] != "start workflow" {
 		t.Fatalf("expected subprocess-routed workflow instance persisted, got %+v", stored)
+	}
+	if stored.Workflow.WaitingForJob == nil {
+		t.Fatalf("expected subprocess-routed workflow to wait for child job, got %+v", stored)
 	}
 	subprocessHost := runtimeSubprocessHost(t, host)
 	stdout, stderr := waitForRuntimeSubprocessCapture(t, subprocessHost, func(stdout string, stderr string) bool {
@@ -776,7 +781,7 @@ func TestRuntimeAppDefaultPluginHostRoutingCrashRecoversWorkflowSubprocessAndExp
 	if failedResp.Code != http.StatusOK {
 		t.Fatalf("expected first workflow request to recover without restarting the app, got %d: %s", failedResp.Code, failedResp.Body.String())
 	}
-	if !strings.Contains(failedResp.Body.String(), `workflow started, please send another message to continue`) {
+	if !strings.Contains(failedResp.Body.String(), `workflow started, child job queued; wait for its result, then send another message to continue`) {
 		t.Fatalf("expected in-request recovery to still return workflow reply, got %s", failedResp.Body.String())
 	}
 	if _, err := os.Stat(markerPath); err != nil {
@@ -804,7 +809,7 @@ func TestRuntimeAppDefaultPluginHostRoutingCrashRecoversWorkflowSubprocessAndExp
 	if err != nil {
 		t.Fatalf("expected recovered workflow subprocess dispatch to persist workflow instance, err=%v", err)
 	}
-	if storedWorkflow.PluginID != "plugin-workflow-demo" || storedWorkflow.Status != runtimecore.WorkflowRuntimeStatusWaitingEvent || storedWorkflow.Workflow.State["greeting"] != "crash once" {
+	if storedWorkflow.PluginID != "plugin-workflow-demo" || storedWorkflow.Status != runtimecore.WorkflowRuntimeStatusWaitingJob || storedWorkflow.Workflow.State["greeting"] != "crash once" {
 		t.Fatalf("expected recovered workflow state after injected crash, got %+v", storedWorkflow)
 	}
 	storedWorkflowObservability := loadRuntimeWorkflowObservabilityRow(t, app, "workflow-user-crash")
@@ -857,11 +862,19 @@ func TestRuntimeAppDefaultPluginHostRoutingCrashRecoversWorkflowSubprocessAndExp
 		}
 	}
 
+	childJobID := "job-workflow-demo-workflow-user-crash"
+	cancelChildReq := httptest.NewRequest(http.MethodPost, "/demo/jobs/"+childJobID+"/cancel", nil)
+	cancelChildReq.Header.Set(runtimecore.ConsoleReadActorHeader, "job-operator")
+	cancelChildResp := httptest.NewRecorder()
+	app.ServeHTTP(cancelChildResp, cancelChildReq)
+	if cancelChildResp.Code != http.StatusOK {
+		t.Fatalf("cancel workflow child job through operator path: %d %s", cancelChildResp.Code, cancelChildResp.Body.String())
+	}
 	recoveredResp := performRuntimeWorkflowMessageRequest(t, app, `{"actor_id":"user-crash","message":"recover now"}`)
 	if recoveredResp.Code != http.StatusOK {
 		t.Fatalf("expected second workflow request to recover without app restart, got %d: %s", recoveredResp.Code, recoveredResp.Body.String())
 	}
-	if !strings.Contains(recoveredResp.Body.String(), `workflow resumed and completed`) {
+	if !strings.Contains(recoveredResp.Body.String(), `workflow resumed after child job failure and compensation completed`) {
 		t.Fatalf("expected recovered workflow reply after subprocess restart, got %s", recoveredResp.Body.String())
 	}
 	recoveredResults := app.runtime.DispatchResults()
@@ -885,6 +898,9 @@ func TestRuntimeAppDefaultPluginHostRoutingCrashRecoversWorkflowSubprocessAndExp
 	}
 	if workflowState.PluginID != "plugin-workflow-demo" || workflowState.Status != runtimecore.WorkflowRuntimeStatusCompleted || !workflowState.Workflow.Completed || !workflowState.Workflow.Compensated || workflowState.Workflow.State["greeting"] != "crash once" {
 		t.Fatalf("expected recovered workflow dispatch to persist waiting state, got %+v", workflowState)
+	}
+	if jobState, _ := workflowState.Workflow.State["child-job"].(map[string]any); jobState == nil || jobState["status"] != string(runtimecore.JobStatusCancelled) {
+		t.Fatalf("expected recovered workflow child-job result state after compensation, got %+v", workflowState.Workflow.State["child-job"])
 	}
 	recoveredConsoleReq := httptest.NewRequest(http.MethodGet, "/api/console?plugin_id=plugin-workflow-demo", nil)
 	recoveredConsoleResp := httptest.NewRecorder()
@@ -962,6 +978,7 @@ func TestRuntimeAppSubprocessWorkflowCallbackBridgeWorksAtSubstrateLevel(t *test
 	subprocessHost.SetWorkflowStartOrResumeCallback(func(ctx context.Context, request runtimecore.SubprocessWorkflowStartOrResumeRequest) (runtimecore.WorkflowTransition, error) {
 		return app.workflowRuntime.StartOrResume(ctx, request.WorkflowID, request.PluginID, request.EventType, request.EventID, request.Initial)
 	})
+	subprocessHost.SetAIChatQueueCallback(runtimeSubprocessAIChatCallbackBridge{queue: app.queue, sessions: app.controlState}.HandleQueue)
 
 	workflowPlugin := testRuntimeWorkflowSubprocessPlugin(t)
 	event := eventmodel.Event{
@@ -974,15 +991,18 @@ func TestRuntimeAppSubprocessWorkflowCallbackBridgeWorksAtSubstrateLevel(t *test
 		Actor:          &eventmodel.Actor{ID: "user-1", Type: "user"},
 		Message:        &eventmodel.Message{ID: "msg-runtime-workflow-subprocess", Text: "workflow-callback"},
 	}
-	if err := subprocessHost.DispatchEvent(t.Context(), workflowPlugin, event, eventmodel.ExecutionContext{TraceID: event.TraceID, EventID: event.EventID}); err != nil {
+	if err := subprocessHost.DispatchEvent(t.Context(), workflowPlugin, event, eventmodel.ExecutionContext{TraceID: event.TraceID, EventID: event.EventID, Reply: &eventmodel.ReplyHandle{Capability: "onebot.reply", TargetID: "group-42", MessageID: event.Message.ID}}); err != nil {
 		t.Fatalf("dispatch workflow subprocess event: %v", err)
 	}
 	stored, err := app.state.LoadWorkflowInstance(t.Context(), "workflow-user-1")
 	if err != nil {
 		t.Fatalf("load workflow instance: %v", err)
 	}
-	if stored.PluginID != "plugin-workflow-demo" || stored.Status != runtimecore.WorkflowRuntimeStatusWaitingEvent || stored.Workflow.State["greeting"] != "workflow-callback" {
+	if stored.PluginID != "plugin-workflow-demo" || stored.Status != runtimecore.WorkflowRuntimeStatusWaitingJob || stored.Workflow.State["greeting"] != "workflow-callback" {
 		t.Fatalf("expected workflow callback bridge to persist waiting runtime state, got %+v", stored)
+	}
+	if stored.Workflow.WaitingForJob == nil {
+		t.Fatalf("expected workflow callback bridge to persist waiting child-job state, got %+v", stored)
 	}
 	stdout, _ := waitForRuntimeSubprocessCapture(t, subprocessHost, func(stdout string, _ string) bool {
 		return strings.Contains(stdout, `"callback":"workflow_start_or_resume"`)
@@ -1406,7 +1426,7 @@ func writeWriteActionRBACConfigWithBackendAt(t *testing.T, dir string, backend s
 	builder.WriteString("      permissions: [schedule:cancel]\n")
 	builder.WriteString("      plugin_scope: ['*']\n")
 	builder.WriteString("    job-operator:\n")
-	builder.WriteString("      permissions: [job:retry]\n")
+	builder.WriteString("      permissions: [job:pause, job:resume, job:cancel, job:retry]\n")
 	builder.WriteString("      plugin_scope: ['*']\n")
 	builder.WriteString("    config-operator:\n")
 	builder.WriteString("      permissions: [plugin:config]\n")
@@ -1510,7 +1530,7 @@ func writeWriteActionRBACOperatorAuthConfig(t *testing.T, dir string) string {
 		"      permissions: [schedule:cancel]\n" +
 		"      plugin_scope: ['*']\n" +
 		"    job-operator:\n" +
-		"      permissions: [job:retry]\n" +
+		"      permissions: [job:pause, job:resume, job:cancel, job:retry]\n" +
 		"      plugin_scope: ['*']\n" +
 		"    config-operator:\n" +
 		"      permissions: [plugin:config]\n" +
@@ -1994,7 +2014,7 @@ func TestRuntimeAppConfiguredOneBotRoutesUseConfiguredSources(t *testing.T) {
 	if got := consoleMetaStringSlice(t, console.Meta, "webhook_ingress_paths"); !reflect.DeepEqual(got, []string{"/ingress/webhook/main"}) {
 		t.Fatalf("expected webhook ingress path in mixed config metadata, got %+v", got)
 	}
-	if got := consoleMetaStringSlice(t, console.Meta, "demo_paths"); !reflect.DeepEqual(got, []string{"/demo/onebot/message", "/demo/onebot/message-beta", "/ingress/webhook/main", "/demo/workflows/message", "/demo/ai/message", "/demo/jobs/enqueue", "/demo/jobs/timeout", "/demo/jobs/{job-id}/retry", "/demo/schedules/echo-delay", "/demo/schedules/{schedule-id}/cancel", "/demo/plugins/{plugin-id}/disable", "/demo/plugins/{plugin-id}/enable", "/demo/plugins/{plugin-id}/config", "/demo/replies", "/demo/state/counts"}) {
+	if got := consoleMetaStringSlice(t, console.Meta, "demo_paths"); !reflect.DeepEqual(got, []string{"/demo/onebot/message", "/demo/onebot/message-beta", "/ingress/webhook/main", "/demo/workflows/message", "/demo/ai/message", "/demo/jobs/enqueue", "/demo/jobs/timeout", "/demo/jobs/{job-id}/pause", "/demo/jobs/{job-id}/resume", "/demo/jobs/{job-id}/cancel", "/demo/jobs/{job-id}/retry", "/demo/schedules/echo-delay", "/demo/schedules/{schedule-id}/cancel", "/demo/plugins/{plugin-id}/disable", "/demo/plugins/{plugin-id}/enable", "/demo/plugins/{plugin-id}/config", "/demo/replies", "/demo/state/counts"}) {
 		t.Fatalf("expected mixed demo paths, got %+v", got)
 	}
 }
@@ -2406,7 +2426,7 @@ func TestRuntimeAppConsoleReflectsRuntimeState(t *testing.T) {
 	if !strings.Contains(resp.Body.String(), `"plugin_read_model": "runtime-registry+sqlite-plugin-status-snapshot"`) {
 		t.Fatalf("expected console payload to include plugin_read_model=runtime-registry+sqlite-plugin-status-snapshot, got %s", resp.Body.String())
 	}
-	for _, expected := range []string{`"plugin_config_state_read_model": "runtime-registry+sqlite-plugin-config"`, `"plugin_config_state_kind": "plugin-owned-persisted-input"`, `"plugin_config_state_persisted": true`, `"plugin_config_operator_actions": [`, `"plugin_config_operator_scope": "plugins with app-local persisted config bindings only"`, `"plugin_enabled_state_read_model": "runtime-registry+sqlite-plugin-enabled-overlay"`, `"plugin_enabled_state_persisted": true`, `"plugin_operator_scope": "already-registered plugins only"`, `"workflow_read_model": "sqlite-workflow-instances"`, `"workflow_status_source": "sqlite-workflow-instances"`, `"workflow_status_persisted": true`, `"workflow_runtime_owner": "runtime-core"`, `"/demo/plugins/{plugin-id}/enable"`, `"/demo/plugins/{plugin-id}/disable"`, `"/demo/plugins/{plugin-id}/config"`, `"/demo/jobs/{job-id}/retry"`, `"/demo/schedules/{schedule-id}/cancel"`, `"job_operator_scope": "dead-letter jobs only"`, `"console_mode": "read+operator-plugin-enable-disable+plugin-config+job-retry+schedule-cancel"`, `"enabled": true`, `"enabledStateSource": "runtime-default-enabled"`, `"enabledStatePersisted": false`, `"configStateKind": "plugin-owned-persisted-input"`, `"configPersisted": false`} {
+	for _, expected := range []string{`"plugin_config_state_read_model": "runtime-registry+sqlite-plugin-config"`, `"plugin_config_state_kind": "plugin-owned-persisted-input"`, `"plugin_config_state_persisted": true`, `"plugin_config_operator_actions": [`, `"plugin_config_operator_scope": "plugins with app-local persisted config bindings only"`, `"plugin_enabled_state_read_model": "runtime-registry+sqlite-plugin-enabled-overlay"`, `"plugin_enabled_state_persisted": true`, `"plugin_operator_scope": "already-registered plugins only"`, `"workflow_read_model": "sqlite-workflow-instances"`, `"workflow_status_source": "sqlite-workflow-instances"`, `"workflow_status_persisted": true`, `"workflow_runtime_owner": "runtime-core"`, `"workflow_child_job_resume_path": "runtime-owned queued job terminal outcome -\u003e workflow resume"`, `"workflow_reference_demo": "event trigger -\u003e workflow wait -\u003e child job -\u003e suspend/restore -\u003e compensation"`, `"/demo/plugins/{plugin-id}/enable"`, `"/demo/plugins/{plugin-id}/disable"`, `"/demo/plugins/{plugin-id}/config"`, `"/demo/jobs/{job-id}/pause"`, `"/demo/jobs/{job-id}/resume"`, `"/demo/jobs/{job-id}/cancel"`, `"/demo/jobs/{job-id}/retry"`, `"/demo/schedules/{schedule-id}/cancel"`, `"job_operator_scope": "queued jobs for pause|resume|cancel, dead-letter jobs for retry"`, `"console_mode": "read+operator-plugin-enable-disable+plugin-config+job-control+schedule-cancel"`, `"enabled": true`, `"enabledStateSource": "runtime-default-enabled"`, `"enabledStatePersisted": false`, `"configStateKind": "plugin-owned-persisted-input"`, `"configPersisted": false`} {
 		if !strings.Contains(resp.Body.String(), expected) {
 			t.Fatalf("expected console payload to include %s, got %s", expected, resp.Body.String())
 		}
@@ -2418,6 +2438,9 @@ func TestRuntimeAppConsoleReflectsRuntimeState(t *testing.T) {
 		"/demo/ai/message",
 		"/demo/jobs/enqueue",
 		"/demo/jobs/timeout",
+		"/demo/jobs/{job-id}/pause",
+		"/demo/jobs/{job-id}/resume",
+		"/demo/jobs/{job-id}/cancel",
 		"/demo/jobs/{job-id}/retry",
 		"/demo/schedules/echo-delay",
 		"/demo/schedules/{schedule-id}/cancel",
@@ -2427,7 +2450,7 @@ func TestRuntimeAppConsoleReflectsRuntimeState(t *testing.T) {
 		"/demo/replies",
 		"/demo/state/counts",
 	}
-	if got := consoleMetaString(t, console.Meta, "console_mode"); got != "read+operator-plugin-enable-disable+plugin-config+job-retry+schedule-cancel" {
+	if got := consoleMetaString(t, console.Meta, "console_mode"); got != "read+operator-plugin-enable-disable+plugin-config+job-control+schedule-cancel" {
 		t.Fatalf("expected console_mode to advertise plugin-config capability, got %q", got)
 	}
 	if got := consoleMetaString(t, console.Meta, "plugin_config_operator_scope"); got != "plugins with app-local persisted config bindings only" {
@@ -2436,10 +2459,10 @@ func TestRuntimeAppConsoleReflectsRuntimeState(t *testing.T) {
 	if got := consoleMetaStringSlice(t, console.Meta, "plugin_config_operator_actions"); !reflect.DeepEqual(got, []string{"/demo/plugins/{plugin-id}/config"}) {
 		t.Fatalf("expected exact plugin_config_operator_actions, got %+v", got)
 	}
-	if got := consoleMetaStringSlice(t, console.Meta, "job_operator_actions"); !reflect.DeepEqual(got, []string{"/demo/jobs/{job-id}/retry"}) {
+	if got := consoleMetaStringSlice(t, console.Meta, "job_operator_actions"); !reflect.DeepEqual(got, []string{"/demo/jobs/{job-id}/pause", "/demo/jobs/{job-id}/resume", "/demo/jobs/{job-id}/cancel", "/demo/jobs/{job-id}/retry"}) {
 		t.Fatalf("expected exact job_operator_actions, got %+v", got)
 	}
-	if got := consoleMetaString(t, console.Meta, "job_operator_scope"); got != "dead-letter jobs only" {
+	if got := consoleMetaString(t, console.Meta, "job_operator_scope"); got != "queued jobs for pause|resume|cancel, dead-letter jobs for retry" {
 		t.Fatalf("expected job_operator_scope to describe retry capability, got %q", got)
 	}
 	if got := consoleMetaStringSlice(t, console.Meta, "demo_paths"); !reflect.DeepEqual(got, expectedDemoPaths) {
@@ -2861,18 +2884,18 @@ func TestRuntimeAppWorkflowDemoPersistsAndRecoversAcrossRestart(t *testing.T) {
 	if startResp.Code != http.StatusOK {
 		t.Fatalf(`expected workflow start 200, got %d: %s`, startResp.Code, startResp.Body.String())
 	}
-	if !strings.Contains(startResp.Body.String(), `workflow started, please send another message to continue`) {
+	if !strings.Contains(startResp.Body.String(), `workflow started, child job queued; wait for its result, then send another message to continue`) {
 		t.Fatalf(`expected workflow start reply, got %s`, startResp.Body.String())
 	}
 	started, err := app.state.LoadWorkflowInstance(t.Context(), `workflow-user-1`)
 	if err != nil {
 		t.Fatalf(`load started workflow instance: %v`, err)
 	}
-	if started.PluginID != `plugin-workflow-demo` || started.Status != runtimecore.WorkflowRuntimeStatusWaitingEvent {
+	if started.PluginID != `plugin-workflow-demo` || started.Status != runtimecore.WorkflowRuntimeStatusWaitingJob {
 		t.Fatalf(`expected waiting persisted workflow after first request, got %+v`, started)
 	}
-	if started.Workflow.WaitingFor != `message.received` || started.Workflow.State[`greeting`] != `start workflow` || started.Workflow.Completed {
-		t.Fatalf(`expected workflow runtime to persist waiting state after first request, got %+v`, started.Workflow)
+	if started.Workflow.WaitingForJob == nil || started.Workflow.State[`greeting`] != `start workflow` || started.Workflow.Completed {
+		t.Fatalf(`expected workflow runtime to persist waiting child-job state after first request, got %+v`, started.Workflow)
 	}
 	startedObservability := loadRuntimeWorkflowObservabilityRow(t, app, `workflow-user-1`)
 	if startedObservability.TraceID == `` || startedObservability.EventID == `` || startedObservability.RunID == `` || startedObservability.CorrelationID == `` {
@@ -2894,7 +2917,7 @@ func TestRuntimeAppWorkflowDemoPersistsAndRecoversAcrossRestart(t *testing.T) {
 	if startedPayload.EventID != startedEventID || startedPayload.TraceID != startedTraceID || startedPayload.WorkflowID != `workflow-user-1` {
 		t.Fatalf(`expected workflow start response ids to match persisted workflow observability row, got response=%+v persisted=%+v`, startedPayload, startedObservability)
 	}
-	if len(startedPayload.Replies) != 1 || startedPayload.Replies[0].Payload != `workflow started, please send another message to continue` {
+	if len(startedPayload.Replies) != 1 || startedPayload.Replies[0].Payload != `workflow started, child job queued; wait for its result, then send another message to continue` {
 		t.Fatalf(`expected workflow start response to expose reply payload, got %+v`, startedPayload.Replies)
 	}
 	if rendered := app.tracer.RenderTrace(startedTraceID); !strings.Contains(rendered, `runtime.dispatch event_id=`+startedEventID) || !strings.Contains(rendered, `plugin_host.dispatch event_id=`+startedEventID+` plugin_id=plugin-workflow-demo`) || !strings.Contains(rendered, `reply.send event_id=`+startedEventID+` plugin_id=plugin-workflow-demo`) {
@@ -2931,14 +2954,22 @@ func TestRuntimeAppWorkflowDemoPersistsAndRecoversAcrossRestart(t *testing.T) {
 	}
 	defer func() { _ = restarted.Close() }()
 	recovery := restarted.workflowRuntime.LastRecoverySnapshot()
-	if recovery.TotalWorkflows != 1 || recovery.RecoveredWorkflows != 1 || recovery.StatusCounts[runtimecore.WorkflowRuntimeStatusWaitingEvent] != 1 {
+	if recovery.TotalWorkflows != 1 || recovery.RecoveredWorkflows != 1 || recovery.StatusCounts[runtimecore.WorkflowRuntimeStatusWaitingJob] != 1 {
 		t.Fatalf(`expected workflow runtime recovery snapshot after restart, got %+v`, recovery)
+	}
+	childJobID := "job-workflow-demo-workflow-user-1"
+	cancelChildReq := httptest.NewRequest(http.MethodPost, "/demo/jobs/"+childJobID+"/cancel", nil)
+	cancelChildReq.Header.Set(runtimecore.ConsoleReadActorHeader, "job-operator")
+	cancelChildResp := httptest.NewRecorder()
+	restarted.ServeHTTP(cancelChildResp, cancelChildReq)
+	if cancelChildResp.Code != http.StatusOK {
+		t.Fatalf(`cancel workflow child job before resume through operator path: %d %s`, cancelChildResp.Code, cancelChildResp.Body.String())
 	}
 	resumeResp := performRuntimeWorkflowMessageRequest(t, restarted, `{"actor_id":"user-1","message":"continue"}`)
 	if resumeResp.Code != http.StatusOK {
 		t.Fatalf(`expected workflow resume 200, got %d: %s`, resumeResp.Code, resumeResp.Body.String())
 	}
-	if !strings.Contains(resumeResp.Body.String(), `workflow resumed and completed`) {
+	if !strings.Contains(resumeResp.Body.String(), `workflow resumed after child job failure and compensation completed`) {
 		t.Fatalf(`expected workflow resume reply, got %s`, resumeResp.Body.String())
 	}
 	completed, err := restarted.state.LoadWorkflowInstance(t.Context(), `workflow-user-1`)
@@ -2981,7 +3012,7 @@ func TestRuntimeAppWorkflowDemoPersistsAndRecoversAcrossRestart(t *testing.T) {
 	if resumedPayload.TraceID == `` || resumedPayload.TraceID == startedTraceID {
 		t.Fatalf(`expected workflow resume response to carry the live trigger trace while persistence keeps origin trace stable, got start=%q resume=%+v`, startedTraceID, resumedPayload)
 	}
-	if len(resumedPayload.Replies) != 1 || resumedPayload.Replies[0].Payload != `workflow resumed and completed` {
+	if len(resumedPayload.Replies) != 1 || resumedPayload.Replies[0].Payload != `workflow resumed after child job failure and compensation completed` {
 		t.Fatalf(`expected workflow resume response to expose reply payload, got %+v`, resumedPayload.Replies)
 	}
 	if rendered := restarted.tracer.RenderTrace(completedObservability.TraceID); !strings.Contains(rendered, `reply.send event_id=`+startedEventID+` plugin_id=plugin-workflow-demo`) {
@@ -3037,6 +3068,9 @@ func TestRuntimeAppWorkflowDemoPersistsAndRecoversAcrossRestart(t *testing.T) {
 		if workflow.PluginID != `plugin-workflow-demo` || workflow.Status != `completed` || !workflow.Completed || !workflow.Compensated {
 			t.Fatalf(`expected completed workflow facts in console payload, got %+v`, workflow)
 		}
+		if workflow.LastJobResult == nil || workflow.LastJobResult[`status`] != string(runtimecore.JobStatusCancelled) {
+			t.Fatalf(`expected console workflow payload to expose last child job result, got %+v`, workflow)
+		}
 		if workflow.TraceID != startedTraceID || workflow.EventID != startedEventID || workflow.RunID != startedRunID || workflow.CorrelationID != startedCorrelationID {
 			t.Fatalf(`expected console workflow payload to expose stable origin observability ids, got %+v`, workflow)
 		}
@@ -3060,7 +3094,7 @@ func TestRuntimeAppWorkflowDemoRestoresAcrossRestartWithPostgresSelectedBackend(
 	if startResp.Code != http.StatusOK {
 		t.Fatalf("expected workflow start 200, got %d: %s", startResp.Code, startResp.Body.String())
 	}
-	if !strings.Contains(startResp.Body.String(), `workflow started, please send another message to continue`) {
+	if !strings.Contains(startResp.Body.String(), `workflow started, child job queued; wait for its result, then send another message to continue`) {
 		t.Fatalf("expected workflow start reply, got %s", startResp.Body.String())
 	}
 
@@ -3073,11 +3107,11 @@ func TestRuntimeAppWorkflowDemoRestoresAcrossRestartWithPostgresSelectedBackend(
 	if err != nil {
 		t.Fatalf("load postgres workflow instance before restart: %v", err)
 	}
-	if started.PluginID != "plugin-workflow-demo" || started.Status != runtimecore.WorkflowRuntimeStatusWaitingEvent {
+	if started.PluginID != "plugin-workflow-demo" || started.Status != runtimecore.WorkflowRuntimeStatusWaitingJob {
 		t.Fatalf("expected waiting postgres workflow before restart, got %+v", started)
 	}
-	if started.Workflow.WaitingFor != "message.received" || started.Workflow.State["greeting"] != "start workflow" || started.Workflow.Completed {
-		t.Fatalf("expected persisted postgres workflow waiting state, got %+v", started.Workflow)
+	if started.Workflow.WaitingForJob == nil || started.Workflow.State["greeting"] != "start workflow" || started.Workflow.Completed {
+		t.Fatalf("expected persisted postgres workflow waiting child-job state, got %+v", started.Workflow)
 	}
 	startedTraceID := started.TraceID
 	startedEventID := started.EventID
@@ -3097,14 +3131,21 @@ func TestRuntimeAppWorkflowDemoRestoresAcrossRestartWithPostgresSelectedBackend(
 	defer func() { _ = restarted.Close() }()
 
 	recovery := restarted.workflowRuntime.LastRecoverySnapshot()
-	if recovery.TotalWorkflows != 1 || recovery.RecoveredWorkflows != 1 || recovery.StatusCounts[runtimecore.WorkflowRuntimeStatusWaitingEvent] != 1 {
+	if recovery.TotalWorkflows != 1 || recovery.RecoveredWorkflows != 1 || recovery.StatusCounts[runtimecore.WorkflowRuntimeStatusWaitingJob] != 1 {
 		t.Fatalf("expected postgres workflow recovery snapshot after restart, got %+v", recovery)
+	}
+	cancelChildReq := httptest.NewRequest(http.MethodPost, "/demo/jobs/job-workflow-demo-workflow-postgres-restore-user/cancel", nil)
+	cancelChildReq.Header.Set(runtimecore.ConsoleReadActorHeader, "job-operator")
+	cancelChildResp := httptest.NewRecorder()
+	restarted.ServeHTTP(cancelChildResp, cancelChildReq)
+	if cancelChildResp.Code != http.StatusOK {
+		t.Fatalf("cancel postgres workflow child job before resume through operator path: %d %s", cancelChildResp.Code, cancelChildResp.Body.String())
 	}
 	resumeResp := performRuntimeWorkflowMessageRequest(t, restarted, `{"actor_id":"postgres-restore-user","message":"continue"}`)
 	if resumeResp.Code != http.StatusOK {
 		t.Fatalf("expected workflow resume 200, got %d: %s", resumeResp.Code, resumeResp.Body.String())
 	}
-	if !strings.Contains(resumeResp.Body.String(), `workflow resumed and completed`) {
+	if !strings.Contains(resumeResp.Body.String(), `workflow resumed after child job failure and compensation completed`) {
 		t.Fatalf("expected workflow resume reply, got %s", resumeResp.Body.String())
 	}
 
@@ -3155,6 +3196,9 @@ func TestRuntimeAppWorkflowDemoRestoresAcrossRestartWithPostgresSelectedBackend(
 		if workflow.PluginID != "plugin-workflow-demo" || workflow.Status != "completed" || !workflow.Completed || !workflow.Compensated {
 			t.Fatalf("expected postgres console workflow facts after restore, got %+v", workflow)
 		}
+		if workflow.LastJobResult == nil || workflow.LastJobResult[`status`] != string(runtimecore.JobStatusCancelled) {
+			t.Fatalf("expected postgres console workflow child-job result after restore, got %+v", workflow)
+		}
 		if workflow.TraceID != startedTraceID || workflow.EventID != startedEventID || workflow.RunID != startedRunID || workflow.CorrelationID != startedCorrelationID {
 			t.Fatalf("expected postgres console workflow origin observability ids after restore, got %+v", workflow)
 		}
@@ -3164,6 +3208,67 @@ func TestRuntimeAppWorkflowDemoRestoresAcrossRestartWithPostgresSelectedBackend(
 		return
 	}
 	t.Fatalf("expected %s in postgres console payload after restore, got %+v", workflowID, console.Workflows)
+}
+
+func TestRuntimeAppWorkflowDemoStartsFreshRunForSameActorAfterCompletion(t *testing.T) {
+	t.Parallel()
+
+	app, err := newRuntimeApp(writeWriteActionRBACConfig(t))
+	if err != nil {
+		t.Fatalf("new runtime app: %v", err)
+	}
+	defer func() { _ = app.Close() }()
+
+	startResp := performRuntimeWorkflowMessageRequest(t, app, `{"actor_id":"repeat-actor","message":"first run"}`)
+	if startResp.Code != http.StatusOK {
+		t.Fatalf("expected first workflow start 200, got %d: %s", startResp.Code, startResp.Body.String())
+	}
+	cancelFirstReq := httptest.NewRequest(http.MethodPost, "/demo/jobs/job-workflow-demo-workflow-repeat-actor/cancel", nil)
+	cancelFirstReq.Header.Set(runtimecore.ConsoleReadActorHeader, "job-operator")
+	cancelFirstResp := httptest.NewRecorder()
+	app.ServeHTTP(cancelFirstResp, cancelFirstReq)
+	if cancelFirstResp.Code != http.StatusOK {
+		t.Fatalf("expected first child job cancel 200, got %d: %s", cancelFirstResp.Code, cancelFirstResp.Body.String())
+	}
+	continueResp := performRuntimeWorkflowMessageRequest(t, app, `{"actor_id":"repeat-actor","message":"complete first run"}`)
+	if continueResp.Code != http.StatusOK {
+		t.Fatalf("expected first workflow continue 200, got %d: %s", continueResp.Code, continueResp.Body.String())
+	}
+	if !strings.Contains(continueResp.Body.String(), `workflow resumed after child job failure and compensation completed`) {
+		t.Fatalf("expected compensated completion reply, got %s", continueResp.Body.String())
+	}
+
+	secondStartResp := performRuntimeWorkflowMessageRequest(t, app, `{"actor_id":"repeat-actor","message":"second run"}`)
+	if secondStartResp.Code != http.StatusOK {
+		t.Fatalf("expected second workflow start 200, got %d: %s", secondStartResp.Code, secondStartResp.Body.String())
+	}
+	var secondPayload struct {
+		WorkflowID string `json:"workflow_id"`
+	}
+	if err := json.Unmarshal(secondStartResp.Body.Bytes(), &secondPayload); err != nil {
+		t.Fatalf("decode second workflow start response: %v", err)
+	}
+	if secondPayload.WorkflowID == `workflow-repeat-actor` || !strings.HasPrefix(secondPayload.WorkflowID, `workflow-repeat-actor-run-`) {
+		t.Fatalf("expected fresh workflow run id for repeated actor, got %+v", secondPayload)
+	}
+	console := readRuntimeConsoleResponseAsViewer(t, app, "/api/console?plugin_id=plugin-workflow-demo")
+	freshWaiting := false
+	completedBase := false
+	for _, workflow := range console.Workflows {
+		switch workflow.ID {
+		case `workflow-repeat-actor`:
+			if workflow.Status == `completed` {
+				completedBase = true
+			}
+		default:
+			if workflow.ID == secondPayload.WorkflowID && workflow.Status == `waiting_job` && workflow.WaitingForJob != nil {
+				freshWaiting = true
+			}
+		}
+	}
+	if !completedBase || !freshWaiting {
+		t.Fatalf("expected completed base run plus fresh waiting run in console payload, got %+v", console.Workflows)
+	}
 }
 
 func TestRuntimeAppConsoleReturnsForbiddenWhenConsoleReadAuthorizationDenies(t *testing.T) {
@@ -4737,6 +4842,188 @@ func TestRuntimeAppRetryDeadLetterOperatorFailsClosedWithoutActorHeaderUnderConf
 	}
 }
 
+func TestRuntimeAppJobPauseResumeCancelOperatorsPersistQueueControlAndAudits(t *testing.T) {
+	t.Parallel()
+
+	app, err := newRuntimeApp(writeWriteActionRBACConfig(t))
+	if err != nil {
+		t.Fatalf("new runtime app: %v", err)
+	}
+	defer func() { _ = app.Close() }()
+
+	pending := runtimecore.NewJob("job-operator-pause-resume", "demo.echo", 1, 30*time.Second)
+	if err := app.queue.Enqueue(t.Context(), pending); err != nil {
+		t.Fatalf("enqueue pause/resume job: %v", err)
+	}
+
+	pauseReq := httptest.NewRequest(http.MethodPost, "/demo/jobs/"+pending.ID+"/pause", nil)
+	pauseReq.Header.Set(runtimecore.ConsoleReadActorHeader, "job-operator")
+	pauseResp := httptest.NewRecorder()
+	app.ServeHTTP(pauseResp, pauseReq)
+	if pauseResp.Code != http.StatusOK {
+		t.Fatalf("expected pause operator 200, got %d: %s", pauseResp.Code, pauseResp.Body.String())
+	}
+	var pausePayload operatorJobResponsePayload
+	if err := json.Unmarshal(pauseResp.Body.Bytes(), &pausePayload); err != nil {
+		t.Fatalf("decode pause response: %v", err)
+	}
+	if pausePayload.Status != "ok" || pausePayload.Action != "job.pause" || pausePayload.Target != pending.ID || !pausePayload.Accepted || pausePayload.Reason != "job_paused" {
+		t.Fatalf("expected normalized pause response, got %+v", pausePayload)
+	}
+	pausedJob, err := app.queue.Inspect(t.Context(), pending.ID)
+	if err != nil {
+		t.Fatalf("inspect paused job: %v", err)
+	}
+	if pausedJob.Status != runtimecore.JobStatusPaused {
+		t.Fatalf("expected paused job state, got %+v", pausedJob)
+	}
+
+	resumeReq := httptest.NewRequest(http.MethodPost, "/demo/jobs/"+pending.ID+"/resume", nil)
+	resumeReq.Header.Set(runtimecore.ConsoleReadActorHeader, "job-operator")
+	resumeResp := httptest.NewRecorder()
+	app.ServeHTTP(resumeResp, resumeReq)
+	if resumeResp.Code != http.StatusOK {
+		t.Fatalf("expected resume operator 200, got %d: %s", resumeResp.Code, resumeResp.Body.String())
+	}
+	var resumePayload operatorJobResponsePayload
+	if err := json.Unmarshal(resumeResp.Body.Bytes(), &resumePayload); err != nil {
+		t.Fatalf("decode resume response: %v", err)
+	}
+	if resumePayload.Status != "ok" || resumePayload.Action != "job.resume" || resumePayload.Target != pending.ID || !resumePayload.Accepted || resumePayload.Reason != "job_resumed" {
+		t.Fatalf("expected normalized resume response, got %+v", resumePayload)
+	}
+	resumedJob, err := app.queue.Inspect(t.Context(), pending.ID)
+	if err != nil {
+		t.Fatalf("inspect resumed job: %v", err)
+	}
+	if resumedJob.Status != runtimecore.JobStatusPending {
+		t.Fatalf("expected resumed pending job state, got %+v", resumedJob)
+	}
+
+	retrying := runtimecore.NewJob("job-operator-cancel", "ai.chat", 1, 30*time.Second)
+	retrying.TraceID = "trace-job-operator-cancel"
+	retrying.EventID = "evt-job-operator-cancel"
+	retrying.Correlation = "runtime-ai:user-operator-cancel:cancel"
+	if err := applyDemoAIJobContract(&retrying, "cancel me", "user-operator-cancel"); err != nil {
+		t.Fatalf("apply demo ai job contract: %v", err)
+	}
+	if err := app.queue.Enqueue(t.Context(), retrying); err != nil {
+		t.Fatalf("enqueue cancel job: %v", err)
+	}
+	if _, err := app.queue.MarkRunning(t.Context(), retrying.ID); err != nil {
+		t.Fatalf("mark running cancel job: %v", err)
+	}
+	if _, err := app.queue.Fail(t.Context(), retrying.ID, "boom"); err != nil {
+		t.Fatalf("move cancel job to retrying: %v", err)
+	}
+
+	cancelReq := httptest.NewRequest(http.MethodPost, "/demo/jobs/"+retrying.ID+"/cancel", nil)
+	cancelReq.Header.Set(runtimecore.ConsoleReadActorHeader, "job-operator")
+	cancelResp := httptest.NewRecorder()
+	app.ServeHTTP(cancelResp, cancelReq)
+	if cancelResp.Code != http.StatusOK {
+		t.Fatalf("expected cancel operator 200, got %d: %s", cancelResp.Code, cancelResp.Body.String())
+	}
+	var cancelPayload operatorJobResponsePayload
+	if err := json.Unmarshal(cancelResp.Body.Bytes(), &cancelPayload); err != nil {
+		t.Fatalf("decode cancel response: %v", err)
+	}
+	if cancelPayload.Status != "ok" || cancelPayload.Action != "job.cancel" || cancelPayload.Target != retrying.ID || !cancelPayload.Accepted || cancelPayload.Reason != "job_cancelled" {
+		t.Fatalf("expected normalized cancel response, got %+v", cancelPayload)
+	}
+	cancelledJob, err := app.queue.Inspect(t.Context(), retrying.ID)
+	if err != nil {
+		t.Fatalf("inspect cancelled job: %v", err)
+	}
+	if cancelledJob.Status != runtimecore.JobStatusCancelled {
+		t.Fatalf("expected cancelled job state, got %+v", cancelledJob)
+	}
+
+	entries := app.audits.AuditEntries()
+	if len(entries) != 3 {
+		t.Fatalf("expected pause+resume+cancel audits, got %+v", entries)
+	}
+	if entries[0].Action != "job.pause" || entries[0].Permission != "job:pause" || !entries[0].Allowed || entries[0].Reason != "job_paused" {
+		t.Fatalf("expected pause audit entry, got %+v", entries[0])
+	}
+	if entries[1].Action != "job.resume" || entries[1].Permission != "job:resume" || !entries[1].Allowed || entries[1].Reason != "job_resumed" {
+		t.Fatalf("expected resume audit entry, got %+v", entries[1])
+	}
+	if entries[2].Action != "job.cancel" || entries[2].Permission != "job:cancel" || !entries[2].Allowed || entries[2].Reason != "job_cancelled" {
+		t.Fatalf("expected cancel audit entry, got %+v", entries[2])
+	}
+	console := readRuntimeConsoleResponseAsViewer(t, app, "/api/console?job_query=job-operator")
+	if got := consoleMetaStringSlice(t, console.Meta, "job_operator_actions"); !reflect.DeepEqual(got, []string{"/demo/jobs/{job-id}/pause", "/demo/jobs/{job-id}/resume", "/demo/jobs/{job-id}/cancel", "/demo/jobs/{job-id}/retry"}) {
+		t.Fatalf("expected job operator actions in console meta, got %+v", got)
+	}
+}
+
+func TestRuntimeAppDefaultDevConfigJobOperatorAllowsPauseResumeCancel(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.dev.yaml")
+	raw, err := os.ReadFile(filepath.Join(`D:\Repositories\Elysia-Bot`, `deploy`, `config.dev.yaml`))
+	if err != nil {
+		t.Fatalf("read deploy config: %v", err)
+	}
+	content := strings.ReplaceAll(string(raw), "data/dev/runtime.sqlite", filepath.ToSlash(filepath.Join(dir, "runtime.sqlite")))
+	if err := os.WriteFile(configPath, []byte(content), 0o644); err != nil {
+		t.Fatalf("write isolated deploy config: %v", err)
+	}
+	t.Setenv("BOT_PLATFORM_OPERATOR_TOKEN", "default-dev-admin")
+	t.Setenv("BOT_PLATFORM_OPERATOR_CONFIG_TOKEN", "default-dev-config")
+	t.Setenv("BOT_PLATFORM_OPERATOR_JOB_TOKEN", "default-dev-job")
+	t.Setenv("BOT_PLATFORM_OPERATOR_SCHEDULE_TOKEN", "default-dev-schedule")
+	t.Setenv("BOT_PLATFORM_OPERATOR_VIEWER_TOKEN", "default-dev-viewer")
+
+	app, err := newRuntimeApp(configPath)
+	if err != nil {
+		t.Fatalf("new runtime app from deploy config: %v", err)
+	}
+	defer func() { _ = app.Close() }()
+
+	job := runtimecore.NewJob("job-default-dev-control", "demo.echo", 1, 30*time.Second)
+	if err := app.queue.Enqueue(t.Context(), job); err != nil {
+		t.Fatalf("enqueue default-dev control job: %v", err)
+	}
+	headers := map[string]string{"Authorization": "Bearer default-dev-job"}
+	for _, tc := range []struct {
+		path       string
+		wantAction string
+	}{
+		{path: "/demo/jobs/" + job.ID + "/pause", wantAction: "job.pause"},
+		{path: "/demo/jobs/" + job.ID + "/resume", wantAction: "job.resume"},
+	} {
+		req := httptest.NewRequest(http.MethodPost, tc.path, nil)
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		resp := httptest.NewRecorder()
+		app.ServeHTTP(resp, req)
+		if resp.Code != http.StatusOK {
+			t.Fatalf("expected %s 200 under default dev config, got %d: %s", tc.wantAction, resp.Code, resp.Body.String())
+		}
+		if !strings.Contains(resp.Body.String(), tc.wantAction) {
+			t.Fatalf("expected %s response envelope, got %s", tc.wantAction, resp.Body.String())
+		}
+	}
+	if _, err := app.queue.MarkRunning(t.Context(), job.ID); err != nil {
+		t.Fatalf("mark default-dev control job running: %v", err)
+	}
+	if _, err := app.queue.Fail(t.Context(), job.ID, "boom"); err != nil {
+		t.Fatalf("move default-dev control job to retrying: %v", err)
+	}
+	cancelReq := httptest.NewRequest(http.MethodPost, "/demo/jobs/"+job.ID+"/cancel", nil)
+	cancelReq.Header.Set("Authorization", "Bearer default-dev-job")
+	cancelResp := httptest.NewRecorder()
+	app.ServeHTTP(cancelResp, cancelReq)
+	if cancelResp.Code != http.StatusOK {
+		t.Fatalf("expected job.cancel 200 under default dev config, got %d: %s", cancelResp.Code, cancelResp.Body.String())
+	}
+	if !strings.Contains(cancelResp.Body.String(), `job.cancel`) {
+		t.Fatalf("expected cancel response envelope, got %s", cancelResp.Body.String())
+	}
+}
+
 func TestRuntimeAppPluginEchoConfigOperatorPersistsConfigWithStableEnvelopeAndAllowAudit(t *testing.T) {
 	t.Parallel()
 
@@ -5093,6 +5380,9 @@ func TestRuntimeAppOperatorWriteRoutesRequireBearerAuthWhenOperatorAuthConfigure
 	}{
 		{name: "plugin disable", path: "/demo/plugins/plugin-echo/disable"},
 		{name: "plugin config", path: "/demo/plugins/plugin-echo/config", body: `{"prefix":"unauthorized: "}`},
+		{name: "job pause", path: "/demo/jobs/" + job.ID + "/pause"},
+		{name: "job resume", path: "/demo/jobs/" + job.ID + "/resume"},
+		{name: "job cancel", path: "/demo/jobs/" + job.ID + "/cancel"},
 		{name: "job retry", path: "/demo/jobs/" + job.ID + "/retry"},
 		{name: "schedule cancel", path: "/demo/schedules/schedule-operator-auth/cancel"},
 	}

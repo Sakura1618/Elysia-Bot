@@ -23,6 +23,11 @@ type failingQueuedJobDispatcher struct {
 	err error
 }
 
+type recordingQueuedJobDispatcher struct {
+	jobs []Job
+	err  error
+}
+
 func (s *recordingAlertSink) RecordAlert(_ context.Context, alert AlertRecord) error {
 	if s.err != nil {
 		return s.err
@@ -32,6 +37,11 @@ func (s *recordingAlertSink) RecordAlert(_ context.Context, alert AlertRecord) e
 }
 
 func (d failingQueuedJobDispatcher) DispatchQueuedJob(context.Context, Job) error {
+	return d.err
+}
+
+func (d *recordingQueuedJobDispatcher) DispatchQueuedJob(_ context.Context, job Job) error {
+	d.jobs = append(d.jobs, job)
 	return d.err
 }
 
@@ -120,6 +130,42 @@ func TestJobQueueFailureTriggersRetryWithBackoff(t *testing.T) {
 	}
 	if runningAgain.Status != JobStatusRunning {
 		t.Fatalf("expected running after retry, got %+v", runningAgain)
+	}
+}
+
+func TestJobQueueFailureBackoffRemainsLinearAcrossRetries(t *testing.T) {
+	t.Parallel()
+
+	queue := NewJobQueue()
+	queue.SetWorkerIdentity("runtime-local:test-worker")
+	base := time.Date(2026, 4, 2, 20, 5, 0, 0, time.UTC)
+	queue.now = func() time.Time { return base }
+
+	job := NewJob("job-q-linear-backoff", "file.process", 3, time.Minute)
+	if err := queue.Enqueue(context.Background(), job); err != nil {
+		t.Fatalf("enqueue job: %v", err)
+	}
+	if _, err := queue.MarkRunning(context.Background(), job.ID); err != nil {
+		t.Fatalf("mark running first attempt: %v", err)
+	}
+	firstRetry, err := queue.Fail(context.Background(), job.ID, "boom-1")
+	if err != nil {
+		t.Fatalf("first fail: %v", err)
+	}
+	if firstRetry.NextRunAt == nil || !firstRetry.NextRunAt.Equal(base.Add(1*time.Second)) {
+		t.Fatalf("expected first retry backoff to stay linear at 1s, got %+v", firstRetry)
+	}
+
+	queue.now = func() time.Time { return base.Add(10 * time.Second) }
+	if _, err := queue.Retry(context.Background(), job.ID); err != nil {
+		t.Fatalf("retry first failure: %v", err)
+	}
+	secondRetry, err := queue.Fail(context.Background(), job.ID, "boom-2")
+	if err != nil {
+		t.Fatalf("second fail: %v", err)
+	}
+	if secondRetry.NextRunAt == nil || !secondRetry.NextRunAt.Equal(base.Add(12*time.Second)) {
+		t.Fatalf("expected second retry backoff to stay linear at 2s, got %+v", secondRetry)
 	}
 }
 
@@ -485,6 +531,136 @@ func TestJobQueueCanCancelPendingAndRetryingJobs(t *testing.T) {
 	}
 }
 
+func TestJobQueuePauseAndResumePendingAndRetryingJobs(t *testing.T) {
+	t.Parallel()
+
+	queue := NewJobQueue()
+	base := time.Date(2026, 4, 2, 22, 10, 0, 0, time.UTC)
+	queue.now = func() time.Time { return base }
+
+	pending := NewJob("job-q-pause-pending", "ai.call", 1, 30*time.Second)
+	if err := queue.Enqueue(context.Background(), pending); err != nil {
+		t.Fatalf("enqueue pending job: %v", err)
+	}
+	pausedPending, err := queue.Pause(context.Background(), pending.ID)
+	if err != nil {
+		t.Fatalf("pause pending job: %v", err)
+	}
+	if pausedPending.Status != JobStatusPaused || pausedPending.NextRunAt != nil {
+		t.Fatalf("expected paused pending job, got %+v", pausedPending)
+	}
+	if ready := queue.ReadyJobs(base.Add(10 * time.Second)); len(ready) != 0 {
+		t.Fatalf("expected paused pending job to stay out of ready set, got %+v", ready)
+	}
+	resumedPending, err := queue.Resume(context.Background(), pending.ID)
+	if err != nil {
+		t.Fatalf("resume pending job: %v", err)
+	}
+	if resumedPending.Status != JobStatusPending || resumedPending.LastError != "" || resumedPending.ReasonCode != "" {
+		t.Fatalf("expected resumed pending job without retry metadata, got %+v", resumedPending)
+	}
+
+	retrying := NewJob("job-q-pause-retrying", "ai.call", 2, 30*time.Second)
+	if err := queue.Enqueue(context.Background(), retrying); err != nil {
+		t.Fatalf("enqueue retrying job: %v", err)
+	}
+	if _, err := queue.MarkRunning(context.Background(), retrying.ID); err != nil {
+		t.Fatalf("mark running retrying job: %v", err)
+	}
+	retryingState, err := queue.Fail(context.Background(), retrying.ID, "boom")
+	if err != nil {
+		t.Fatalf("fail retrying job: %v", err)
+	}
+	if retryingState.NextRunAt == nil {
+		t.Fatalf("expected retrying next run timestamp, got %+v", retryingState)
+	}
+	pausedRetrying, err := queue.Pause(context.Background(), retrying.ID)
+	if err != nil {
+		t.Fatalf("pause retrying job: %v", err)
+	}
+	if pausedRetrying.Status != JobStatusPaused || pausedRetrying.RetryCount != 1 || pausedRetrying.NextRunAt == nil || !pausedRetrying.NextRunAt.Equal(*retryingState.NextRunAt) || pausedRetrying.LastError != "boom" || pausedRetrying.ReasonCode != JobReasonCodeExecutionRetry {
+		t.Fatalf("expected paused retrying job to preserve retry metadata, got %+v", pausedRetrying)
+	}
+	if ready := queue.ReadyJobs(base.Add(10 * time.Second)); len(ready) != 1 || ready[0].ID != pending.ID {
+		t.Fatalf("expected only resumed pending job to be ready while retry is paused, got %+v", ready)
+	}
+	resumedRetrying, err := queue.Resume(context.Background(), retrying.ID)
+	if err != nil {
+		t.Fatalf("resume retrying job: %v", err)
+	}
+	if resumedRetrying.Status != JobStatusRetrying || resumedRetrying.RetryCount != 1 || resumedRetrying.NextRunAt == nil || !resumedRetrying.NextRunAt.Equal(*retryingState.NextRunAt) || resumedRetrying.LastError != "boom" || resumedRetrying.ReasonCode != JobReasonCodeExecutionRetry {
+		t.Fatalf("expected resumed retrying job to preserve retry metadata, got %+v", resumedRetrying)
+	}
+
+	metricsOutput := queue.metrics.RenderPrometheus()
+	if !strings.Contains(metricsOutput, "bot_platform_job_count{status=\"paused\"} 0") || !strings.Contains(metricsOutput, "bot_platform_job_count{status=\"pending\"} 1") || !strings.Contains(metricsOutput, "bot_platform_job_count{status=\"retrying\"} 1") {
+		t.Fatalf("expected pause/resume metrics to clear paused count and preserve queue counts, got %s", metricsOutput)
+	}
+}
+
+func TestJobQueueDispatchReadySkipsPausedJobs(t *testing.T) {
+	t.Parallel()
+
+	queue := NewJobQueue()
+	queue.SetWorkerIdentity("runtime-local:test-worker")
+	now := time.Date(2026, 4, 9, 15, 0, 0, 0, time.UTC)
+	queue.now = func() time.Time { return now }
+	dispatcher := &recordingQueuedJobDispatcher{}
+	if err := queue.RegisterDispatcher("ai.call", dispatcher); err != nil {
+		t.Fatalf("register dispatcher: %v", err)
+	}
+
+	pausedPending := NewJob("job-dispatch-paused-pending", "ai.call", 1, 30*time.Second)
+	pausedPending.CreatedAt = now.Add(-3 * time.Second)
+	if err := queue.Enqueue(context.Background(), pausedPending); err != nil {
+		t.Fatalf("enqueue paused pending job: %v", err)
+	}
+	if _, err := queue.Pause(context.Background(), pausedPending.ID); err != nil {
+		t.Fatalf("pause pending job: %v", err)
+	}
+
+	pausedRetrying := NewJob("job-dispatch-paused-retrying", "ai.call", 2, 30*time.Second)
+	pausedRetrying.CreatedAt = now.Add(-2 * time.Second)
+	if err := queue.Enqueue(context.Background(), pausedRetrying); err != nil {
+		t.Fatalf("enqueue paused retrying job: %v", err)
+	}
+	if _, err := queue.MarkRunning(context.Background(), pausedRetrying.ID); err != nil {
+		t.Fatalf("mark running paused retrying job: %v", err)
+	}
+	if _, err := queue.Fail(context.Background(), pausedRetrying.ID, "boom"); err != nil {
+		t.Fatalf("fail paused retrying job: %v", err)
+	}
+	if _, err := queue.Pause(context.Background(), pausedRetrying.ID); err != nil {
+		t.Fatalf("pause retrying job: %v", err)
+	}
+
+	ready := NewJob("job-dispatch-ready", "ai.call", 1, 30*time.Second)
+	ready.CreatedAt = now.Add(-1 * time.Second)
+	if err := queue.Enqueue(context.Background(), ready); err != nil {
+		t.Fatalf("enqueue ready job: %v", err)
+	}
+
+	queue.DispatchReady(context.Background(), now.Add(10*time.Second))
+
+	if len(dispatcher.jobs) != 1 || dispatcher.jobs[0].ID != ready.ID || dispatcher.jobs[0].Status != JobStatusRunning {
+		t.Fatalf("expected only non-paused job to dispatch, got %+v", dispatcher.jobs)
+	}
+	storedPausedPending, err := queue.Inspect(context.Background(), pausedPending.ID)
+	if err != nil {
+		t.Fatalf("inspect paused pending job: %v", err)
+	}
+	if storedPausedPending.Status != JobStatusPaused {
+		t.Fatalf("expected paused pending job to stay paused, got %+v", storedPausedPending)
+	}
+	storedPausedRetrying, err := queue.Inspect(context.Background(), pausedRetrying.ID)
+	if err != nil {
+		t.Fatalf("inspect paused retrying job: %v", err)
+	}
+	if storedPausedRetrying.Status != JobStatusPaused {
+		t.Fatalf("expected paused retrying job to stay paused, got %+v", storedPausedRetrying)
+	}
+}
+
 func TestJobQueueRejectsCancelForRunningAndTerminalJobs(t *testing.T) {
 	t.Parallel()
 
@@ -532,6 +708,36 @@ func TestJobQueueRejectsCancelForRunningAndTerminalJobs(t *testing.T) {
 	queue.jobs[failed.ID] = failed
 	if _, err := queue.Cancel(context.Background(), failed.ID); err == nil {
 		t.Fatal("expected failed job cancel to fail")
+	}
+
+	paused := NewJob("job-q-paused", "ai.call", 1, 30*time.Second)
+	if err := queue.Enqueue(context.Background(), paused); err != nil {
+		t.Fatalf("enqueue paused job: %v", err)
+	}
+	if _, err := queue.Pause(context.Background(), paused.ID); err != nil {
+		t.Fatalf("pause job: %v", err)
+	}
+	if _, err := queue.Cancel(context.Background(), paused.ID); err == nil {
+		t.Fatal("expected paused job cancel to fail")
+	}
+}
+
+func TestJobQueueRejectsPauseResumeOutsidePreDispatchStates(t *testing.T) {
+	t.Parallel()
+
+	queue := NewJobQueue()
+	job := NewJob("job-q-pause-invalid", "ai.call", 1, 30*time.Second)
+	if err := queue.Enqueue(context.Background(), job); err != nil {
+		t.Fatalf("enqueue job: %v", err)
+	}
+	if _, err := queue.Resume(context.Background(), job.ID); err == nil {
+		t.Fatal("expected resume for non-paused job to fail")
+	}
+	if _, err := queue.MarkRunning(context.Background(), job.ID); err != nil {
+		t.Fatalf("mark running: %v", err)
+	}
+	if _, err := queue.Pause(context.Background(), job.ID); err == nil {
+		t.Fatal("expected running job pause to fail")
 	}
 }
 
@@ -593,6 +799,52 @@ func TestJobQueuePersistsLifecycleTransitionsToSQLiteStore(t *testing.T) {
 	}
 	if stored.NextRunAt == nil {
 		t.Fatalf("expected persisted next run timestamp, got %+v", stored)
+	}
+}
+
+func TestJobQueuePersistsPauseAndResumeToSQLiteStore(t *testing.T) {
+	t.Parallel()
+
+	store := openTempSQLiteStore(t)
+	defer func() { _ = store.Close() }()
+
+	queue := NewJobQueue()
+	queue.SetStore(store)
+	base := time.Date(2026, 4, 7, 11, 7, 0, 0, time.UTC)
+	queue.now = func() time.Time { return base }
+
+	job := NewJob("job-persist-pause-resume", "ai.chat", 2, 30*time.Second)
+	if err := queue.Enqueue(context.Background(), job); err != nil {
+		t.Fatalf("enqueue job: %v", err)
+	}
+	if _, err := queue.MarkRunning(context.Background(), job.ID); err != nil {
+		t.Fatalf("mark running: %v", err)
+	}
+	retrying, err := queue.Fail(context.Background(), job.ID, "mock upstream failure")
+	if err != nil {
+		t.Fatalf("fail job: %v", err)
+	}
+	if _, err := queue.Pause(context.Background(), job.ID); err != nil {
+		t.Fatalf("pause job: %v", err)
+	}
+
+	pausedStored, err := store.LoadJob(context.Background(), job.ID)
+	if err != nil {
+		t.Fatalf("load paused job from store: %v", err)
+	}
+	if pausedStored.Status != JobStatusPaused || pausedStored.NextRunAt == nil || !pausedStored.NextRunAt.Equal(*retrying.NextRunAt) || pausedStored.LastError != "mock upstream failure" {
+		t.Fatalf("expected persisted paused job to keep retry schedule, got %+v", pausedStored)
+	}
+
+	if _, err := queue.Resume(context.Background(), job.ID); err != nil {
+		t.Fatalf("resume job: %v", err)
+	}
+	resumedStored, err := store.LoadJob(context.Background(), job.ID)
+	if err != nil {
+		t.Fatalf("load resumed job from store: %v", err)
+	}
+	if resumedStored.Status != JobStatusRetrying || resumedStored.NextRunAt == nil || !resumedStored.NextRunAt.Equal(*retrying.NextRunAt) || resumedStored.LastError != "mock upstream failure" || resumedStored.ReasonCode != JobReasonCodeExecutionRetry {
+		t.Fatalf("expected persisted resumed retrying job to preserve retry metadata, got %+v", resumedStored)
 	}
 }
 

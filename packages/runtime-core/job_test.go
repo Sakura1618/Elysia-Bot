@@ -68,6 +68,54 @@ func TestJobTransitionRetryAndDeadLetter(t *testing.T) {
 	}
 }
 
+func TestJobCanPauseAndResumePreDispatchStates(t *testing.T) {
+	t.Parallel()
+
+	at := time.Date(2026, 4, 2, 19, 7, 0, 0, time.UTC)
+	pending := NewJob("job-pause-pending", "ai.call", 1, time.Minute)
+
+	pausedPending, err := pending.Transition(JobStatusPaused, at, "")
+	if err != nil {
+		t.Fatalf("pause pending job: %v", err)
+	}
+	if pausedPending.Status != JobStatusPaused || pausedPending.NextRunAt != nil || pausedPending.ExplainStatus() != "job is paused before dispatch" {
+		t.Fatalf("expected paused pending job, got %+v", pausedPending)
+	}
+
+	resumedPending, err := pausedPending.Transition(JobStatusPending, at.Add(time.Second), "")
+	if err != nil {
+		t.Fatalf("resume paused pending job: %v", err)
+	}
+	if resumedPending.Status != JobStatusPending || resumedPending.NextRunAt != nil {
+		t.Fatalf("expected resumed pending job, got %+v", resumedPending)
+	}
+
+	running, err := NewJob("job-pause-retrying", "ai.call", 2, time.Minute).Transition(JobStatusRunning, at, "")
+	if err != nil {
+		t.Fatalf("start retrying job: %v", err)
+	}
+	retryingAt := at.Add(2 * time.Second)
+	retrying, err := running.Transition(JobStatusRetrying, retryingAt, "boom")
+	if err != nil {
+		t.Fatalf("transition to retrying: %v", err)
+	}
+	pausedRetrying, err := retrying.Transition(JobStatusPaused, retryingAt.Add(time.Second), "")
+	if err != nil {
+		t.Fatalf("pause retrying job: %v", err)
+	}
+	if pausedRetrying.Status != JobStatusPaused || pausedRetrying.RetryCount != 1 || pausedRetrying.NextRunAt == nil || !pausedRetrying.NextRunAt.Equal(retryingAt) || pausedRetrying.LastError != "boom" {
+		t.Fatalf("expected paused retrying job to preserve retry schedule, got %+v", pausedRetrying)
+	}
+
+	resumedRetrying, err := pausedRetrying.Transition(JobStatusRetrying, retryingAt.Add(5*time.Second), "")
+	if err != nil {
+		t.Fatalf("resume paused retrying job: %v", err)
+	}
+	if resumedRetrying.Status != JobStatusRetrying || resumedRetrying.RetryCount != 1 || resumedRetrying.NextRunAt == nil || !resumedRetrying.NextRunAt.Equal(retryingAt) || resumedRetrying.LastError != "boom" {
+		t.Fatalf("expected resumed retrying job to preserve backoff state, got %+v", resumedRetrying)
+	}
+}
+
 func TestJobRejectsInvalidTransition(t *testing.T) {
 	t.Parallel()
 

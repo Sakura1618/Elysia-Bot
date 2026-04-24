@@ -51,8 +51,20 @@ func TestWorkflowAdvanceResumeAndPersistState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("call job step: %v", err)
 	}
-	if workflow.State["state-key"] != "state-value" || workflow.State["job-key"] != "job-ai" {
+	if workflow.State["state-key"] != "state-value" {
 		t.Fatalf("unexpected workflow state %+v", workflow.State)
+	}
+	if workflow.WaitingForJob == nil || workflow.WaitingForJob.JobID != "job-ai" || workflow.CurrentIndex != 2 {
+		t.Fatalf("expected workflow to block on child job, got %+v", workflow)
+	}
+
+	workflow, err = workflow.ResumeWithChildJob(WorkflowJobResult{JobID: "job-ai", Status: JobStatusDone})
+	if err != nil {
+		t.Fatalf("resume with child job: %v", err)
+	}
+	jobState, ok := workflow.State["job-key"].(map[string]any)
+	if !ok || jobState["job_id"] != "job-ai" || jobState["status"] != string(JobStatusDone) {
+		t.Fatalf("expected child job result state after resume, got %+v", workflow.State["job-key"])
 	}
 
 	workflow, err = workflow.Advance(now)
@@ -79,8 +91,45 @@ func TestWorkflowAdvanceResumeAndPersistState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("compensate step: %v", err)
 	}
+	if !workflow.Completed || workflow.Compensated {
+		t.Fatalf("expected completed non-compensated workflow after successful child job, got %+v", workflow)
+	}
+}
+
+func TestWorkflowCallJobFailureRequiresCompensation(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 4, 3, 15, 30, 0, 0, time.UTC)
+	workflow := NewWorkflow(
+		"wf-call-job-failure",
+		WorkflowStep{Kind: WorkflowStepKindCallJob, Name: "job-key", Value: "job-failed"},
+		WorkflowStep{Kind: WorkflowStepKindCompensate, Name: "compensate-1"},
+	)
+
+	workflow, err := workflow.Advance(now)
+	if err != nil {
+		t.Fatalf("advance call job step: %v", err)
+	}
+	if workflow.WaitingForJob == nil || workflow.WaitingForJob.JobID != "job-failed" {
+		t.Fatalf("expected waiting child job state, got %+v", workflow)
+	}
+	workflow, err = workflow.ResumeWithChildJob(WorkflowJobResult{JobID: "job-failed", Status: JobStatusDead, ReasonCode: JobReasonCodeExecutionDead, LastError: "boom"})
+	if err != nil {
+		t.Fatalf("resume failed child job: %v", err)
+	}
+	workflow, err = workflow.Advance(now)
+	if err != nil {
+		t.Fatalf("advance compensate step: %v", err)
+	}
 	if !workflow.Completed || !workflow.Compensated {
-		t.Fatalf("expected completed compensated workflow, got %+v", workflow)
+		t.Fatalf("expected compensated workflow after failed child job, got %+v", workflow)
+	}
+	jobState, ok := workflow.State["job-key"].(map[string]any)
+	if !ok || jobState["reason_code"] != string(JobReasonCodeExecutionDead) || jobState["last_error"] != "boom" {
+		t.Fatalf("expected failed child job result state, got %+v", workflow.State["job-key"])
+	}
+	if workflow.LastJobResult == nil || workflow.LastJobResult.Status != JobStatusDead {
+		t.Fatalf("expected workflow to retain last child job result, got %+v", workflow.LastJobResult)
 	}
 }
 
@@ -147,6 +196,256 @@ func TestWorkflowRuntimeRestoresPersistedSleepingWorkflow(t *testing.T) {
 	}
 	if persisted.Status != WorkflowRuntimeStatusCompleted || !persisted.Workflow.Completed {
 		t.Fatalf(`expected restored workflow to persist completed state, got %+v`, persisted)
+	}
+}
+
+func TestWorkflowRuntimeResumeFromChildJobPersistsWaitingStateAndSuccessResult(t *testing.T) {
+	t.Parallel()
+
+	store := openTempSQLiteStore(t)
+	defer func() { _ = store.Close() }()
+	runtime := NewWorkflowRuntime(store)
+	now := time.Date(2026, 4, 23, 14, 0, 0, 0, time.UTC)
+	runtime.now = func() time.Time { return now }
+	ctx := context.Background()
+	initial := NewWorkflow(
+		`wf-call-job-runtime`,
+		WorkflowStep{Kind: WorkflowStepKindPersist, Name: `greeting`, Value: `hello`},
+		WorkflowStep{Kind: WorkflowStepKindCallJob, Name: `child-job`, Value: `job-child-1`},
+		WorkflowStep{Kind: WorkflowStepKindCompensate, Name: `compensate`},
+	)
+
+	started, err := runtime.StartOrResume(testWorkflowContext(ctx, `plugin-workflow-demo`, `start-child-job`), `wf-call-job-runtime`, `plugin-workflow-demo`, `message.received`, `evt-start-child-job`, initial)
+	if err != nil {
+		t.Fatalf(`start workflow: %v`, err)
+	}
+	if !started.Started || started.Instance.Status != WorkflowRuntimeStatusWaitingJob {
+		t.Fatalf(`expected waiting_job workflow after start, got %+v`, started)
+	}
+	if started.Instance.Workflow.WaitingForJob == nil || started.Instance.Workflow.WaitingForJob.JobID != `job-child-1` {
+		t.Fatalf(`expected persisted waiting child job state, got %+v`, started.Instance.Workflow)
+	}
+
+	persistedStarted, err := store.LoadWorkflowInstance(ctx, `wf-call-job-runtime`)
+	if err != nil {
+		t.Fatalf(`load started workflow: %v`, err)
+	}
+	if persistedStarted.Status != WorkflowRuntimeStatusWaitingJob || persistedStarted.Workflow.WaitingForJob == nil || persistedStarted.Workflow.WaitingForJob.JobID != `job-child-1` {
+		t.Fatalf(`expected persisted waiting_job state, got %+v`, persistedStarted)
+	}
+	if persistedStarted.LastEventID != `evt-start-child-job` || persistedStarted.LastEventType != `message.received` {
+		t.Fatalf(`expected start event cursor to remain on ingress event, got %+v`, persistedStarted)
+	}
+
+	resumed, err := runtime.ResumeFromChildJob(ctx, `wf-call-job-runtime`, `plugin-workflow-demo`, WorkflowChildJobResume{JobID: `job-child-1`, Status: JobStatusDone})
+	if err != nil {
+		t.Fatalf(`resume from child job: %v`, err)
+	}
+	if !resumed.Resumed || resumed.Instance.Status != WorkflowRuntimeStatusCompleted {
+		t.Fatalf(`expected resumed completed workflow after successful child job, got %+v`, resumed)
+	}
+	if resumed.Instance.Workflow.Compensated {
+		t.Fatalf(`expected successful child job not to trigger compensation, got %+v`, resumed.Instance.Workflow)
+	}
+	jobState, ok := resumed.Instance.Workflow.State[`child-job`].(map[string]any)
+	if !ok || jobState[`job_id`] != `job-child-1` || jobState[`status`] != string(JobStatusDone) {
+		t.Fatalf(`expected successful child job result state, got %+v`, resumed.Instance.Workflow.State[`child-job`])
+	}
+
+	persistedResumed, err := store.LoadWorkflowInstance(ctx, `wf-call-job-runtime`)
+	if err != nil {
+		t.Fatalf(`load resumed workflow: %v`, err)
+	}
+	if persistedResumed.Status != WorkflowRuntimeStatusCompleted || !persistedResumed.Workflow.Completed || persistedResumed.Workflow.WaitingForJob != nil {
+		t.Fatalf(`expected persisted completed workflow after child resume, got %+v`, persistedResumed)
+	}
+	if persistedResumed.LastEventID != `job.result:job-child-1` || persistedResumed.LastEventType != `job.result` {
+		t.Fatalf(`expected child-job resume boundary to avoid ingress event cursor rewrite, got %+v`, persistedResumed)
+	}
+	if persistedResumed.TraceID != `trace-start-child-job` || persistedResumed.EventID != `evt-start-child-job` || persistedResumed.RunID != `run-start-child-job` || persistedResumed.CorrelationID != `corr-start-child-job` {
+		t.Fatalf(`expected origin observability ids to stay stable after child-job resume, got %+v`, persistedResumed)
+	}
+	if _, err := runtime.StartOrResume(testWorkflowContext(ctx, `plugin-workflow-demo`, `event-during-child-wait`), `wf-call-job-runtime`, `plugin-workflow-demo`, `message.received`, `evt-during-child-wait`, Workflow{}); err == nil {
+		t.Fatal(`expected ingress resume to be rejected while workflow waits for child job result`)
+	}
+
+	metricsOutput := runtime.metrics.RenderPrometheus()
+	for _, expected := range []string{
+		`bot_platform_workflow_transition_total{plugin_id="plugin-workflow-demo",outcome="started"} 1`,
+		`bot_platform_workflow_transition_total{plugin_id="plugin-workflow-demo",outcome="resumed"} 1`,
+		`bot_platform_workflow_instance_count{status="waiting_job"} 0`,
+		`bot_platform_workflow_instance_count{status="completed"} 1`,
+	} {
+		if !strings.Contains(metricsOutput, expected) {
+			t.Fatalf(`expected workflow metrics output to contain %q, got %s`, expected, metricsOutput)
+		}
+	}
+}
+
+func TestWorkflowRuntimeResumeFromChildJobFailureTriggersCompensationAndRestoreContinuity(t *testing.T) {
+	t.Parallel()
+
+	store := openTempSQLiteStore(t)
+	defer func() { _ = store.Close() }()
+	ctx := context.Background()
+	createdAt := time.Date(2026, 4, 24, 9, 0, 0, 0, time.UTC)
+	workflow := NewWorkflow(
+		`wf-child-job-restore`,
+		WorkflowStep{Kind: WorkflowStepKindPersist, Name: `greeting`, Value: `hello`},
+		WorkflowStep{Kind: WorkflowStepKindCallJob, Name: `child-job`, Value: `job-child-dead`},
+		WorkflowStep{Kind: WorkflowStepKindCompensate, Name: `compensate`},
+	)
+	workflow.State[`greeting`] = `hello`
+	workflow.CurrentIndex = 1
+	workflow.WaitingForJob = &WorkflowCallJobState{StepName: `child-job`, JobID: `job-child-dead`}
+
+	if err := store.SaveWorkflowInstance(ctx, WorkflowInstanceState{
+		WorkflowID:    `wf-child-job-restore`,
+		PluginID:      `plugin-workflow-demo`,
+		TraceID:       `trace-child-job-restore`,
+		EventID:       `evt-child-job-restore-origin`,
+		RunID:         `run-child-job-restore`,
+		CorrelationID: `corr-child-job-restore`,
+		Status:        WorkflowRuntimeStatusWaitingJob,
+		Workflow:      workflow,
+		LastEventID:   `evt-child-job-restore-last`,
+		LastEventType: `message.received`,
+		CreatedAt:     createdAt,
+		UpdatedAt:     createdAt,
+	}); err != nil {
+		t.Fatalf(`save waiting child-job workflow: %v`, err)
+	}
+
+	restarted := NewWorkflowRuntime(store)
+	restarted.now = func() time.Time { return createdAt.Add(5 * time.Minute) }
+	if err := restarted.Restore(ctx); err != nil {
+		t.Fatalf(`restore workflow runtime: %v`, err)
+	}
+	snapshot := restarted.LastRecoverySnapshot()
+	if snapshot.TotalWorkflows != 1 || snapshot.RecoveredWorkflows != 1 || snapshot.StatusCounts[WorkflowRuntimeStatusWaitingJob] != 1 {
+		t.Fatalf(`expected waiting_job workflow to survive restore unchanged, got %+v`, snapshot)
+	}
+	restored, err := restarted.Load(ctx, `wf-child-job-restore`)
+	if err != nil {
+		t.Fatalf(`load restored workflow: %v`, err)
+	}
+	if restored.Status != WorkflowRuntimeStatusWaitingJob || restored.Workflow.WaitingForJob == nil || restored.Workflow.WaitingForJob.JobID != `job-child-dead` {
+		t.Fatalf(`expected restored workflow to remain blocked on child job, got %+v`, restored)
+	}
+
+	resumed, err := restarted.ResumeFromChildJob(ctx, `wf-child-job-restore`, `plugin-workflow-demo`, WorkflowChildJobResume{JobID: `job-child-dead`, Status: JobStatusDead, ReasonCode: JobReasonCodeExecutionDead, LastError: `boom`})
+	if err != nil {
+		t.Fatalf(`resume from failed child job: %v`, err)
+	}
+	if !resumed.Resumed || resumed.Instance.Status != WorkflowRuntimeStatusCompleted || !resumed.Instance.Workflow.Compensated {
+		t.Fatalf(`expected failed child job to complete with compensation, got %+v`, resumed)
+	}
+	jobState, ok := resumed.Instance.Workflow.State[`child-job`].(map[string]any)
+	if !ok || jobState[`reason_code`] != string(JobReasonCodeExecutionDead) || jobState[`last_error`] != `boom` {
+		t.Fatalf(`expected failed child job state to persist reason and error, got %+v`, resumed.Instance.Workflow.State[`child-job`])
+	}
+	if resumed.Instance.LastEventID != `job.result:job-child-dead` || resumed.Instance.LastEventType != `job.result` {
+		t.Fatalf(`expected child-job resume not to rewrite last ingress event id, got %+v`, resumed.Instance)
+	}
+	if _, err := restarted.ResumeFromChildJob(ctx, `wf-child-job-restore`, `plugin-workflow-demo`, WorkflowChildJobResume{JobID: `job-child-dead`, Status: JobStatusDone}); err == nil {
+		t.Fatal(`expected child-job resume to reject already-completed workflow boundary`)
+	}
+}
+
+func TestWorkflowRuntimeResumeFromChildJobRejectsNonTerminalAndWrongJobID(t *testing.T) {
+	t.Parallel()
+
+	store := openTempSQLiteStore(t)
+	defer func() { _ = store.Close() }()
+	runtime := NewWorkflowRuntime(store)
+	runtime.now = func() time.Time { return time.Date(2026, 4, 24, 11, 0, 0, 0, time.UTC) }
+	ctx := context.Background()
+	initial := NewWorkflow(
+		`wf-child-job-errors`,
+		WorkflowStep{Kind: WorkflowStepKindCallJob, Name: `child-job`, Value: `job-child-errors`},
+	)
+	if _, err := runtime.StartOrResume(testWorkflowContext(ctx, `plugin-workflow-demo`, `start-child-job-errors`), `wf-child-job-errors`, `plugin-workflow-demo`, `message.received`, `evt-start-child-job-errors`, initial); err != nil {
+		t.Fatalf(`start workflow: %v`, err)
+	}
+	if _, err := runtime.ResumeFromChildJob(ctx, `wf-child-job-errors`, `plugin-workflow-demo`, WorkflowChildJobResume{JobID: `job-child-errors`, Status: JobStatusRunning}); err == nil {
+		t.Fatal(`expected non-terminal child status to be rejected`)
+	}
+	if _, err := runtime.ResumeFromChildJob(ctx, `wf-child-job-errors`, `plugin-workflow-demo`, WorkflowChildJobResume{JobID: `job-unexpected`, Status: JobStatusDone}); err == nil {
+		t.Fatal(`expected wrong child job id to be rejected`)
+	}
+	persisted, err := store.LoadWorkflowInstance(ctx, `wf-child-job-errors`)
+	if err != nil {
+		t.Fatalf(`load workflow after rejected child resumes: %v`, err)
+	}
+	if persisted.Status != WorkflowRuntimeStatusWaitingJob || persisted.Workflow.WaitingForJob == nil || persisted.Workflow.LastJobResult != nil {
+		t.Fatalf(`expected rejected child resumes to leave workflow waiting state unchanged, got %+v`, persisted)
+	}
+}
+
+func TestWorkflowRuntimeRestoreReconcilesWaitingChildJobWithPersistedTerminalResult(t *testing.T) {
+	t.Parallel()
+
+	store := openTempSQLiteStore(t)
+	defer func() { _ = store.Close() }()
+	ctx := context.Background()
+	now := time.Date(2026, 4, 25, 10, 0, 0, 0, time.UTC)
+	workflow := NewWorkflow(
+		`wf-child-job-reconcile`,
+		WorkflowStep{Kind: WorkflowStepKindPersist, Name: `greeting`, Value: `hello`},
+		WorkflowStep{Kind: WorkflowStepKindCallJob, Name: `child-job`, Value: `job-child-reconcile`},
+		WorkflowStep{Kind: WorkflowStepKindCompensate, Name: `compensate`},
+	)
+	workflow.State[`greeting`] = `hello`
+	workflow.CurrentIndex = 1
+	workflow.WaitingForJob = &WorkflowCallJobState{StepName: `child-job`, JobID: `job-child-reconcile`}
+	if err := store.SaveWorkflowInstance(ctx, WorkflowInstanceState{
+		WorkflowID:    `wf-child-job-reconcile`,
+		PluginID:      `plugin-workflow-demo`,
+		TraceID:       `trace-child-job-reconcile`,
+		EventID:       `evt-child-job-reconcile-origin`,
+		RunID:         `run-child-job-reconcile`,
+		CorrelationID: `corr-child-job-reconcile`,
+		Status:        WorkflowRuntimeStatusWaitingJob,
+		Workflow:      workflow,
+		LastEventID:   `evt-child-job-reconcile-ingress`,
+		LastEventType: `message.received`,
+		CreatedAt:     now.Add(-time.Minute),
+		UpdatedAt:     now.Add(-time.Minute),
+	}); err != nil {
+		t.Fatalf(`save waiting child-job workflow: %v`, err)
+	}
+	terminalJob := NewJob(`job-child-reconcile`, `ai.chat`, 0, 30*time.Second)
+	terminalJob.TraceID = `trace-child-job-reconcile`
+	terminalJob.EventID = `evt-child-job-reconcile-origin`
+	terminalJob.RunID = `run-child-job-reconcile`
+	terminalJob.Correlation = `corr-child-job-reconcile`
+	terminalJob.Status = JobStatusCancelled
+	terminalJob.ReasonCode = JobReasonCodeTimeout
+	terminalJob.LastError = `cancelled during crash window`
+	finishedAt := now.Add(-30 * time.Second)
+	terminalJob.FinishedAt = &finishedAt
+	if err := store.SaveJob(ctx, terminalJob); err != nil {
+		t.Fatalf(`save terminal child job: %v`, err)
+	}
+
+	runtime := NewWorkflowRuntime(store)
+	runtime.now = func() time.Time { return now }
+	if err := runtime.Restore(ctx); err != nil {
+		t.Fatalf(`restore workflow runtime: %v`, err)
+	}
+	restored, err := runtime.Load(ctx, `wf-child-job-reconcile`)
+	if err != nil {
+		t.Fatalf(`load reconciled workflow: %v`, err)
+	}
+	if restored.Status != WorkflowRuntimeStatusCompleted || !restored.Workflow.Completed || !restored.Workflow.Compensated {
+		t.Fatalf(`expected restore-time reconciliation to complete workflow with compensation, got %+v`, restored)
+	}
+	if restored.LastEventID != `job.result:job-child-reconcile` || restored.LastEventType != `job.result` {
+		t.Fatalf(`expected reconciled restore checkpoint to point at child job result, got %+v`, restored)
+	}
+	jobState, ok := restored.Workflow.State[`child-job`].(map[string]any)
+	if !ok || jobState[`status`] != string(JobStatusCancelled) || jobState[`reason_code`] != string(JobReasonCodeTimeout) {
+		t.Fatalf(`expected reconciled restore to persist terminal child result, got %+v`, restored.Workflow.State[`child-job`])
 	}
 }
 

@@ -1329,6 +1329,75 @@ func TestSQLiteStateStorePersistsWorkflowInstancesAcrossReopen(t *testing.T) {
 	}
 }
 
+func TestSQLiteStateStorePersistsWaitingJobWorkflowInstancesAcrossReopen(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), `state.db`)
+	ctx := context.Background()
+	workflow := NewWorkflow(
+		`workflow-job-wait-1`,
+		WorkflowStep{Kind: WorkflowStepKindPersist, Name: `greeting`, Value: `hello`},
+		WorkflowStep{Kind: WorkflowStepKindCallJob, Name: `child-job`, Value: `job-state-reopen`},
+		WorkflowStep{Kind: WorkflowStepKindCompensate, Name: `compensate`},
+	)
+	workflow.State[`greeting`] = `hello`
+	workflow.CurrentIndex = 1
+	workflow.WaitingForJob = &WorkflowCallJobState{StepName: `child-job`, JobID: `job-state-reopen`}
+	workflow.LastJobResult = &WorkflowJobResult{StepName: `child-job`, JobID: `job-state-reopen-prior`, Status: JobStatusCancelled, ReasonCode: JobReasonCodeTimeout, LastError: `prior timeout`}
+	createdAt := time.Date(2026, 4, 24, 12, 0, 0, 0, time.UTC)
+	updatedAt := createdAt.Add(time.Minute)
+
+	store, err := OpenSQLiteStateStore(path)
+	if err != nil {
+		t.Fatalf(`open store: %v`, err)
+	}
+	if err := store.SaveWorkflowInstance(ctx, WorkflowInstanceState{
+		WorkflowID:    `workflow-job-wait-1`,
+		PluginID:      `plugin-workflow-demo`,
+		TraceID:       `trace-workflow-job-reopen`,
+		EventID:       `evt-workflow-job-reopen-origin`,
+		RunID:         `run-workflow-job-reopen`,
+		CorrelationID: `corr-workflow-job-reopen`,
+		Status:        WorkflowRuntimeStatusWaitingJob,
+		Workflow:      workflow,
+		LastEventID:   `evt-workflow-job-reopen-last`,
+		LastEventType: `job.result`,
+		CreatedAt:     createdAt,
+		UpdatedAt:     updatedAt,
+	}); err != nil {
+		t.Fatalf(`save workflow instance: %v`, err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf(`close store: %v`, err)
+	}
+
+	reopened, err := OpenSQLiteStateStore(path)
+	if err != nil {
+		t.Fatalf(`reopen store: %v`, err)
+	}
+	defer func() { _ = reopened.Close() }()
+
+	loaded, err := reopened.LoadWorkflowInstance(ctx, `workflow-job-wait-1`)
+	if err != nil {
+		t.Fatalf(`load workflow instance: %v`, err)
+	}
+	if loaded.WorkflowID != `workflow-job-wait-1` || loaded.PluginID != `plugin-workflow-demo` || loaded.Status != WorkflowRuntimeStatusWaitingJob {
+		t.Fatalf(`expected persisted waiting_job workflow identity/state after reopen, got %+v`, loaded)
+	}
+	if loaded.Workflow.WaitingForJob == nil || loaded.Workflow.WaitingForJob.JobID != `job-state-reopen` || loaded.Workflow.WaitingForJob.StepName != `child-job` {
+		t.Fatalf(`expected waiting child job state after reopen, got %+v`, loaded.Workflow)
+	}
+	if loaded.Workflow.LastJobResult == nil || loaded.Workflow.LastJobResult.JobID != `job-state-reopen-prior` || loaded.Workflow.LastJobResult.Status != JobStatusCancelled || loaded.Workflow.LastJobResult.ReasonCode != JobReasonCodeTimeout || loaded.Workflow.LastJobResult.LastError != `prior timeout` {
+		t.Fatalf(`expected last child job result after reopen, got %+v`, loaded.Workflow.LastJobResult)
+	}
+	if loaded.TraceID != `trace-workflow-job-reopen` || loaded.EventID != `evt-workflow-job-reopen-origin` || loaded.RunID != `run-workflow-job-reopen` || loaded.CorrelationID != `corr-workflow-job-reopen` {
+		t.Fatalf(`expected persisted workflow observability ids after reopen, got %+v`, loaded)
+	}
+	if loaded.LastEventID != `evt-workflow-job-reopen-last` || loaded.LastEventType != `job.result` {
+		t.Fatalf(`expected persisted workflow resume boundary fields after reopen, got %+v`, loaded)
+	}
+}
+
 func TestSQLiteStateStoreRejectsWorkflowOwnerOverwriteOnConflict(t *testing.T) {
 	t.Parallel()
 

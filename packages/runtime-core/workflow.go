@@ -3,6 +3,7 @@ package runtimecore
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -23,11 +24,217 @@ const (
 	WorkflowStepKindCompensate = pluginsdk.WorkflowStepKindCompensate
 )
 
-type WorkflowStep = pluginsdk.WorkflowStep
-type Workflow = pluginsdk.Workflow
+type WorkflowStep struct {
+	Kind  WorkflowStepKind `json:"kind"`
+	Name  string           `json:"name"`
+	Value string           `json:"value,omitempty"`
+}
+
+type WorkflowCallJobState struct {
+	StepName string `json:"stepName,omitempty"`
+	JobID    string `json:"jobId,omitempty"`
+}
+
+type WorkflowJobResult struct {
+	StepName   string        `json:"stepName,omitempty"`
+	JobID      string        `json:"jobId,omitempty"`
+	Status     JobStatus     `json:"status,omitempty"`
+	ReasonCode JobReasonCode `json:"reasonCode,omitempty"`
+	LastError  string        `json:"lastError,omitempty"`
+}
+
+func (r WorkflowJobResult) IsTerminal() bool {
+	switch r.Status {
+	case JobStatusDone, JobStatusCancelled, JobStatusFailed, JobStatusDead:
+		return true
+	default:
+		return false
+	}
+}
+
+func (r WorkflowJobResult) RequiresCompensation() bool {
+	switch r.Status {
+	case JobStatusCancelled, JobStatusFailed, JobStatusDead:
+		return true
+	default:
+		return false
+	}
+}
+
+func (r WorkflowJobResult) StateValue() map[string]any {
+	state := map[string]any{
+		"job_id": r.JobID,
+		"status": string(r.Status),
+	}
+	if strings.TrimSpace(r.StepName) != `` {
+		state["step_name"] = r.StepName
+	}
+	if strings.TrimSpace(string(r.ReasonCode)) != `` {
+		state["reason_code"] = string(r.ReasonCode)
+	}
+	if strings.TrimSpace(r.LastError) != `` {
+		state["last_error"] = r.LastError
+	}
+	return state
+}
+
+type Workflow struct {
+	ID            string                `json:"id"`
+	Steps         []WorkflowStep        `json:"steps"`
+	CurrentIndex  int                   `json:"currentIndex"`
+	State         map[string]any        `json:"state,omitempty"`
+	WaitingFor    string                `json:"waitingFor,omitempty"`
+	WaitingForJob *WorkflowCallJobState `json:"waitingForJob,omitempty"`
+	LastJobResult *WorkflowJobResult    `json:"lastJobResult,omitempty"`
+	SleepingUntil *time.Time            `json:"sleepingUntil,omitempty"`
+	Completed     bool                  `json:"completed"`
+	Compensated   bool                  `json:"compensated"`
+}
 
 func NewWorkflow(id string, steps ...WorkflowStep) Workflow {
-	return pluginsdk.NewWorkflow(id, steps...)
+	return Workflow{ID: id, Steps: steps, State: map[string]any{}}
+}
+
+func (w Workflow) CurrentStep() (WorkflowStep, error) {
+	if w.Completed || w.CurrentIndex >= len(w.Steps) {
+		return WorkflowStep{}, errors.New("workflow has no current step")
+	}
+	return w.Steps[w.CurrentIndex], nil
+}
+
+func (w Workflow) Advance(now time.Time) (Workflow, error) {
+	step, err := w.CurrentStep()
+	if err != nil {
+		return Workflow{}, err
+	}
+
+	next := w
+	if next.State == nil {
+		next.State = map[string]any{}
+	}
+	switch step.Kind {
+	case WorkflowStepKindStep:
+		next.CurrentIndex++
+	case WorkflowStepKindWaitEvent:
+		next.WaitingFor = step.Value
+	case WorkflowStepKindSleep:
+		until := now.Add(parseWorkflowDuration(step.Value))
+		next.SleepingUntil = &until
+	case WorkflowStepKindCallJob:
+		jobID := strings.TrimSpace(step.Value)
+		if jobID == `` {
+			return Workflow{}, errors.New("workflow call_job step requires job id value")
+		}
+		next.WaitingForJob = &WorkflowCallJobState{StepName: strings.TrimSpace(step.Name), JobID: jobID}
+		next.LastJobResult = nil
+	case WorkflowStepKindPersist:
+		next.State[step.Name] = step.Value
+		next.CurrentIndex++
+	case WorkflowStepKindCompensate:
+		if next.LastJobResult == nil || next.LastJobResult.RequiresCompensation() {
+			next.Compensated = true
+		}
+		next.CurrentIndex++
+	default:
+		return Workflow{}, fmt.Errorf("unsupported workflow step kind %q", step.Kind)
+	}
+
+	if next.CurrentIndex >= len(next.Steps) && next.WaitingFor == `` && next.WaitingForJob == nil && next.SleepingUntil == nil {
+		next.Completed = true
+	}
+	return next, nil
+}
+
+func (w Workflow) ResumeWithEvent(eventType string) (Workflow, error) {
+	step, err := w.CurrentStep()
+	if err != nil {
+		return Workflow{}, err
+	}
+	if step.Kind != WorkflowStepKindWaitEvent || w.WaitingFor == `` {
+		return Workflow{}, errors.New("workflow is not waiting for event")
+	}
+	if eventType != w.WaitingFor {
+		return Workflow{}, fmt.Errorf("unexpected event %q, waiting for %q", eventType, w.WaitingFor)
+	}
+	next := w
+	next.WaitingFor = ``
+	next.CurrentIndex++
+	if next.CurrentIndex >= len(next.Steps) {
+		next.Completed = true
+	}
+	return next, nil
+}
+
+func (w Workflow) ResumeAfterSleep(now time.Time) (Workflow, error) {
+	step, err := w.CurrentStep()
+	if err != nil {
+		return Workflow{}, err
+	}
+	if step.Kind != WorkflowStepKindSleep || w.SleepingUntil == nil {
+		return Workflow{}, errors.New("workflow is not sleeping")
+	}
+	if now.Before(*w.SleepingUntil) {
+		return Workflow{}, errors.New("workflow sleep not finished")
+	}
+	next := w
+	next.SleepingUntil = nil
+	next.CurrentIndex++
+	if next.CurrentIndex >= len(next.Steps) {
+		next.Completed = true
+	}
+	return next, nil
+}
+
+func (w Workflow) ResumeWithChildJob(result WorkflowJobResult) (Workflow, error) {
+	step, err := w.CurrentStep()
+	if err != nil {
+		return Workflow{}, err
+	}
+	if step.Kind != WorkflowStepKindCallJob || w.WaitingForJob == nil {
+		return Workflow{}, errors.New("workflow is not waiting for child job result")
+	}
+	result.JobID = strings.TrimSpace(result.JobID)
+	if result.JobID == `` {
+		return Workflow{}, errors.New("workflow child job result requires job id")
+	}
+	if !result.IsTerminal() {
+		return Workflow{}, fmt.Errorf("workflow child job %q is not terminal: %s", result.JobID, result.Status)
+	}
+	expectedJobID := strings.TrimSpace(w.WaitingForJob.JobID)
+	if expectedJobID == `` {
+		expectedJobID = strings.TrimSpace(step.Value)
+	}
+	if expectedJobID == `` {
+		return Workflow{}, errors.New("workflow waiting child job id is missing")
+	}
+	if result.JobID != expectedJobID {
+		return Workflow{}, fmt.Errorf("unexpected child job %q, waiting for %q", result.JobID, expectedJobID)
+	}
+	if strings.TrimSpace(result.StepName) == `` {
+		result.StepName = strings.TrimSpace(step.Name)
+	}
+	next := w
+	if next.State == nil {
+		next.State = map[string]any{}
+	}
+	next.WaitingForJob = nil
+	next.LastJobResult = &result
+	if strings.TrimSpace(step.Name) != `` {
+		next.State[step.Name] = result.StateValue()
+	}
+	next.CurrentIndex++
+	if next.CurrentIndex >= len(next.Steps) {
+		next.Completed = true
+	}
+	return next, nil
+}
+
+func parseWorkflowDuration(raw string) time.Duration {
+	duration, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0
+	}
+	return duration
 }
 
 type WorkflowRuntimeStatus string
@@ -35,6 +242,7 @@ type WorkflowRuntimeStatus string
 const (
 	WorkflowRuntimeStatusReady        WorkflowRuntimeStatus = `ready`
 	WorkflowRuntimeStatusWaitingEvent WorkflowRuntimeStatus = `waiting_event`
+	WorkflowRuntimeStatusWaitingJob   WorkflowRuntimeStatus = `waiting_job`
 	WorkflowRuntimeStatusSleeping     WorkflowRuntimeStatus = `sleeping`
 	WorkflowRuntimeStatusCompleted    WorkflowRuntimeStatus = `completed`
 )
@@ -58,6 +266,13 @@ type WorkflowTransition struct {
 	Instance WorkflowInstanceState
 	Started  bool
 	Resumed  bool
+}
+
+type WorkflowChildJobResume struct {
+	JobID      string
+	Status     JobStatus
+	ReasonCode JobReasonCode
+	LastError  string
 }
 
 type WorkflowRecoverySnapshot struct {
@@ -128,6 +343,10 @@ func WithWorkflowObservabilityContext(ctx context.Context, observability Workflo
 	return context.WithValue(ctx, workflowObservabilityContextKey{}, observability)
 }
 
+func WorkflowObservabilityContextFromContext(ctx context.Context) WorkflowObservabilityContext {
+	return workflowObservabilityFromContext(ctx)
+}
+
 func workflowObservabilityFromContext(ctx context.Context) WorkflowObservabilityContext {
 	if ctx == nil {
 		return WorkflowObservabilityContext{}
@@ -140,6 +359,7 @@ type workflowRuntimeStore interface {
 	SaveWorkflowInstance(context.Context, WorkflowInstanceState) error
 	LoadWorkflowInstance(context.Context, string) (WorkflowInstanceState, error)
 	ListWorkflowInstances(context.Context) ([]WorkflowInstanceState, error)
+	LoadJob(context.Context, string) (Job, error)
 }
 
 type WorkflowRuntime struct {
@@ -282,6 +502,8 @@ func (r *WorkflowRuntime) StartOrResume(ctx context.Context, workflowID string, 
 		if err != nil {
 			return WorkflowTransition{}, err
 		}
+	} else if workflow.WaitingForJob != nil {
+		return WorkflowTransition{}, fmt.Errorf(`workflow %q is waiting for child job result`, workflowID)
 	} else if workflow.SleepingUntil != nil {
 		workflow, err = workflow.ResumeAfterSleep(now)
 		if err != nil {
@@ -304,6 +526,73 @@ func (r *WorkflowRuntime) StartOrResume(ctx context.Context, workflowID string, 
 	}
 	if err := r.save(ctx, updated); err != nil {
 		return WorkflowTransition{}, fmt.Errorf(`save resumed workflow: %w`, err)
+	}
+	r.recordTransitionMetric(updated.PluginID, "resumed")
+	return WorkflowTransition{Instance: cloneWorkflowInstanceState(updated), Resumed: true}, nil
+}
+
+func (r *WorkflowRuntime) ResumeFromChildJob(ctx context.Context, workflowID string, pluginID string, child WorkflowChildJobResume) (WorkflowTransition, error) {
+	if r == nil {
+		return WorkflowTransition{}, fmt.Errorf(`workflow runtime is required`)
+	}
+	if r.store == nil {
+		return WorkflowTransition{}, fmt.Errorf(`workflow runtime store is required`)
+	}
+	workflowID = strings.TrimSpace(workflowID)
+	if workflowID == `` {
+		return WorkflowTransition{}, fmt.Errorf(`workflow id is required`)
+	}
+	pluginID = strings.TrimSpace(pluginID)
+	if pluginID == `` {
+		return WorkflowTransition{}, fmt.Errorf(`plugin id is required`)
+	}
+	child.JobID = strings.TrimSpace(child.JobID)
+	if child.JobID == `` {
+		return WorkflowTransition{}, fmt.Errorf(`child job id is required`)
+	}
+	result := WorkflowJobResult{
+		JobID:      child.JobID,
+		Status:     child.Status,
+		ReasonCode: child.ReasonCode,
+		LastError:  strings.TrimSpace(child.LastError),
+	}
+	if !result.IsTerminal() {
+		return WorkflowTransition{}, fmt.Errorf(`workflow child job %q must be terminal, got %s`, result.JobID, result.Status)
+	}
+	now := r.now()
+	current, found, err := r.load(ctx, workflowID)
+	if err != nil {
+		return WorkflowTransition{}, fmt.Errorf(`load workflow instance: %w`, err)
+	}
+	if !found {
+		return WorkflowTransition{}, sql.ErrNoRows
+	}
+	if current.PluginID != pluginID {
+		return WorkflowTransition{}, fmt.Errorf(`workflow %q is owned by plugin %q, not %q`, workflowID, current.PluginID, pluginID)
+	}
+	updated := cloneWorkflowInstanceState(current)
+	workflow := cloneWorkflow(updated.Workflow)
+	if workflow.WaitingForJob == nil {
+		return WorkflowTransition{}, fmt.Errorf(`workflow %q is not waiting for child job result`, workflowID)
+	}
+	resumed, err := workflow.ResumeWithChildJob(result)
+	if err != nil {
+		return WorkflowTransition{}, err
+	}
+	driven, err := advanceWorkflowUntilBlocked(resumed, now)
+	if err != nil {
+		return WorkflowTransition{}, err
+	}
+	updated.Workflow = driven
+	updated.Status = workflowRuntimeStatus(driven)
+	updated.LastEventID = workflowChildJobResumeCheckpointID(child.JobID)
+	updated.LastEventType = `job.result`
+	updated.UpdatedAt = now
+	if updated.CreatedAt.IsZero() {
+		updated.CreatedAt = now
+	}
+	if err := r.save(ctx, updated); err != nil {
+		return WorkflowTransition{}, fmt.Errorf(`save resumed workflow from child job: %w`, err)
 	}
 	r.recordTransitionMetric(updated.PluginID, "resumed")
 	return WorkflowTransition{Instance: cloneWorkflowInstanceState(updated), Resumed: true}, nil
@@ -400,6 +689,7 @@ func (r *WorkflowRuntime) syncMetricsLocked() {
 	counts := map[WorkflowRuntimeStatus]int{
 		WorkflowRuntimeStatusReady:        0,
 		WorkflowRuntimeStatusWaitingEvent: 0,
+		WorkflowRuntimeStatusWaitingJob:   0,
 		WorkflowRuntimeStatusSleeping:     0,
 		WorkflowRuntimeStatusCompleted:    0,
 	}
@@ -433,6 +723,11 @@ func (r *WorkflowRuntime) restoreInstance(ctx context.Context, instance Workflow
 		return WorkflowInstanceState{}, fmt.Errorf(`plugin id is required`)
 	}
 	restored.Workflow.ID = restored.WorkflowID
+	reconciled, err := r.reconcileWaitingChildJob(ctx, restored)
+	if err != nil {
+		return WorkflowInstanceState{}, err
+	}
+	restored = reconciled
 	driven, err := advanceWorkflowUntilBlocked(restored.Workflow, at)
 	if err != nil {
 		return WorkflowInstanceState{}, err
@@ -451,12 +746,67 @@ func (r *WorkflowRuntime) restoreInstance(ctx context.Context, instance Workflow
 	return restored, nil
 }
 
+func (r *WorkflowRuntime) reconcileWaitingChildJob(ctx context.Context, instance WorkflowInstanceState) (WorkflowInstanceState, error) {
+	if r == nil || r.store == nil {
+		return instance, nil
+	}
+	if instance.Workflow.WaitingForJob == nil {
+		return instance, nil
+	}
+	jobID := strings.TrimSpace(instance.Workflow.WaitingForJob.JobID)
+	if jobID == `` {
+		return instance, nil
+	}
+	job, err := r.store.LoadJob(ctx, jobID)
+	if err != nil {
+		if err == sql.ErrNoRows || strings.Contains(strings.ToLower(err.Error()), "no rows") {
+			return instance, nil
+		}
+		return WorkflowInstanceState{}, fmt.Errorf(`load child job %q during workflow restore: %w`, jobID, err)
+	}
+	switch job.Status {
+	case JobStatusDone, JobStatusCancelled, JobStatusFailed, JobStatusDead:
+	default:
+		return instance, nil
+	}
+	resumed, err := instance.Workflow.ResumeWithChildJob(WorkflowJobResult{
+		JobID:      job.ID,
+		Status:     job.Status,
+		ReasonCode: job.ReasonCode,
+		LastError:  strings.TrimSpace(job.LastError),
+	})
+	if err != nil {
+		return WorkflowInstanceState{}, err
+	}
+	instance.Workflow = resumed
+	instance.Status = workflowRuntimeStatus(resumed)
+	instance.LastEventID = workflowChildJobResumeCheckpointID(job.ID)
+	instance.LastEventType = `job.result`
+	return instance, nil
+}
+
+func workflowChildJobResumeCheckpointID(jobID string) string {
+	jobID = strings.TrimSpace(jobID)
+	if jobID == `` {
+		return `job.result`
+	}
+	return `job.result:` + jobID
+}
+
 func cloneWorkflow(workflow Workflow) Workflow {
 	cloned := workflow
 	if len(workflow.Steps) > 0 {
 		cloned.Steps = append([]WorkflowStep(nil), workflow.Steps...)
 	}
 	cloned.State = cloneWorkflowStateMap(workflow.State)
+	if workflow.WaitingForJob != nil {
+		waitingForJob := *workflow.WaitingForJob
+		cloned.WaitingForJob = &waitingForJob
+	}
+	if workflow.LastJobResult != nil {
+		lastJobResult := *workflow.LastJobResult
+		cloned.LastJobResult = &lastJobResult
+	}
 	if workflow.SleepingUntil != nil {
 		sleepingUntil := workflow.SleepingUntil.UTC()
 		cloned.SleepingUntil = &sleepingUntil
@@ -546,6 +896,9 @@ func workflowRuntimeStatus(workflow Workflow) WorkflowRuntimeStatus {
 	if workflow.WaitingFor != `` {
 		return WorkflowRuntimeStatusWaitingEvent
 	}
+	if workflow.WaitingForJob != nil {
+		return WorkflowRuntimeStatusWaitingJob
+	}
 	if workflow.SleepingUntil != nil {
 		return WorkflowRuntimeStatusSleeping
 	}
@@ -559,6 +912,9 @@ func advanceWorkflowUntilBlocked(workflow Workflow, now time.Time) (Workflow, er
 			return current, nil
 		}
 		if current.WaitingFor != `` {
+			return current, nil
+		}
+		if current.WaitingForJob != nil {
 			return current, nil
 		}
 		if current.SleepingUntil != nil {

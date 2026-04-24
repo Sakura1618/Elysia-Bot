@@ -406,6 +406,9 @@ func TestConsoleAPIExposesPersistedWorkflowInstances(t *testing.T) {
 	if workflowItem.WaitingFor != `message.received` || workflowItem.State[`greeting`] != `hello` {
 		t.Fatalf(`expected persisted workflow read-side fields, got %+v`, workflowItem)
 	}
+	if workflowItem.WaitingForJob != nil || workflowItem.LastJobResult != nil {
+		t.Fatalf(`expected wait_event workflow not to project child-job fields, got %+v`, workflowItem)
+	}
 	rendered, err := api.RenderJSON()
 	if err != nil {
 		t.Fatalf(`render console json: %v`, err)
@@ -414,6 +417,65 @@ func TestConsoleAPIExposesPersistedWorkflowInstances(t *testing.T) {
 		if !strings.Contains(rendered, expected) {
 			t.Fatalf(`expected rendered console payload to contain %q, got %s`, expected, rendered)
 		}
+	}
+}
+
+func TestConsoleAPIExposesWaitingJobAndLastChildResultFields(t *testing.T) {
+	t.Parallel()
+
+	store := openTempSQLiteStore(t)
+	defer func() { _ = store.Close() }()
+	workflow := NewWorkflow(
+		`workflow-user-job-console`,
+		WorkflowStep{Kind: WorkflowStepKindPersist, Name: `greeting`, Value: `hello`},
+		WorkflowStep{Kind: WorkflowStepKindCallJob, Name: `child-job`, Value: `job-console-child`},
+		WorkflowStep{Kind: WorkflowStepKindCompensate, Name: `complete`},
+	)
+	workflow.State[`greeting`] = `hello`
+	workflow.CurrentIndex = 1
+	workflow.WaitingForJob = &WorkflowCallJobState{StepName: `child-job`, JobID: `job-console-child`}
+	workflow.LastJobResult = &WorkflowJobResult{StepName: `child-job`, JobID: `job-console-prior`, Status: JobStatusCancelled, ReasonCode: JobReasonCodeTimeout, LastError: `prior timeout`}
+	if err := store.SaveWorkflowInstance(context.Background(), WorkflowInstanceState{
+		WorkflowID:    `workflow-user-job-console`,
+		PluginID:      `plugin-workflow-demo`,
+		TraceID:       `trace-workflow-job-console`,
+		EventID:       `evt-workflow-job-console-origin`,
+		RunID:         `run-workflow-job-console`,
+		CorrelationID: `corr-workflow-job-console`,
+		Status:        WorkflowRuntimeStatusWaitingJob,
+		Workflow:      workflow,
+		LastEventID:   `evt-workflow-job-console-last`,
+		LastEventType: `job.result`,
+		CreatedAt:     time.Date(2026, 4, 24, 10, 0, 0, 0, time.UTC),
+		UpdatedAt:     time.Date(2026, 4, 24, 10, 1, 0, 0, time.UTC),
+	}); err != nil {
+		t.Fatalf(`save waiting_job workflow instance: %v`, err)
+	}
+
+	api := NewConsoleAPI(NewInMemoryRuntime(NoopSupervisor{}, DirectPluginHost{}), nil, Config{}, nil, nil)
+	api.SetWorkflowReader(NewSQLiteConsoleWorkflowReader(store))
+	workflows, err := api.Workflows()
+	if err != nil {
+		t.Fatalf(`console workflows: %v`, err)
+	}
+	if len(workflows) != 1 {
+		t.Fatalf(`expected one workflow, got %+v`, workflows)
+	}
+	item := workflows[0]
+	if item.Status != string(WorkflowRuntimeStatusWaitingJob) || item.WaitingForJob == nil {
+		t.Fatalf(`expected waiting_job workflow projection, got %+v`, item)
+	}
+	if item.WaitingForJob[`jobId`] != `job-console-child` || item.WaitingForJob[`stepName`] != `child-job` {
+		t.Fatalf(`expected waiting job projection fields, got %+v`, item.WaitingForJob)
+	}
+	if item.LastJobResult == nil || item.LastJobResult[`job_id`] != `job-console-prior` || item.LastJobResult[`status`] != string(JobStatusCancelled) || item.LastJobResult[`reason_code`] != string(JobReasonCodeTimeout) {
+		t.Fatalf(`expected last child result projection, got %+v`, item.LastJobResult)
+	}
+	if item.LastEventID != `evt-workflow-job-console-last` || item.LastEventType != `job.result` {
+		t.Fatalf(`expected workflow checkpoint projection for child-job boundary, got %+v`, item)
+	}
+	if !strings.Contains(item.Summary, `waiting_job=job-console-child`) || !strings.Contains(item.Summary, `last_child_job_status=cancelled`) {
+		t.Fatalf(`expected workflow summary to expose waiting-job and child-result facts, got %q`, item.Summary)
 	}
 }
 

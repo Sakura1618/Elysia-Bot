@@ -13,6 +13,7 @@ const (
 	JobStatusPending   = pluginsdk.JobStatusPending
 	JobStatusRunning   = pluginsdk.JobStatusRunning
 	JobStatusRetrying  = pluginsdk.JobStatusRetrying
+	JobStatusPaused    = pluginsdk.JobStatusPaused
 	JobStatusCancelled = pluginsdk.JobStatusCancelled
 	JobStatusFailed    = pluginsdk.JobStatusFailed
 	JobStatusDead      = pluginsdk.JobStatusDead
