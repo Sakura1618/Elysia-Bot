@@ -1,0 +1,112 @@
+name: nightly-validation
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * *'
+
+jobs:
+  fault-injection:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.work
+
+      - name: Install workspace dependencies
+        run: npm ci
+
+      - name: Run fault-injection suite
+        run: npm run test:fault-injection
+
+  plugin-matrix:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - plugin: plugin-echo
+            command: npm run test:plugin:echo
+          - plugin: plugin-admin
+            command: npm run test:plugin:admin
+          - plugin: plugin-ai-chat
+            command: npm run test:plugin:ai-chat
+          - plugin: plugin-scheduler
+            command: npm run test:plugin:scheduler
+          - plugin: plugin-workflow-demo
+            command: npm run test:plugin:workflow-demo
+          - plugin: plugin-template-smoke
+            command: npm run test:plugin-template:smoke
+    name: plugin-matrix (${{ matrix.plugin }})
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.work
+
+      - name: Install workspace dependencies
+        run: npm ci
+
+      - name: Run plugin verification
+        run: ${{ matrix.command }}
+
+  postgres-smoke:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: bot_platform
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d bot_platform"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      BOT_PLATFORM_POSTGRES_TEST_DSN: postgres://postgres:postgres@127.0.0.1:5432/bot_platform?sslmode=disable
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.work
+
+      - name: Install workspace dependencies
+        run: npm ci
+
+      - name: Run Postgres smoke suite
+        run: npm run test:postgres:smoke
+
+      - name: Run Postgres acceptance suite
+        run: npm run test:postgres:acceptance

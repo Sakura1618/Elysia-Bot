@@ -306,6 +306,71 @@ func TestFaultInjectionOneBotOutboundHTTPFailurePropagatesThroughAIJob(t *testin
 	}
 }
 
+func TestFaultInjectionOneBotOutboundRateLimitPropagatesThroughAIJob(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "120")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte("slow down"))
+	}))
+	defer server.Close()
+
+	queue := newFaultJobQueueStub()
+	replies := oneBotReplyServiceBridge{
+		sender: adapteronebot.NewOneBotReplySender(adapteronebot.NewOneBotReplyHTTPTransport(server.URL, server.Client())),
+	}
+	plugin := pluginaichat.New(queue, successProviderStub{response: "ai response"}, faultSessionRecorder{}, replies)
+	job := pluginsdk.NewJob("job-ai-onebot-rate-limit", "ai.chat", 1, 30*time.Second)
+	job.Payload = map[string]any{"prompt": "hello ai"}
+	if err := queue.Enqueue(context.Background(), job); err != nil {
+		t.Fatalf("enqueue ai job: %v", err)
+	}
+
+	err := plugin.ProcessJob(context.Background(), job.ID, eventmodel.ReplyHandle{
+		Capability: "onebot.reply",
+		TargetID:   "group-42",
+		Metadata: map[string]any{
+			"message_type": "group",
+			"group_id":     int64(42),
+		},
+	})
+	if err == nil {
+		t.Fatal("expected outbound onebot reply 429 rate limit to bubble through ai job path")
+	}
+
+	var httpErr *adapteronebot.OneBotReplyHTTPError
+	if !errors.As(err, &httpErr) {
+		t.Fatalf("expected classified onebot http transport error, got %T (%v)", err, err)
+	}
+	if httpErr.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("expected status 429, got %+v", httpErr)
+	}
+	if httpErr.RetryAfter != "120" {
+		t.Fatalf("expected retry-after hint to survive ai job path, got %+v", httpErr)
+	}
+	if !httpErr.RateLimited() {
+		t.Fatalf("expected 429 to retain rate-limit classification, got %+v", httpErr)
+	}
+	if !httpErr.UpstreamFailure() {
+		t.Fatalf("expected 429 to retain upstream failure classification, got %+v", httpErr)
+	}
+	if httpErr.GenericUpstreamFailure() {
+		t.Fatalf("expected 429 to remain distinct from generic upstream failure, got %+v", httpErr)
+	}
+
+	stored, inspectErr := queue.Inspect(context.Background(), job.ID)
+	if inspectErr != nil {
+		t.Fatalf("inspect ai job: %v", inspectErr)
+	}
+	if stored.Status != pluginsdk.JobStatusRetrying {
+		t.Fatalf("expected outbound reply rate limit to move ai job into retrying, got %+v", stored)
+	}
+	if !strings.Contains(stored.LastError, "429 Too Many Requests") || !strings.Contains(stored.LastError, "slow down") || !strings.Contains(stored.LastError, "retry-after: 120") {
+		t.Fatalf("expected job last error to preserve outbound 429 detail, body, and retry-after hint, got %+v", stored)
+	}
+}
+
 func TestFaultInjectionSQLiteDisconnectReturnsError(t *testing.T) {
 	t.Parallel()
 

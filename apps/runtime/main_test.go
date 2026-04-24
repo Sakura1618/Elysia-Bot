@@ -13,6 +13,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -358,6 +359,37 @@ func (s *testRuntimeSmokeStore) Close() error {
 	return nil
 }
 
+type recordingDirectPluginHost struct {
+	mu             sync.Mutex
+	direct         runtimecore.DirectPluginHost
+	eventPluginIDs []string
+}
+
+func (h *recordingDirectPluginHost) DispatchEvent(ctx context.Context, plugin pluginsdk.Plugin, event eventmodel.Event, executionContext eventmodel.ExecutionContext) error {
+	h.mu.Lock()
+	h.eventPluginIDs = append(h.eventPluginIDs, plugin.Manifest.ID)
+	h.mu.Unlock()
+	return h.direct.DispatchEvent(ctx, plugin, event, executionContext)
+}
+
+func (h *recordingDirectPluginHost) DispatchCommand(ctx context.Context, plugin pluginsdk.Plugin, command eventmodel.CommandInvocation, executionContext eventmodel.ExecutionContext) error {
+	return h.direct.DispatchCommand(ctx, plugin, command, executionContext)
+}
+
+func (h *recordingDirectPluginHost) DispatchJob(ctx context.Context, plugin pluginsdk.Plugin, job pluginsdk.JobInvocation, executionContext eventmodel.ExecutionContext) error {
+	return h.direct.DispatchJob(ctx, plugin, job, executionContext)
+}
+
+func (h *recordingDirectPluginHost) DispatchSchedule(ctx context.Context, plugin pluginsdk.Plugin, trigger pluginsdk.ScheduleTrigger, executionContext eventmodel.ExecutionContext) error {
+	return h.direct.DispatchSchedule(ctx, plugin, trigger, executionContext)
+}
+
+func (h *recordingDirectPluginHost) EventPluginIDs() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]string(nil), h.eventPluginIDs...)
+}
+
 func runtimeDemoOneBotMessageBody(t *testing.T, messageID int64, rawMessage string) string {
 	t.Helper()
 	encodedRawMessage, err := json.Marshal(rawMessage)
@@ -422,6 +454,36 @@ func assertRuntimeSmokeCounts(t *testing.T, app *runtimeApp, expectedEventJourna
 	}
 	if counts["event_journal"] != expectedEventJournal || counts["idempotency_keys"] != expectedIdempotencyKeys {
 		t.Fatalf("expected smoke counts event_journal=%d idempotency_keys=%d, got %+v", expectedEventJournal, expectedIdempotencyKeys, counts)
+	}
+}
+
+func assertRegisteredAdapterBindings(t *testing.T, runtime *runtimecore.InMemoryRuntime, expected map[string]string) {
+	t.Helper()
+	if runtime == nil {
+		t.Fatal("runtime is required")
+	}
+	registered := runtime.RegisteredAdapters()
+	if len(registered) != len(expected) {
+		t.Fatalf("expected %d registered adapters, got %d: %+v", len(expected), len(registered), registered)
+	}
+	actual := make(map[string]string, len(registered))
+	for _, reg := range registered {
+		if reg.Adapter == nil {
+			t.Fatalf("expected adapter %q to keep a bound adapter instance, got nil", reg.ID)
+		}
+		if _, exists := actual[reg.ID]; exists {
+			t.Fatalf("expected registered adapters to have unique ids, got duplicate %q in %+v", reg.ID, registered)
+		}
+		actual[reg.ID] = reg.Source
+		if got := reg.Adapter.ID(); got != reg.ID {
+			t.Fatalf("expected registered adapter %q to keep bound adapter id %q, got %q", reg.ID, reg.ID, got)
+		}
+		if got := reg.Adapter.Source(); got != reg.Source {
+			t.Fatalf("expected registered adapter %q to keep bound adapter source %q, got %q", reg.ID, reg.Source, got)
+		}
+	}
+	if !reflect.DeepEqual(actual, expected) {
+		t.Fatalf("expected registered adapter bindings %+v, got %+v", expected, actual)
 	}
 }
 
@@ -2325,6 +2387,272 @@ func TestRuntimeAppDemoOneBotMessageWithPostgresSmokeStore(t *testing.T) {
 	}
 }
 
+func TestRuntimeAppDemoOneBotMessageWithPostgresSmokeStoreAndDirectHost(t *testing.T) {
+	dir := t.TempDir()
+	directHost := &recordingDirectPluginHost{}
+	app, err := newRuntimeAppWithOptions(writeTestConfigWithPostgresSmokeStoreAt(t, dir, runtimePostgresTestDSN(t)), runtimeAppBuildOptions{
+		pluginHostFactory: func(*replyBuffer, *runtimecore.WorkflowRuntime) runtimecore.PluginHost {
+			return directHost
+		},
+	})
+	if err != nil {
+		t.Fatalf("new runtime app with postgres smoke store and direct host: %v", err)
+	}
+	defer func() { _ = app.Close() }()
+
+	host, ok := app.runtime.PluginHost().(*recordingDirectPluginHost)
+	if !ok || host != directHost {
+		t.Fatalf("expected injected direct host, got %T", app.runtime.PluginHost())
+	}
+	if _, ok := app.runtimeState.(*runtimecore.PostgresStore); !ok {
+		t.Fatalf("expected runtimeState to stay postgres-backed, got %T", app.runtimeState)
+	}
+	if _, ok := app.smokeStore.(postgresRuntimeSmokeStore); !ok {
+		t.Fatalf("expected postgres smoke store under direct host seam, got %T", app.smokeStore)
+	}
+
+	beforeCounts, err := app.runtimeStateCounts(t.Context())
+	if err != nil {
+		t.Fatalf("runtime state counts before direct-host request: %v", err)
+	}
+
+	messageID := time.Now().UnixNano()
+	messageBody := runtimeDemoOneBotMessageBody(t, messageID, "hello postgres direct host")
+	resp := performRuntimeOneBotMessageRequest(t, app, messageBody)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected direct-host onebot request 200, got %d: %s", resp.Code, resp.Body.String())
+	}
+	var payload struct {
+		Status    string        `json:"status"`
+		Duplicate bool          `json:"duplicate"`
+		Replies   []replyRecord `json:"replies"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode direct-host response: %v", err)
+	}
+	if payload.Status != "ok" || payload.Duplicate {
+		t.Fatalf("expected successful non-duplicate direct-host response, got %+v", payload)
+	}
+	if len(payload.Replies) != 1 || payload.Replies[0].Payload != "echo: hello postgres direct host" {
+		t.Fatalf("expected direct-host reply payload, got %+v", payload.Replies)
+	}
+	if app.replies.Count() != 1 {
+		t.Fatalf("expected one recorded reply through direct host path, got %+v", app.replies.Since(0))
+	}
+	directDispatches := directHost.EventPluginIDs()
+	if len(directDispatches) == 0 {
+		t.Fatal("expected direct host to observe event dispatches")
+	}
+	pluginEchoSeen := false
+	for _, pluginID := range directDispatches {
+		if pluginID == "plugin-echo" {
+			pluginEchoSeen = true
+			break
+		}
+	}
+	if !pluginEchoSeen {
+		t.Fatalf("expected direct host path to dispatch plugin-echo, got %+v", directDispatches)
+	}
+
+	afterCounts, err := app.runtimeStateCounts(t.Context())
+	if err != nil {
+		t.Fatalf("runtime state counts after direct-host request: %v", err)
+	}
+	if afterCounts["event_journal"] != beforeCounts["event_journal"]+1 {
+		t.Fatalf("expected postgres event_journal to increase by one under direct host, before=%+v after=%+v", beforeCounts, afterCounts)
+	}
+	if afterCounts["idempotency_keys"] != beforeCounts["idempotency_keys"]+1 {
+		t.Fatalf("expected postgres idempotency_keys to increase by one under direct host, before=%+v after=%+v", beforeCounts, afterCounts)
+	}
+
+	duplicateResp := performRuntimeOneBotMessageRequest(t, app, messageBody)
+	if duplicateResp.Code != http.StatusOK {
+		t.Fatalf("expected duplicate direct-host request 200, got %d: %s", duplicateResp.Code, duplicateResp.Body.String())
+	}
+	var duplicatePayload struct {
+		Status    string        `json:"status"`
+		Duplicate bool          `json:"duplicate"`
+		Replies   []replyRecord `json:"replies"`
+	}
+	if err := json.Unmarshal(duplicateResp.Body.Bytes(), &duplicatePayload); err != nil {
+		t.Fatalf("decode duplicate direct-host response: %v", err)
+	}
+	if duplicatePayload.Status != "ok" || !duplicatePayload.Duplicate {
+		t.Fatalf("expected duplicate=true for second direct-host request, got %+v", duplicatePayload)
+	}
+
+	afterDuplicateCounts, err := app.runtimeStateCounts(t.Context())
+	if err != nil {
+		t.Fatalf("runtime state counts after duplicate direct-host request: %v", err)
+	}
+	if afterDuplicateCounts["event_journal"] != afterCounts["event_journal"] {
+		t.Fatalf("expected duplicate direct-host request to leave postgres event_journal flat, afterFirst=%+v afterDuplicate=%+v", afterCounts, afterDuplicateCounts)
+	}
+	if afterDuplicateCounts["idempotency_keys"] != afterCounts["idempotency_keys"] {
+		t.Fatalf("expected duplicate direct-host request to leave postgres idempotency_keys flat, afterFirst=%+v afterDuplicate=%+v", afterCounts, afterDuplicateCounts)
+	}
+
+	sqliteCounts, err := app.state.Counts(t.Context())
+	if err != nil {
+		t.Fatalf("sqlite counts under postgres direct-host test: %v", err)
+	}
+	if sqliteCounts["event_journal"] != 0 || sqliteCounts["idempotency_keys"] != 0 {
+		t.Fatalf("expected sqlite smoke tables to remain empty under postgres-selected direct host, got %+v", sqliteCounts)
+	}
+
+	console := readRuntimeConsoleResponse(t, app)
+	if got := consoleMetaString(t, console.Meta, "smoke_store_backend"); got != "postgres" {
+		t.Fatalf("expected smoke_store_backend=postgres, got %q", got)
+	}
+	if got := consoleMetaString(t, console.Meta, "job_read_model"); got != "postgres" {
+		t.Fatalf("expected job_read_model=postgres under direct host, got %q", got)
+	}
+	if got := consoleMetaString(t, console.Meta, "job_status_source"); got != "postgres-jobs" {
+		t.Fatalf("expected job_status_source=postgres-jobs under direct host, got %q", got)
+	}
+	if got := consoleMetaString(t, console.Meta, "schedule_read_model"); got != "postgres" {
+		t.Fatalf("expected schedule_read_model=postgres under direct host, got %q", got)
+	}
+	if got := consoleMetaString(t, console.Meta, "schedule_status_source"); got != "postgres-schedule-plans" {
+		t.Fatalf("expected schedule_status_source=postgres-schedule-plans under direct host, got %q", got)
+	}
+	if got := consoleMetaString(t, console.Meta, "workflow_read_model"); got != "postgres-workflow-instances" {
+		t.Fatalf("expected workflow_read_model=postgres-workflow-instances under direct host, got %q", got)
+	}
+	if got := consoleMetaString(t, console.Meta, "workflow_status_source"); got != "postgres-workflow-instances" {
+		t.Fatalf("expected workflow_status_source=postgres-workflow-instances under direct host, got %q", got)
+	}
+}
+
+func TestRuntimeAppDemoOneBotMessageWithSQLiteSmokeStoreAndDirectHost(t *testing.T) {
+	dir := t.TempDir()
+	directHost := &recordingDirectPluginHost{}
+	app, err := newRuntimeAppWithOptions(writeTestConfigAt(t, dir), runtimeAppBuildOptions{
+		pluginHostFactory: func(*replyBuffer, *runtimecore.WorkflowRuntime) runtimecore.PluginHost {
+			return directHost
+		},
+	})
+	if err != nil {
+		t.Fatalf("new runtime app with sqlite smoke store and direct host: %v", err)
+	}
+	defer func() { _ = app.Close() }()
+
+	host, ok := app.runtime.PluginHost().(*recordingDirectPluginHost)
+	if !ok || host != directHost {
+		t.Fatalf("expected injected direct host, got %T", app.runtime.PluginHost())
+	}
+	if _, ok := app.runtimeState.(*runtimecore.SQLiteStateStore); !ok {
+		t.Fatalf("expected runtimeState to stay sqlite-backed, got %T", app.runtimeState)
+	}
+	if _, ok := app.smokeStore.(sqliteRuntimeSmokeStore); !ok {
+		t.Fatalf("expected sqlite smoke store under direct host seam, got %T", app.smokeStore)
+	}
+
+	beforeCounts, err := app.runtimeStateCounts(t.Context())
+	if err != nil {
+		t.Fatalf("runtime state counts before direct-host sqlite request: %v", err)
+	}
+
+	messageID := time.Now().UnixNano()
+	messageBody := runtimeDemoOneBotMessageBody(t, messageID, "hello sqlite direct host")
+	resp := performRuntimeOneBotMessageRequest(t, app, messageBody)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected direct-host sqlite onebot request 200, got %d: %s", resp.Code, resp.Body.String())
+	}
+	var payload struct {
+		Status    string        `json:"status"`
+		Duplicate bool          `json:"duplicate"`
+		Replies   []replyRecord `json:"replies"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode direct-host sqlite response: %v", err)
+	}
+	if payload.Status != "ok" || payload.Duplicate {
+		t.Fatalf("expected successful non-duplicate sqlite direct-host response, got %+v", payload)
+	}
+	if len(payload.Replies) != 1 || payload.Replies[0].Payload != "echo: hello sqlite direct host" {
+		t.Fatalf("expected sqlite direct-host reply payload, got %+v", payload.Replies)
+	}
+	if app.replies.Count() != 1 {
+		t.Fatalf("expected one recorded reply through sqlite direct host path, got %+v", app.replies.Since(0))
+	}
+	directDispatches := directHost.EventPluginIDs()
+	if len(directDispatches) == 0 {
+		t.Fatal("expected sqlite direct host to observe event dispatches")
+	}
+	pluginEchoSeen := false
+	for _, pluginID := range directDispatches {
+		if pluginID == "plugin-echo" {
+			pluginEchoSeen = true
+			break
+		}
+	}
+	if !pluginEchoSeen {
+		t.Fatalf("expected sqlite direct host path to dispatch plugin-echo, got %+v", directDispatches)
+	}
+
+	afterCounts, err := app.runtimeStateCounts(t.Context())
+	if err != nil {
+		t.Fatalf("runtime state counts after direct-host sqlite request: %v", err)
+	}
+	if afterCounts["event_journal"] != beforeCounts["event_journal"]+1 {
+		t.Fatalf("expected sqlite event_journal to increase by one under direct host, before=%+v after=%+v", beforeCounts, afterCounts)
+	}
+	if afterCounts["idempotency_keys"] != beforeCounts["idempotency_keys"]+1 {
+		t.Fatalf("expected sqlite idempotency_keys to increase by one under direct host, before=%+v after=%+v", beforeCounts, afterCounts)
+	}
+
+	duplicateResp := performRuntimeOneBotMessageRequest(t, app, messageBody)
+	if duplicateResp.Code != http.StatusOK {
+		t.Fatalf("expected duplicate sqlite direct-host request 200, got %d: %s", duplicateResp.Code, duplicateResp.Body.String())
+	}
+	var duplicatePayload struct {
+		Status    string        `json:"status"`
+		Duplicate bool          `json:"duplicate"`
+		Replies   []replyRecord `json:"replies"`
+	}
+	if err := json.Unmarshal(duplicateResp.Body.Bytes(), &duplicatePayload); err != nil {
+		t.Fatalf("decode duplicate sqlite direct-host response: %v", err)
+	}
+	if duplicatePayload.Status != "ok" || !duplicatePayload.Duplicate {
+		t.Fatalf("expected duplicate=true for second sqlite direct-host request, got %+v", duplicatePayload)
+	}
+
+	afterDuplicateCounts, err := app.runtimeStateCounts(t.Context())
+	if err != nil {
+		t.Fatalf("runtime state counts after duplicate sqlite direct-host request: %v", err)
+	}
+	if afterDuplicateCounts["event_journal"] != afterCounts["event_journal"] {
+		t.Fatalf("expected duplicate sqlite direct-host request to leave event_journal flat, afterFirst=%+v afterDuplicate=%+v", afterCounts, afterDuplicateCounts)
+	}
+	if afterDuplicateCounts["idempotency_keys"] != afterCounts["idempotency_keys"] {
+		t.Fatalf("expected duplicate sqlite direct-host request to leave idempotency_keys flat, afterFirst=%+v afterDuplicate=%+v", afterCounts, afterDuplicateCounts)
+	}
+
+	console := readRuntimeConsoleResponse(t, app)
+	if got := consoleMetaString(t, console.Meta, "smoke_store_backend"); got != "sqlite" {
+		t.Fatalf("expected smoke_store_backend=sqlite, got %q", got)
+	}
+	if got := consoleMetaString(t, console.Meta, "job_read_model"); got != "sqlite" {
+		t.Fatalf("expected job_read_model=sqlite under direct host, got %q", got)
+	}
+	if got := consoleMetaString(t, console.Meta, "job_status_source"); got != "sqlite-jobs" {
+		t.Fatalf("expected job_status_source=sqlite-jobs under direct host, got %q", got)
+	}
+	if got := consoleMetaString(t, console.Meta, "schedule_read_model"); got != "sqlite" {
+		t.Fatalf("expected schedule_read_model=sqlite under direct host, got %q", got)
+	}
+	if got := consoleMetaString(t, console.Meta, "schedule_status_source"); got != "sqlite-schedule-plans" {
+		t.Fatalf("expected schedule_status_source=sqlite-schedule-plans under direct host, got %q", got)
+	}
+	if got := consoleMetaString(t, console.Meta, "workflow_read_model"); got != "sqlite-workflow-instances" {
+		t.Fatalf("expected workflow_read_model=sqlite-workflow-instances under direct host, got %q", got)
+	}
+	if got := consoleMetaString(t, console.Meta, "workflow_status_source"); got != "sqlite-workflow-instances" {
+		t.Fatalf("expected workflow_status_source=sqlite-workflow-instances under direct host, got %q", got)
+	}
+}
+
 func TestRuntimeAppPostgresSmokeStoreClosedCountsEndpointFailsLoudly(t *testing.T) {
 	app := newRuntimePostgresSmokeStoreApp(t)
 	defer func() { _ = app.Close() }()
@@ -4067,6 +4395,109 @@ func TestRuntimeAppSkipsDuplicateIdempotencyKey(t *testing.T) {
 	if counts["event_journal"] != 1 || counts["idempotency_keys"] != 1 {
 		t.Fatalf("expected one persisted event and one idempotency key, got %+v", counts)
 	}
+}
+
+func TestRuntimeAppOutOfOrderOneBotMessagesStayDistinctWhileDuplicateStillShortCircuits(t *testing.T) {
+	t.Parallel()
+
+	app, err := newRuntimeApp(writeTestConfig(t))
+	if err != nil {
+		t.Fatalf("new runtime app: %v", err)
+	}
+	defer func() { _ = app.Close() }()
+
+	type oneBotMessageResponse struct {
+		Status    string `json:"status"`
+		EventID   string `json:"event_id"`
+		Duplicate bool   `json:"duplicate"`
+	}
+
+	buildBody := func(messageID int64, unixSeconds int64, rawMessage string) string {
+		t.Helper()
+		encodedRawMessage, err := json.Marshal(rawMessage)
+		if err != nil {
+			t.Fatalf("marshal raw onebot message: %v", err)
+		}
+		return `{"post_type":"message","message_type":"group","time":` + strconv.FormatInt(unixSeconds, 10) + `,"user_id":10001,"group_id":42,"message_id":` + strconv.FormatInt(messageID, 10) + `,"raw_message":` + string(encodedRawMessage) + `,"sender":{"nickname":"alice"}}`
+	}
+
+	decodeResponse := func(name string, resp *httptest.ResponseRecorder) oneBotMessageResponse {
+		t.Helper()
+		if resp.Code != http.StatusOK {
+			t.Fatalf("expected %s request 200, got %d: %s", name, resp.Code, resp.Body.String())
+		}
+		var payload oneBotMessageResponse
+		if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+			t.Fatalf("decode %s response: %v", name, err)
+		}
+		return payload
+	}
+
+	const (
+		laterMessageID     int64 = 9102
+		earlierMessageID   int64 = 9101
+		laterMessageTime   int64 = 1712034002
+		earlierMessageTime int64 = 1712034001
+	)
+
+	laterBody := buildBody(laterMessageID, laterMessageTime, "later logical message")
+	earlierBody := buildBody(earlierMessageID, earlierMessageTime, "earlier logical message")
+
+	laterResp := decodeResponse("later-arrives-first", performRuntimeOneBotMessageRequest(t, app, laterBody))
+	if laterResp.Status != "ok" || laterResp.EventID == "" || laterResp.Duplicate {
+		t.Fatalf("expected later-arrives-first response to be successful and non-duplicate, got %+v", laterResp)
+	}
+
+	earlierResp := decodeResponse("earlier-arrives-second", performRuntimeOneBotMessageRequest(t, app, earlierBody))
+	if earlierResp.Status != "ok" || earlierResp.EventID == "" || earlierResp.Duplicate {
+		t.Fatalf("expected earlier-arrives-second response to be successful and non-duplicate, got %+v", earlierResp)
+	}
+	if laterResp.EventID == earlierResp.EventID {
+		t.Fatalf("expected out-of-order distinct messages to persist as distinct events, got later=%+v earlier=%+v", laterResp, earlierResp)
+	}
+
+	laterEvent, err := app.state.LoadEvent(t.Context(), laterResp.EventID)
+	if err != nil {
+		t.Fatalf("load persisted later event: %v", err)
+	}
+	earlierEvent, err := app.state.LoadEvent(t.Context(), earlierResp.EventID)
+	if err != nil {
+		t.Fatalf("load persisted earlier event: %v", err)
+	}
+
+	if laterEvent.EventID == earlierEvent.EventID || laterEvent.IdempotencyKey == earlierEvent.IdempotencyKey {
+		t.Fatalf("expected persisted out-of-order messages to remain distinct facts, got later=%+v earlier=%+v", laterEvent, earlierEvent)
+	}
+	if laterEvent.Message == nil || laterEvent.Message.ID != "msg-"+strconv.FormatInt(laterMessageID, 10) || laterEvent.Message.Text != "later logical message" {
+		t.Fatalf("expected persisted later event to keep posted message fact, got %+v", laterEvent)
+	}
+	if earlierEvent.Message == nil || earlierEvent.Message.ID != "msg-"+strconv.FormatInt(earlierMessageID, 10) || earlierEvent.Message.Text != "earlier logical message" {
+		t.Fatalf("expected persisted earlier event to keep posted message fact, got %+v", earlierEvent)
+	}
+	if laterEvent.IdempotencyKey != "onebot:onebot:group:"+strconv.FormatInt(laterMessageID, 10) {
+		t.Fatalf("expected persisted later event idempotency key to match source/message id boundary, got %+v", laterEvent)
+	}
+	if earlierEvent.IdempotencyKey != "onebot:onebot:group:"+strconv.FormatInt(earlierMessageID, 10) {
+		t.Fatalf("expected persisted earlier event idempotency key to match source/message id boundary, got %+v", earlierEvent)
+	}
+	if !laterEvent.Timestamp.Equal(time.Unix(laterMessageTime, 0).UTC()) {
+		t.Fatalf("expected persisted later event timestamp to reflect payload time, got %+v", laterEvent)
+	}
+	if !earlierEvent.Timestamp.Equal(time.Unix(earlierMessageTime, 0).UTC()) {
+		t.Fatalf("expected persisted earlier event timestamp to reflect payload time, got %+v", earlierEvent)
+	}
+	if !laterEvent.Timestamp.After(earlierEvent.Timestamp) {
+		t.Fatalf("expected persisted timestamps to reflect payload chronology rather than arrival order, got later=%s earlier=%s", laterEvent.Timestamp, earlierEvent.Timestamp)
+	}
+
+	assertRuntimeSmokeCounts(t, app, 2, 2)
+
+	duplicateResp := decodeResponse("true-duplicate", performRuntimeOneBotMessageRequest(t, app, laterBody))
+	if duplicateResp.Status != "ok" || !duplicateResp.Duplicate {
+		t.Fatalf("expected reposted original body to short-circuit as duplicate, got %+v", duplicateResp)
+	}
+
+	assertRuntimeSmokeCounts(t, app, 2, 2)
 }
 
 func TestRuntimeAppReplayUsesSQLiteSelectedBackendEventJournal(t *testing.T) {
@@ -6193,6 +6624,119 @@ func TestRuntimeAppLoadsConfiguredBotInstancesAndExposesThemAfterRestart(t *test
 	if got := len(restarted.runtime.RegisteredAdapters()); got != 3 {
 		t.Fatalf("expected three registered adapters after restart, got %d", got)
 	}
+}
+
+func TestRuntimeAppConfiguredOneBotAndWebhookIngressWorkAfterRestart(t *testing.T) {
+	t.Setenv("BOT_PLATFORM_WEBHOOK_TOKEN", "test-webhook-token")
+
+	dir := t.TempDir()
+	configPath := writeTestConfigWithBotInstancesAt(t, dir)
+
+	app, err := newRuntimeApp(configPath)
+	if err != nil {
+		t.Fatalf("new runtime app: %v", err)
+	}
+	counts, err := app.state.Counts(t.Context())
+	if err != nil {
+		t.Fatalf("sqlite counts before restart: %v", err)
+	}
+	if counts["adapter_instances"] != 3 {
+		t.Fatalf("expected three persisted adapter instances before restart, got %+v", counts)
+	}
+	if err := app.Close(); err != nil {
+		t.Fatalf("close first app: %v", err)
+	}
+
+	restarted, err := newRuntimeApp(configPath)
+	if err != nil {
+		t.Fatalf("restart runtime app: %v", err)
+	}
+	defer func() { _ = restarted.Close() }()
+
+	oneBotMessageID := int64(9312)
+	oneBotResp := performRuntimeOneBotMessageRequestAtPath(t, restarted, "/demo/onebot/message-beta", runtimeDemoOneBotMessageBody(t, oneBotMessageID, "hello beta after restart"))
+	if oneBotResp.Code != http.StatusOK {
+		t.Fatalf("expected restarted onebot route 200, got %d: %s", oneBotResp.Code, oneBotResp.Body.String())
+	}
+	var oneBotPayload struct {
+		Status  string `json:"status"`
+		EventID string `json:"event_id"`
+	}
+	if err := json.Unmarshal(oneBotResp.Body.Bytes(), &oneBotPayload); err != nil {
+		t.Fatalf("decode restarted onebot response: %v", err)
+	}
+	if oneBotPayload.Status != "ok" || oneBotPayload.EventID == "" {
+		t.Fatalf("unexpected restarted onebot response %+v", oneBotPayload)
+	}
+	oneBotEvent, err := restarted.state.LoadEvent(t.Context(), oneBotPayload.EventID)
+	if err != nil {
+		t.Fatalf("load restarted onebot event: %v", err)
+	}
+	if oneBotEvent.Source != "onebot-beta" {
+		t.Fatalf("expected restarted onebot event source onebot-beta, got %+v", oneBotEvent)
+	}
+	expectedOneBotIdempotencyKey := "onebot:onebot-beta:group:" + strconv.FormatInt(oneBotMessageID, 10)
+	if oneBotEvent.IdempotencyKey != expectedOneBotIdempotencyKey {
+		t.Fatalf("expected restarted onebot idempotency key %q, got %+v", expectedOneBotIdempotencyKey, oneBotEvent)
+	}
+	if oneBotEvent.Metadata["adapter_instance_id"] != "adapter-onebot-beta" {
+		t.Fatalf("expected restarted onebot metadata to keep adapter instance id, got %+v", oneBotEvent.Metadata)
+	}
+
+	webhookReq := httptest.NewRequest(http.MethodPost, "/ingress/webhook/main", strings.NewReader(`{"event_type":"message.received","source":"client-spoofed","actor_id":"svc-1","text":"hello webhook after restart"}`))
+	webhookReq.Header.Set("Content-Type", "application/json")
+	webhookReq.Header.Set("X-Webhook-Token", "test-webhook-token")
+	webhookResp := httptest.NewRecorder()
+	restarted.ServeHTTP(webhookResp, webhookReq)
+	if webhookResp.Code != http.StatusOK {
+		t.Fatalf("expected restarted webhook ingress 200, got %d: %s", webhookResp.Code, webhookResp.Body.String())
+	}
+	var webhookPayload struct {
+		Status  string `json:"status"`
+		EventID string `json:"event_id"`
+		TraceID string `json:"trace_id"`
+	}
+	if err := json.Unmarshal(webhookResp.Body.Bytes(), &webhookPayload); err != nil {
+		t.Fatalf("decode restarted webhook response: %v", err)
+	}
+	if webhookPayload.Status != "ok" || webhookPayload.EventID == "" || webhookPayload.TraceID == "" {
+		t.Fatalf("unexpected restarted webhook response %+v", webhookPayload)
+	}
+	webhookEvent, err := restarted.state.LoadEvent(t.Context(), webhookPayload.EventID)
+	if err != nil {
+		t.Fatalf("load restarted webhook event: %v", err)
+	}
+	if webhookEvent.Source != "webhook-main" {
+		t.Fatalf("expected restarted webhook event source webhook-main, got %+v", webhookEvent)
+	}
+	if webhookEvent.Metadata["ingress_source"] != "client-spoofed" {
+		t.Fatalf("expected restarted webhook metadata to keep ingress_source, got %+v", webhookEvent.Metadata)
+	}
+	if webhookEvent.Metadata["adapter_instance_id"] != "adapter-webhook-main" {
+		t.Fatalf("expected restarted webhook metadata to keep adapter instance id, got %+v", webhookEvent.Metadata)
+	}
+	if !strings.HasPrefix(webhookEvent.IdempotencyKey, "webhook:webhook-main:message.received:") {
+		t.Fatalf("expected restarted webhook idempotency key prefix, got %+v", webhookEvent)
+	}
+
+	consoleReq := consoleRequestWithViewer("/api/console")
+	consoleResp := httptest.NewRecorder()
+	restarted.ServeHTTP(consoleResp, consoleReq)
+	if consoleResp.Code != http.StatusOK {
+		t.Fatalf("expected restarted console 200, got %d: %s", consoleResp.Code, consoleResp.Body.String())
+	}
+	var console runtimeConsoleResponse
+	if err := json.Unmarshal(consoleResp.Body.Bytes(), &console); err != nil {
+		t.Fatalf("decode restarted console payload: %v", err)
+	}
+	if console.Status.Adapters != 3 || !hasConsoleAdapter(console, "adapter-onebot-alpha") || !hasConsoleAdapter(console, "adapter-onebot-beta") || !hasConsoleAdapter(console, "adapter-webhook-main") {
+		t.Fatalf("expected restarted console to expose all configured adapter rows, got %+v", console)
+	}
+	assertRegisteredAdapterBindings(t, restarted.runtime, map[string]string{
+		"adapter-onebot-alpha": "onebot-alpha",
+		"adapter-onebot-beta":  "onebot-beta",
+		"adapter-webhook-main": "webhook-main",
+	})
 }
 
 func TestRuntimeAppRestoresPersistedDelayScheduleAfterRestart(t *testing.T) {

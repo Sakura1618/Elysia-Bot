@@ -9,22 +9,17 @@
 
 ## Backlog
 
-### 1. 扩充 e2e、fault injection 与 host/storage 组合验证
-- 覆盖插件崩溃、数据库断连、外部 API 429、重复事件、消息乱序、adapter 重连等关键失败场景。
-- 覆盖 SQLite / Postgres 与 inproc / subprocess 的关键组合 smoke，避免主路径切换时出现盲区。
-- 建立 nightly fault-injection、Postgres smoke、plugin matrix 级别的持续验证。
-
-### 2. 整理主路径文档与工程治理文档
+### 1. 整理主路径文档与工程治理文档
 - 恢复 `docs/roadmap` / ADR / feature maturity 说明，明确哪些能力是默认主路径、哪些只是骨架。
 - 把“先收口再扩张”的当前阶段判断写清楚，避免 README、TODO、实现状态继续漂移。
 - 以“内核年 / 生态年 / 平台年”组织长期层次，但不要把远期蓝图写成当前承诺。
 
-### 3. 继续打磨插件开发最小闭环
+### 2. 继续打磨插件开发最小闭环
 - 收口 scaffold → manifest → package → smoke 的 repo-local 插件开发流，减少模板与真实路径脱节。
 - 增补官方参考插件与插件开发手册，但目标是验证 runtime 语义，不是提前扩张插件市场。
 - 补权限声明、配置 schema、观测、发布约束等开发约定文档。
 
-### 4. 在读面优先前提下补有限控制面写路径
+### 3. 在读面优先前提下补有限控制面写路径
 - 在认证与审计收口后，再扩 plugin config、schedule、dead-letter、rollout 等最小写入口。
 - 保持 `console-web` 不是完整产品化控制面，避免 UI 范围再次跑到 runtime 收口前面。
 - 先补详情与状态可见性，再考虑批量操作和更强交互。
