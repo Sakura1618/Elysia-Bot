@@ -41,7 +41,7 @@ func TestSchedulerRestoreDispatchesToHelperSubprocessPlugin(t *testing.T) {
 
 	host := runtimecore.NewSubprocessPluginHost(testHelperPluginProcessFactory(t, "echo"))
 	runtime := runtimecore.NewInMemoryRuntime(runtimecore.NoopSupervisor{}, host)
-	plugin := pluginsdk.Plugin{Manifest: pluginsdk.PluginManifest{ID: "plugin-subprocess-fixture", Name: "Subprocess Fixture", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, Entry: pluginsdk.PluginEntry{Binary: "subprocess-fixture"}}, Handlers: pluginsdk.Handlers{Event: noopEventHandler{}}}
+	plugin := pluginsdk.Plugin{Manifest: pluginsdk.PluginManifest{SchemaVersion: pluginsdk.SupportedPluginManifestSchemaVersion, ID: "plugin-subprocess-fixture", Name: "Subprocess Fixture", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, Entry: pluginsdk.PluginEntry{Binary: "subprocess-fixture"}}, Handlers: pluginsdk.Handlers{Event: noopEventHandler{}}}
 	if err := runtime.RegisterPlugin(plugin); err != nil {
 		t.Fatalf("register subprocess fixture plugin: %v", err)
 	}

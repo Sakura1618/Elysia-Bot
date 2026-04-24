@@ -220,6 +220,18 @@ CREATE TABLE IF NOT EXISTS rollout_operation_records_pg (
   updated_at TIMESTAMPTZ NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS rollout_heads_pg (
+  plugin_id TEXT PRIMARY KEY,
+  stable_snapshot_json JSONB NOT NULL,
+  active_snapshot_json JSONB NOT NULL,
+  candidate_snapshot_json JSONB NULL,
+  phase TEXT NOT NULL,
+  status TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  last_operation_id TEXT NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS audit_log (
   actor TEXT NOT NULL,
   permission TEXT NOT NULL,
@@ -1152,6 +1164,33 @@ ON CONFLICT (operation_id) DO UPDATE SET
 	return nil
 }
 
+func (s *PostgresStore) SaveRolloutHead(ctx context.Context, state RolloutHeadState) error {
+	normalized, stableJSON, activeJSON, candidateJSON, err := normalizeRolloutHeadStateForSave(state)
+	if err != nil {
+		return err
+	}
+	_, err = s.pool.Exec(ctx, `
+INSERT INTO rollout_heads_pg (
+  plugin_id, stable_snapshot_json, active_snapshot_json, candidate_snapshot_json,
+  phase, status, reason, last_operation_id, updated_at
+)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+ON CONFLICT (plugin_id) DO UPDATE SET
+  stable_snapshot_json=excluded.stable_snapshot_json,
+  active_snapshot_json=excluded.active_snapshot_json,
+  candidate_snapshot_json=excluded.candidate_snapshot_json,
+  phase=excluded.phase,
+  status=excluded.status,
+  reason=excluded.reason,
+  last_operation_id=excluded.last_operation_id,
+  updated_at=excluded.updated_at
+`, normalized.PluginID, []byte(stableJSON), []byte(activeJSON), postgresOptionalJSON(candidateJSON), normalized.Phase, normalized.Status, normalized.Reason, normalized.LastOperationID, normalized.UpdatedAt.UTC())
+	if err != nil {
+		return fmt.Errorf("upsert rollout head: %w", err)
+	}
+	return nil
+}
+
 func (s *PostgresStore) ListRolloutOperationRecords(ctx context.Context) ([]RolloutOperationRecord, error) {
 	rows, err := s.pool.Query(ctx, `
 SELECT operation_id, plugin_id, action, current_version, candidate_version, status, reason, occurred_at, updated_at
@@ -1163,6 +1202,35 @@ ORDER BY occurred_at DESC, operation_id DESC
 	}
 	defer rows.Close()
 	return scanPostgresRolloutOperationRecords(rows)
+}
+
+func (s *PostgresStore) LoadRolloutHead(ctx context.Context, pluginID string) (RolloutHeadState, error) {
+	row := s.pool.QueryRow(ctx, `
+SELECT plugin_id, stable_snapshot_json, active_snapshot_json, candidate_snapshot_json, phase, status, reason, last_operation_id, updated_at
+FROM rollout_heads_pg
+WHERE plugin_id = $1
+`, strings.TrimSpace(pluginID))
+	state, err := scanPostgresRolloutHead(row)
+	if err != nil {
+		if isPostgresNoRows(err) {
+			return RolloutHeadState{}, sql.ErrNoRows
+		}
+		return RolloutHeadState{}, fmt.Errorf("load rollout head: %w", err)
+	}
+	return state, nil
+}
+
+func (s *PostgresStore) ListRolloutHeads(ctx context.Context) ([]RolloutHeadState, error) {
+	rows, err := s.pool.Query(ctx, `
+SELECT plugin_id, stable_snapshot_json, active_snapshot_json, candidate_snapshot_json, phase, status, reason, last_operation_id, updated_at
+FROM rollout_heads_pg
+ORDER BY plugin_id ASC
+`)
+	if err != nil {
+		return nil, fmt.Errorf("list rollout heads: %w", err)
+	}
+	defer rows.Close()
+	return scanPostgresRolloutHeads(rows)
 }
 
 func (s *PostgresStore) ReplaceCurrentRBACState(ctx context.Context, identities []OperatorIdentityState, snapshot RBACSnapshotState) error {
@@ -1374,6 +1442,7 @@ func (s *PostgresStore) Counts(ctx context.Context) (map[string]int, error) {
 		"plugin_enabled_overlays":   `SELECT COUNT(*) FROM plugin_enabled_overlays_pg`,
 		"plugin_configs":            `SELECT COUNT(*) FROM plugin_configs_pg`,
 		"plugin_status_snapshots":   `SELECT COUNT(*) FROM plugin_status_snapshots_pg`,
+		"rollout_heads":             `SELECT COUNT(*) FROM rollout_heads_pg`,
 		"adapter_instances":         `SELECT COUNT(*) FROM adapter_instances_pg`,
 		"sessions":                  `SELECT COUNT(*) FROM sessions_pg`,
 		"idempotency_keys":          `SELECT COUNT(*) FROM idempotency_keys_pg`,
@@ -1897,6 +1966,66 @@ func scanPostgresRolloutOperationRecords(rows postgresRows) ([]RolloutOperationR
 		return nil, fmt.Errorf("iterate rollout operation records: %w", err)
 	}
 	return records, nil
+}
+
+func postgresOptionalJSON(value any) any {
+	if value == nil {
+		return nil
+	}
+	if raw, ok := value.(string); ok {
+		return []byte(raw)
+	}
+	return value
+}
+
+func scanPostgresRolloutHead(row rowScanner) (RolloutHeadState, error) {
+	var (
+		state              RolloutHeadState
+		stableSnapshotJSON []byte
+		activeSnapshotJSON []byte
+		candidateSnapshot  []byte
+	)
+	if err := row.Scan(&state.PluginID, &stableSnapshotJSON, &activeSnapshotJSON, &candidateSnapshot, &state.Phase, &state.Status, &state.Reason, &state.LastOperationID, &state.UpdatedAt); err != nil {
+		return RolloutHeadState{}, err
+	}
+	if err := json.Unmarshal(stableSnapshotJSON, &state.Stable); err != nil {
+		return RolloutHeadState{}, fmt.Errorf("unmarshal rollout head stable snapshot: %w", err)
+	}
+	state.Stable = normalizeRolloutSnapshotState(state.Stable)
+	if err := json.Unmarshal(activeSnapshotJSON, &state.Active); err != nil {
+		return RolloutHeadState{}, fmt.Errorf("unmarshal rollout head active snapshot: %w", err)
+	}
+	state.Active = normalizeRolloutSnapshotState(state.Active)
+	if len(candidateSnapshot) > 0 && string(candidateSnapshot) != "null" {
+		candidate := RolloutSnapshotState{}
+		if err := json.Unmarshal(candidateSnapshot, &candidate); err != nil {
+			return RolloutHeadState{}, fmt.Errorf("unmarshal rollout head candidate snapshot: %w", err)
+		}
+		candidate = normalizeRolloutSnapshotState(candidate)
+		state.Candidate = &candidate
+	}
+	state.PluginID = strings.TrimSpace(state.PluginID)
+	state.Phase = strings.TrimSpace(state.Phase)
+	state.Status = strings.TrimSpace(state.Status)
+	state.Reason = strings.TrimSpace(state.Reason)
+	state.LastOperationID = strings.TrimSpace(state.LastOperationID)
+	state.UpdatedAt = state.UpdatedAt.UTC()
+	return state, nil
+}
+
+func scanPostgresRolloutHeads(rows postgresRows) ([]RolloutHeadState, error) {
+	states := make([]RolloutHeadState, 0)
+	for rows.Next() {
+		state, err := scanPostgresRolloutHead(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan rollout head: %w", err)
+		}
+		states = append(states, state)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate rollout heads: %w", err)
+	}
+	return states, nil
 }
 
 func scanPostgresAuditEntry(row rowScanner) (pluginsdk.AuditEntry, error) {

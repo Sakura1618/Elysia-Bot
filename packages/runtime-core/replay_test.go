@@ -17,7 +17,7 @@ func TestEventReplayerRedispatchesStoredEventWithReplayIdentity(t *testing.T) {
 	defer func() { _ = store.Close() }()
 	handler := &recordingEventHandler{}
 	runtime := NewInMemoryRuntime(NoopSupervisor{}, DirectPluginHost{})
-	if err := runtime.RegisterPlugin(pluginsdk.Plugin{
+	if err := registerPluginWithTestSchema(runtime, pluginsdk.Plugin{
 		Manifest: pluginsdk.PluginManifest{ID: "plugin-echo", Name: "Echo Plugin", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, Entry: pluginsdk.PluginEntry{Module: "plugins/echo", Symbol: "Plugin"}},
 		Handlers: pluginsdk.Handlers{Event: handler},
 	}); err != nil {
@@ -80,7 +80,7 @@ func TestEventReplayerReturnsReplayIdentityOnDispatchFailure(t *testing.T) {
 	store := openTempSQLiteStore(t)
 	defer func() { _ = store.Close() }()
 	runtime := NewInMemoryRuntime(NoopSupervisor{}, DirectPluginHost{})
-	if err := runtime.RegisterPlugin(pluginsdk.Plugin{
+	if err := registerPluginWithTestSchema(runtime, pluginsdk.Plugin{
 		Manifest: pluginsdk.PluginManifest{ID: "plugin-fail", Name: "Fail Plugin", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, Entry: pluginsdk.PluginEntry{Module: "plugins/fail", Symbol: "Plugin"}},
 		Handlers: pluginsdk.Handlers{Event: failingEventHandler{}},
 	}); err != nil {
@@ -172,7 +172,7 @@ func TestEventReplayerRejectsReplayTaggedStoredEvent(t *testing.T) {
 	defer func() { _ = store.Close() }()
 	handler := &recordingEventHandler{}
 	runtime := NewInMemoryRuntime(NoopSupervisor{}, DirectPluginHost{})
-	if err := runtime.RegisterPlugin(pluginsdk.Plugin{
+	if err := registerPluginWithTestSchema(runtime, pluginsdk.Plugin{
 		Manifest: pluginsdk.PluginManifest{ID: "plugin-echo", Name: "Echo Plugin", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, Entry: pluginsdk.PluginEntry{Module: "plugins/echo", Symbol: "Plugin"}},
 		Handlers: pluginsdk.Handlers{Event: handler},
 	}); err != nil {
@@ -208,7 +208,7 @@ func TestEventReplayerRejectsStoredEventWithReplayIdentityPrefixEvenWithoutMetad
 	defer func() { _ = store.Close() }()
 	handler := &recordingEventHandler{}
 	runtime := NewInMemoryRuntime(NoopSupervisor{}, DirectPluginHost{})
-	if err := runtime.RegisterPlugin(pluginsdk.Plugin{
+	if err := registerPluginWithTestSchema(runtime, pluginsdk.Plugin{
 		Manifest: pluginsdk.PluginManifest{ID: "plugin-echo", Name: "Echo Plugin", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, Entry: pluginsdk.PluginEntry{Module: "plugins/echo", Symbol: "Plugin"}},
 		Handlers: pluginsdk.Handlers{Event: handler},
 	}); err != nil {
@@ -244,7 +244,7 @@ func TestEventReplayerAllowsUnrelatedReplayOfMetadataWithoutReplayFlags(t *testi
 	defer func() { _ = store.Close() }()
 	handler := &recordingEventHandler{}
 	runtime := NewInMemoryRuntime(NoopSupervisor{}, DirectPluginHost{})
-	if err := runtime.RegisterPlugin(pluginsdk.Plugin{
+	if err := registerPluginWithTestSchema(runtime, pluginsdk.Plugin{
 		Manifest: pluginsdk.PluginManifest{ID: "plugin-echo", Name: "Echo Plugin", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, Entry: pluginsdk.PluginEntry{Module: "plugins/echo", Symbol: "Plugin"}},
 		Handlers: pluginsdk.Handlers{Event: handler},
 	}); err != nil {

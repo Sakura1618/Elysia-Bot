@@ -9,6 +9,11 @@ import (
 	pluginsdk "github.com/ohmyopencode/bot-platform/packages/plugin-sdk"
 )
 
+const (
+	pluginAIChatPublishSourceURI    = "https://github.com/ohmyopencode/bot-platform/tree/main/plugins/plugin-ai-chat"
+	pluginAIChatRuntimeVersionRange = ">=0.1.0 <1.0.0"
+)
+
 type AIProvider interface {
 	Generate(ctx context.Context, prompt string) (string, error)
 }
@@ -37,16 +42,22 @@ type Plugin struct {
 func New(queue JobQueue, provider AIProvider, sessions SessionStore, replyService pluginsdk.ReplyService) *Plugin {
 	return &Plugin{
 		Manifest: pluginsdk.PluginManifest{
-			ID:         "plugin-ai-chat",
-			Name:       "AI Chat Plugin",
-			Version:    "0.1.0",
-			APIVersion: "v0",
-			Mode:       pluginsdk.ModeSubprocess,
+			SchemaVersion: pluginsdk.SupportedPluginManifestSchemaVersion,
+			ID:            "plugin-ai-chat",
+			Name:          "AI Chat Plugin",
+			Version:       "0.1.0",
+			APIVersion:    "v0",
+			Mode:          pluginsdk.ModeSubprocess,
 			Permissions: []string{
 				"reply:send",
 				"job:enqueue",
 				"job:run",
 				"session:write",
+			},
+			Publish: &pluginsdk.PluginPublish{
+				SourceType:          pluginsdk.PublishSourceTypeGit,
+				SourceURI:           pluginAIChatPublishSourceURI,
+				RuntimeVersionRange: pluginAIChatRuntimeVersionRange,
 			},
 			Entry: pluginsdk.PluginEntry{Module: "plugins/plugin-ai-chat", Symbol: "Plugin"},
 		},

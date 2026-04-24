@@ -276,6 +276,32 @@ func TestPluginAIChatRejectsEventWithoutReplyHandle(t *testing.T) {
 	}
 }
 
+func TestPluginAIChatManifestAdoptsV1Contract(t *testing.T) {
+	t.Parallel()
+
+	plugin := New(newJobQueueStub(), providerStub{response: "hello"}, &sessionRecorder{}, &replyRecorder{})
+	manifest := plugin.Manifest
+
+	if manifest.SchemaVersion != pluginsdk.SupportedPluginManifestSchemaVersion {
+		t.Fatalf("manifest schemaVersion = %q, want %q", manifest.SchemaVersion, pluginsdk.SupportedPluginManifestSchemaVersion)
+	}
+	if manifest.Publish == nil {
+		t.Fatal("manifest publish metadata is required")
+	}
+	if manifest.Publish.SourceType != pluginsdk.PublishSourceTypeGit {
+		t.Fatalf("manifest publish sourceType = %q, want %q", manifest.Publish.SourceType, pluginsdk.PublishSourceTypeGit)
+	}
+	if manifest.Publish.SourceURI != pluginAIChatPublishSourceURI {
+		t.Fatalf("manifest publish sourceUri = %q, want %q", manifest.Publish.SourceURI, pluginAIChatPublishSourceURI)
+	}
+	if manifest.Publish.RuntimeVersionRange != pluginAIChatRuntimeVersionRange {
+		t.Fatalf("manifest publish runtimeVersionRange = %q, want %q", manifest.Publish.RuntimeVersionRange, pluginAIChatRuntimeVersionRange)
+	}
+	if err := manifest.Validate(); err != nil {
+		t.Fatalf("expected plugin-ai-chat manifest to validate, got %v", err)
+	}
+}
+
 func TestPluginAIChatReplyFailureTransitionsJobOutOfRunning(t *testing.T) {
 	t.Parallel()
 

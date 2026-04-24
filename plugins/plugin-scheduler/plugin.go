@@ -10,6 +10,11 @@ import (
 	pluginsdk "github.com/ohmyopencode/bot-platform/packages/plugin-sdk"
 )
 
+const (
+	pluginSchedulerPublishSourceURI    = "https://github.com/ohmyopencode/bot-platform/tree/main/plugins/plugin-scheduler"
+	pluginSchedulerRuntimeVersionRange = ">=0.1.0 <1.0.0"
+)
+
 type SchedulerService interface {
 	Register(plan pluginsdk.SchedulePlan) error
 	Plan(id string) (pluginsdk.SchedulePlan, error)
@@ -27,13 +32,19 @@ type Plugin struct {
 func New(scheduler SchedulerService, replyService pluginsdk.ReplyService) Plugin {
 	return Plugin{
 		Manifest: pluginsdk.PluginManifest{
-			ID:          "plugin-scheduler",
-			Name:        "Scheduler Plugin",
-			Version:     "0.1.0",
-			APIVersion:  "v0",
-			Mode:        pluginsdk.ModeSubprocess,
-			Permissions: []string{"reply:send", "schedule:manage"},
-			Entry:       pluginsdk.PluginEntry{Module: "plugins/plugin-scheduler", Symbol: "Plugin"},
+			SchemaVersion: pluginsdk.SupportedPluginManifestSchemaVersion,
+			ID:            "plugin-scheduler",
+			Name:          "Scheduler Plugin",
+			Version:       "0.1.0",
+			APIVersion:    "v0",
+			Mode:          pluginsdk.ModeSubprocess,
+			Permissions:   []string{"reply:send", "schedule:manage"},
+			Publish: &pluginsdk.PluginPublish{
+				SourceType:          pluginsdk.PublishSourceTypeGit,
+				SourceURI:           pluginSchedulerPublishSourceURI,
+				RuntimeVersionRange: pluginSchedulerRuntimeVersionRange,
+			},
+			Entry: pluginsdk.PluginEntry{Module: "plugins/plugin-scheduler", Symbol: "Plugin"},
 		},
 		Scheduler:    scheduler,
 		ReplyService: replyService,

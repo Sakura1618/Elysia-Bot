@@ -340,6 +340,89 @@ func TestSQLiteStateStoreRetainsMetadataAcrossReopen(t *testing.T) {
 	}
 }
 
+func TestSQLiteStateStorePersistsRolloutHeadsAcrossReopen(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "state.db")
+	ctx := context.Background()
+	updatedAt := time.Date(2026, 4, 24, 9, 0, 0, 0, time.UTC)
+	state := RolloutHeadState{
+		PluginID: "plugin-echo",
+		Stable: RolloutSnapshotState{
+			Version:    "0.1.0",
+			APIVersion: "v0",
+			Mode:       pluginsdk.ModeSubprocess,
+		},
+		Active: RolloutSnapshotState{
+			Version:    "0.1.0",
+			APIVersion: "v0",
+			Mode:       pluginsdk.ModeSubprocess,
+		},
+		Candidate: &RolloutSnapshotState{
+			Version:    "0.2.0-candidate",
+			APIVersion: "v0",
+			Mode:       pluginsdk.ModeSubprocess,
+		},
+		Phase:           "prepared",
+		Status:          "prepared",
+		Reason:          "",
+		LastOperationID: "rollout-op-prepare-plugin-echo-1",
+		UpdatedAt:       updatedAt,
+	}
+
+	store, err := OpenSQLiteStateStore(path)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	if err := store.SaveRolloutHead(ctx, state); err != nil {
+		t.Fatalf("save rollout head: %v", err)
+	}
+	loadedBeforeClose, err := store.LoadRolloutHead(ctx, state.PluginID)
+	if err != nil {
+		t.Fatalf("load rollout head before close: %v", err)
+	}
+	if loadedBeforeClose.PluginID != state.PluginID || loadedBeforeClose.Phase != state.Phase || loadedBeforeClose.LastOperationID != state.LastOperationID {
+		t.Fatalf("unexpected rollout head before close %+v", loadedBeforeClose)
+	}
+	if loadedBeforeClose.Candidate == nil || loadedBeforeClose.Candidate.Version != state.Candidate.Version {
+		t.Fatalf("expected candidate snapshot before close, got %+v", loadedBeforeClose)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	reopened, err := OpenSQLiteStateStore(path)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer func() { _ = reopened.Close() }()
+
+	loaded, err := reopened.LoadRolloutHead(ctx, state.PluginID)
+	if err != nil {
+		t.Fatalf("load rollout head after reopen: %v", err)
+	}
+	if loaded.PluginID != state.PluginID || loaded.Stable.Version != "0.1.0" || loaded.Active.Version != "0.1.0" || loaded.Phase != "prepared" || loaded.Status != "prepared" || loaded.LastOperationID != state.LastOperationID {
+		t.Fatalf("unexpected reopened rollout head %+v", loaded)
+	}
+	if loaded.Candidate == nil || loaded.Candidate.Version != "0.2.0-candidate" || loaded.Candidate.APIVersion != "v0" || loaded.Candidate.Mode != pluginsdk.ModeSubprocess {
+		t.Fatalf("expected reopened candidate snapshot, got %+v", loaded)
+	}
+	listed, err := reopened.ListRolloutHeads(ctx)
+	if err != nil {
+		t.Fatalf("list rollout heads: %v", err)
+	}
+	if len(listed) != 1 || listed[0].PluginID != state.PluginID {
+		t.Fatalf("expected one rollout head, got %+v", listed)
+	}
+	counts, err := reopened.Counts(ctx)
+	if err != nil {
+		t.Fatalf("counts after reopen: %v", err)
+	}
+	if counts["rollout_heads"] != 1 {
+		t.Fatalf("expected one rollout head count, got %+v", counts)
+	}
+}
+
 func TestSQLiteStateStorePersistsPluginConfigAcrossReopen(t *testing.T) {
 	t.Parallel()
 

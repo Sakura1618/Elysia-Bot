@@ -33,7 +33,7 @@ func TestScaffoldRepoPluginCreatesRepoLocalPluginFlow(t *testing.T) {
 
 	targetDir, err := ScaffoldRepoPlugin(ScaffoldOptions{WorkspaceRoot: workspaceRoot, PluginID: "plugin-sample-alpha"})
 	if err != nil {
-		 t.Fatalf("scaffold plugin: %v", err)
+		t.Fatalf("scaffold plugin: %v", err)
 	}
 
 	if _, err := os.Stat(filepath.Join(targetDir, "manifest_test.go")); err != nil {
@@ -141,7 +141,7 @@ func createPluginWorkspaceFixture(t *testing.T) string {
 	repoRoot := repoRootFromTestFile(t)
 	workspaceRoot := t.TempDir()
 
-	goWork := "go 1.25.0\n\nuse (\n\t./packages/event-model\n\t./packages/plugin-sdk\n\t./plugins/plugin-template-smoke\n)\n"
+	goWork := "go 1.25.0\n\nuse (\n\t./packages/event-model\n\t./packages/plugin-sdk\n\t./packages/runtime-core\n\t./plugins/plugin-template-smoke\n)\n"
 	if err := os.WriteFile(filepath.Join(workspaceRoot, "go.work"), []byte(goWork), 0o644); err != nil {
 		t.Fatalf("write fixture go.work: %v", err)
 	}
@@ -156,6 +156,7 @@ func createPluginWorkspaceFixture(t *testing.T) string {
 
 	copyDirOrFail("packages/event-model")
 	copyDirOrFail("packages/plugin-sdk")
+	copyDirOrFail("packages/runtime-core")
 	copyDirOrFail("plugins/plugin-template-smoke")
 
 	return workspaceRoot

@@ -176,6 +176,18 @@ CREATE TABLE IF NOT EXISTS rollout_operation_records (
   updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS rollout_heads (
+  plugin_id TEXT PRIMARY KEY,
+  stable_snapshot_json TEXT NOT NULL,
+  active_snapshot_json TEXT NOT NULL,
+  candidate_snapshot_json TEXT,
+  phase TEXT NOT NULL,
+  status TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  last_operation_id TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS audit_log (
   actor TEXT NOT NULL,
   permission TEXT NOT NULL DEFAULT '',
@@ -295,6 +307,24 @@ type RolloutOperationRecord struct {
 	Reason           string
 	OccurredAt       time.Time
 	UpdatedAt        time.Time
+}
+
+type RolloutSnapshotState struct {
+	Version    string
+	APIVersion string
+	Mode       string
+}
+
+type RolloutHeadState struct {
+	PluginID        string
+	Stable          RolloutSnapshotState
+	Active          RolloutSnapshotState
+	Candidate       *RolloutSnapshotState
+	Phase           string
+	Status          string
+	Reason          string
+	LastOperationID string
+	UpdatedAt       time.Time
 }
 
 type storedSchedulePlan struct {
@@ -1287,6 +1317,7 @@ func (s *SQLiteStateStore) Counts(ctx context.Context) (map[string]int, error) {
 		"plugin_enabled_overlays":   `SELECT COUNT(*) FROM plugin_enabled_overlays`,
 		"plugin_configs":            `SELECT COUNT(*) FROM plugin_configs`,
 		"plugin_status_snapshots":   `SELECT COUNT(*) FROM plugin_status_snapshots`,
+		"rollout_heads":             `SELECT COUNT(*) FROM rollout_heads`,
 		"adapter_instances":         `SELECT COUNT(*) FROM adapter_instances`,
 		"sessions":                  `SELECT COUNT(*) FROM sessions`,
 		"idempotency_keys":          `SELECT COUNT(*) FROM idempotency_keys`,
@@ -1445,6 +1476,13 @@ func (s *SQLiteStateStore) SaveRolloutOperationRecord(ctx context.Context, recor
 	return saveRolloutOperationRecordWithExecutor(ctx, s.db, record)
 }
 
+func (s *SQLiteStateStore) SaveRolloutHead(ctx context.Context, state RolloutHeadState) error {
+	if s == nil {
+		return fmt.Errorf("save rollout head: sqlite state store is required")
+	}
+	return saveRolloutHeadWithExecutor(ctx, s.db, state)
+}
+
 func saveRolloutOperationRecordWithExecutor(ctx context.Context, executor sqliteExecContexter, record RolloutOperationRecord) error {
 	record.OperationID = strings.TrimSpace(record.OperationID)
 	if record.OperationID == "" {
@@ -1490,6 +1528,33 @@ ON CONFLICT(operation_id) DO UPDATE SET
 	return nil
 }
 
+func saveRolloutHeadWithExecutor(ctx context.Context, executor sqliteExecContexter, state RolloutHeadState) error {
+	normalized, stableJSON, activeJSON, candidateJSON, err := normalizeRolloutHeadStateForSave(state)
+	if err != nil {
+		return err
+	}
+	_, err = executor.ExecContext(ctx, `
+INSERT INTO rollout_heads (
+  plugin_id, stable_snapshot_json, active_snapshot_json, candidate_snapshot_json,
+  phase, status, reason, last_operation_id, updated_at
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(plugin_id) DO UPDATE SET
+  stable_snapshot_json=excluded.stable_snapshot_json,
+  active_snapshot_json=excluded.active_snapshot_json,
+  candidate_snapshot_json=excluded.candidate_snapshot_json,
+  phase=excluded.phase,
+  status=excluded.status,
+  reason=excluded.reason,
+  last_operation_id=excluded.last_operation_id,
+  updated_at=excluded.updated_at
+`, normalized.PluginID, stableJSON, activeJSON, candidateJSON, normalized.Phase, normalized.Status, normalized.Reason, normalized.LastOperationID, formatSQLiteTimestamp(normalized.UpdatedAt))
+	if err != nil {
+		return fmt.Errorf("upsert rollout head: %w", err)
+	}
+	return nil
+}
+
 func (s *SQLiteStateStore) ListRolloutOperationRecords(ctx context.Context) ([]RolloutOperationRecord, error) {
 	rows, err := s.db.QueryContext(ctx, `
 SELECT operation_id, plugin_id, action, current_version, candidate_version, status, reason, occurred_at, updated_at
@@ -1501,6 +1566,39 @@ ORDER BY occurred_at DESC, operation_id DESC
 	}
 	defer rows.Close()
 	return scanRolloutOperationRecords(rows)
+}
+
+func (s *SQLiteStateStore) LoadRolloutHead(ctx context.Context, pluginID string) (RolloutHeadState, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT plugin_id, stable_snapshot_json, active_snapshot_json, candidate_snapshot_json, phase, status, reason, last_operation_id, updated_at
+FROM rollout_heads
+WHERE plugin_id = ?
+`, strings.TrimSpace(pluginID))
+	if err != nil {
+		return RolloutHeadState{}, fmt.Errorf("load rollout head: %w", err)
+	}
+	defer rows.Close()
+	states, err := scanRolloutHeads(rows)
+	if err != nil {
+		return RolloutHeadState{}, err
+	}
+	if len(states) == 0 {
+		return RolloutHeadState{}, sql.ErrNoRows
+	}
+	return states[0], nil
+}
+
+func (s *SQLiteStateStore) ListRolloutHeads(ctx context.Context) ([]RolloutHeadState, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT plugin_id, stable_snapshot_json, active_snapshot_json, candidate_snapshot_json, phase, status, reason, last_operation_id, updated_at
+FROM rollout_heads
+ORDER BY plugin_id ASC
+`)
+	if err != nil {
+		return nil, fmt.Errorf("list rollout heads: %w", err)
+	}
+	defer rows.Close()
+	return scanRolloutHeads(rows)
 }
 
 func (s *SQLiteStateStore) ReplaceCurrentRBACState(ctx context.Context, identities []OperatorIdentityState, snapshot RBACSnapshotState) error {
@@ -1919,6 +2017,117 @@ func scanRolloutOperationRecords(rows *sql.Rows) ([]RolloutOperationRecord, erro
 		return nil, fmt.Errorf("iterate rollout operation records: %w", err)
 	}
 	return records, nil
+}
+
+func normalizeRolloutSnapshotState(snapshot RolloutSnapshotState) RolloutSnapshotState {
+	snapshot.Version = strings.TrimSpace(snapshot.Version)
+	snapshot.APIVersion = strings.TrimSpace(snapshot.APIVersion)
+	snapshot.Mode = strings.TrimSpace(snapshot.Mode)
+	return snapshot
+}
+
+func normalizeRolloutHeadStateForSave(state RolloutHeadState) (RolloutHeadState, string, string, any, error) {
+	state.PluginID = strings.TrimSpace(state.PluginID)
+	if state.PluginID == "" {
+		return RolloutHeadState{}, "", "", nil, fmt.Errorf("save rollout head: plugin id is required")
+	}
+	state.Stable = normalizeRolloutSnapshotState(state.Stable)
+	if state.Stable.Version == "" {
+		return RolloutHeadState{}, "", "", nil, fmt.Errorf("save rollout head: stable version is required")
+	}
+	state.Active = normalizeRolloutSnapshotState(state.Active)
+	if state.Active.Version == "" {
+		return RolloutHeadState{}, "", "", nil, fmt.Errorf("save rollout head: active version is required")
+	}
+	if state.Candidate != nil {
+		candidate := normalizeRolloutSnapshotState(*state.Candidate)
+		if candidate.Version == "" {
+			return RolloutHeadState{}, "", "", nil, fmt.Errorf("save rollout head: candidate version is required when candidate snapshot is present")
+		}
+		state.Candidate = &candidate
+	}
+	state.Phase = strings.TrimSpace(state.Phase)
+	if state.Phase == "" {
+		return RolloutHeadState{}, "", "", nil, fmt.Errorf("save rollout head: phase is required")
+	}
+	state.Status = strings.TrimSpace(state.Status)
+	if state.Status == "" {
+		return RolloutHeadState{}, "", "", nil, fmt.Errorf("save rollout head: status is required")
+	}
+	state.Reason = strings.TrimSpace(state.Reason)
+	state.LastOperationID = strings.TrimSpace(state.LastOperationID)
+	if state.LastOperationID == "" {
+		return RolloutHeadState{}, "", "", nil, fmt.Errorf("save rollout head: last operation id is required")
+	}
+	if state.UpdatedAt.IsZero() {
+		state.UpdatedAt = time.Now().UTC()
+	} else {
+		state.UpdatedAt = state.UpdatedAt.UTC()
+	}
+	stableJSONBytes, err := json.Marshal(state.Stable)
+	if err != nil {
+		return RolloutHeadState{}, "", "", nil, fmt.Errorf("marshal rollout head stable snapshot: %w", err)
+	}
+	activeJSONBytes, err := json.Marshal(state.Active)
+	if err != nil {
+		return RolloutHeadState{}, "", "", nil, fmt.Errorf("marshal rollout head active snapshot: %w", err)
+	}
+	var candidateValue any
+	if state.Candidate != nil {
+		candidateJSONBytes, err := json.Marshal(*state.Candidate)
+		if err != nil {
+			return RolloutHeadState{}, "", "", nil, fmt.Errorf("marshal rollout head candidate snapshot: %w", err)
+		}
+		candidateValue = string(candidateJSONBytes)
+	}
+	return state, string(stableJSONBytes), string(activeJSONBytes), candidateValue, nil
+}
+
+func scanRolloutHeads(rows *sql.Rows) ([]RolloutHeadState, error) {
+	states := make([]RolloutHeadState, 0)
+	for rows.Next() {
+		var (
+			state                RolloutHeadState
+			stableSnapshotJSON   string
+			activeSnapshotJSON   string
+			candidateSnapshotRaw sql.NullString
+			updatedAtRaw         string
+		)
+		if err := rows.Scan(&state.PluginID, &stableSnapshotJSON, &activeSnapshotJSON, &candidateSnapshotRaw, &state.Phase, &state.Status, &state.Reason, &state.LastOperationID, &updatedAtRaw); err != nil {
+			return nil, fmt.Errorf("scan rollout head: %w", err)
+		}
+		if err := json.Unmarshal([]byte(stableSnapshotJSON), &state.Stable); err != nil {
+			return nil, fmt.Errorf("unmarshal rollout head stable snapshot: %w", err)
+		}
+		state.Stable = normalizeRolloutSnapshotState(state.Stable)
+		if err := json.Unmarshal([]byte(activeSnapshotJSON), &state.Active); err != nil {
+			return nil, fmt.Errorf("unmarshal rollout head active snapshot: %w", err)
+		}
+		state.Active = normalizeRolloutSnapshotState(state.Active)
+		if candidateSnapshotRaw.Valid && strings.TrimSpace(candidateSnapshotRaw.String) != "" && candidateSnapshotRaw.String != "null" {
+			candidate := RolloutSnapshotState{}
+			if err := json.Unmarshal([]byte(candidateSnapshotRaw.String), &candidate); err != nil {
+				return nil, fmt.Errorf("unmarshal rollout head candidate snapshot: %w", err)
+			}
+			candidate = normalizeRolloutSnapshotState(candidate)
+			state.Candidate = &candidate
+		}
+		updatedAt, err := parseSQLiteTimestamp(updatedAtRaw)
+		if err != nil {
+			return nil, fmt.Errorf("parse rollout head updated_at: %w", err)
+		}
+		state.PluginID = strings.TrimSpace(state.PluginID)
+		state.Phase = strings.TrimSpace(state.Phase)
+		state.Status = strings.TrimSpace(state.Status)
+		state.Reason = strings.TrimSpace(state.Reason)
+		state.LastOperationID = strings.TrimSpace(state.LastOperationID)
+		state.UpdatedAt = updatedAt
+		states = append(states, state)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate rollout heads: %w", err)
+	}
+	return states, nil
 }
 
 func scanAuditEntries(rows *sql.Rows) ([]pluginsdk.AuditEntry, error) {

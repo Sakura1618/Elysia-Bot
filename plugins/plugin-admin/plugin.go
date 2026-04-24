@@ -10,6 +10,11 @@ import (
 	pluginsdk "github.com/ohmyopencode/bot-platform/packages/plugin-sdk"
 )
 
+const (
+	pluginAdminPublishSourceURI    = "https://github.com/ohmyopencode/bot-platform/tree/main/plugins/plugin-admin"
+	pluginAdminRuntimeVersionRange = ">=0.1.0 <1.0.0"
+)
+
 type PluginLifecycleService interface {
 	Enable(pluginID string) error
 	Disable(pluginID string) error
@@ -17,8 +22,11 @@ type PluginLifecycleService interface {
 
 type RolloutManager interface {
 	Prepare(pluginID string) (pluginsdk.RolloutRecord, error)
+	Canary(pluginID string) (pluginsdk.RolloutRecord, error)
 	CanActivate(pluginID string) (pluginsdk.RolloutRecord, error)
 	Activate(pluginID string) (pluginsdk.RolloutRecord, error)
+	CanRollback(pluginID string) (pluginsdk.RolloutRecord, error)
+	Rollback(pluginID string) (pluginsdk.RolloutRecord, error)
 	Record(pluginID string) (pluginsdk.RolloutRecord, bool)
 }
 
@@ -34,33 +42,45 @@ type CurrentAuthorizerProvider interface {
 	CurrentAuthorizer() *pluginsdk.Authorizer
 }
 
+type AuthorizationService interface {
+	Authorize(actor, permission, target string) pluginsdk.AuthorizationDecision
+	AuthorizeTarget(actor, permission string, kind pluginsdk.AuthorizationTargetKind, target string) pluginsdk.AuthorizationDecision
+}
+
 type RolePolicy = pluginsdk.AuthorizationPolicy
 
 type Plugin struct {
-	Manifest      pluginsdk.PluginManifest
-	Lifecycle     PluginLifecycleService
-	Rollouts      RolloutManager
-	Replay        ReplayService
-	AuditTrail    []pluginsdk.AuditEntry
-	AuditRecorder AuditRecorder
-	Authorizer    *pluginsdk.Authorizer
-	Provider      CurrentAuthorizerProvider
-	CurrentTime   func() time.Time
+	Manifest           pluginsdk.PluginManifest
+	Lifecycle          PluginLifecycleService
+	Rollouts           RolloutManager
+	Replay             ReplayService
+	AuditTrail         []pluginsdk.AuditEntry
+	AuditRecorder      AuditRecorder
+	Authorizer         *pluginsdk.Authorizer
+	Provider           CurrentAuthorizerProvider
+	DecisionAuthorizer AuthorizationService
+	CurrentTime        func() time.Time
 }
 
 func New(lifecycle PluginLifecycleService, rollouts RolloutManager, replay ReplayService, provider CurrentAuthorizerProvider, actorRoles map[string][]string, policies map[string]RolePolicy, recorder AuditRecorder) *Plugin {
 	return &Plugin{
 		Manifest: pluginsdk.PluginManifest{
-			ID:         "plugin-admin",
-			Name:       "Admin Plugin",
-			Version:    "0.1.0",
-			APIVersion: "v0",
-			Mode:       pluginsdk.ModeSubprocess,
+			SchemaVersion: pluginsdk.SupportedPluginManifestSchemaVersion,
+			ID:            "plugin-admin",
+			Name:          "Admin Plugin",
+			Version:       "0.1.0",
+			APIVersion:    "v0",
+			Mode:          pluginsdk.ModeSubprocess,
 			Permissions: []string{
 				"plugin:enable",
 				"plugin:disable",
 				"plugin:replay",
 				"plugin:rollout",
+			},
+			Publish: &pluginsdk.PluginPublish{
+				SourceType:          pluginsdk.PublishSourceTypeGit,
+				SourceURI:           pluginAdminPublishSourceURI,
+				RuntimeVersionRange: pluginAdminRuntimeVersionRange,
 			},
 			Entry: pluginsdk.PluginEntry{Module: "plugins/plugin-admin", Symbol: "Plugin"},
 		},
@@ -78,6 +98,13 @@ func (p *Plugin) Definition() pluginsdk.Plugin {
 	return pluginsdk.Plugin{Manifest: p.Manifest, Handlers: pluginsdk.Handlers{Command: p}}
 }
 
+func (p *Plugin) SetDecisionAuthorizer(authorizer AuthorizationService) {
+	if p == nil {
+		return
+	}
+	p.DecisionAuthorizer = authorizer
+}
+
 func (p *Plugin) OnCommand(command eventmodel.CommandInvocation, ctx eventmodel.ExecutionContext) error {
 	actor := actorFromCommand(command)
 
@@ -88,7 +115,7 @@ func (p *Plugin) OnCommand(command eventmodel.CommandInvocation, ctx eventmodel.
 
 	action := parts[1]
 	target := parts[2]
-	if action == "prepare" || action == "activate" {
+	if action == "prepare" || action == "canary" || action == "activate" || action == "rollback" {
 		return p.handleRollout(command, ctx, actor, action, target)
 	}
 	if action == "replay" {
@@ -98,7 +125,7 @@ func (p *Plugin) OnCommand(command eventmodel.CommandInvocation, ctx eventmodel.
 	if permission == "" {
 		return p.recordAndJoin(command, ctx, actor, action, target, "", false, fmt.Errorf("unsupported admin action %q", action))
 	}
-	decision := p.currentAuthorizer().Authorize(actor, permission, target)
+	decision := p.currentAuthorizationService().Authorize(actor, permission, target)
 	if !decision.Allowed {
 		return p.recordAndJoin(command, ctx, actor, action, target, permission, false, errors.New(decision.Reason))
 	}
@@ -115,7 +142,7 @@ func (p *Plugin) OnCommand(command eventmodel.CommandInvocation, ctx eventmodel.
 
 func (p *Plugin) handleReplay(command eventmodel.CommandInvocation, ctx eventmodel.ExecutionContext, actor, eventID string) error {
 	permission := permissionForAction("replay")
-	decision := p.currentAuthorizer().AuthorizeTarget(actor, permission, pluginsdk.AuthorizationTargetEvent, eventID)
+	decision := p.currentAuthorizationService().AuthorizeTarget(actor, permission, pluginsdk.AuthorizationTargetEvent, eventID)
 	if !decision.Allowed {
 		return p.recordAndJoin(command, ctx, actor, "replay", eventID, permission, false, errors.New(decision.Reason))
 	}
@@ -131,7 +158,7 @@ func (p *Plugin) handleRollout(command eventmodel.CommandInvocation, ctx eventmo
 	if permission == "" {
 		return p.recordAndJoin(command, ctx, actor, action, target, "", false, fmt.Errorf("unsupported admin action %q", action))
 	}
-	decision := p.currentAuthorizer().Authorize(actor, permission, target)
+	decision := p.currentAuthorizationService().Authorize(actor, permission, target)
 	if !decision.Allowed {
 		return p.recordAndJoin(command, ctx, actor, action, target, permission, false, errors.New(decision.Reason))
 	}
@@ -142,6 +169,8 @@ func (p *Plugin) handleRollout(command eventmodel.CommandInvocation, ctx eventmo
 	switch action {
 	case "prepare":
 		_, err = p.Rollouts.Prepare(target)
+	case "canary":
+		_, err = p.Rollouts.Canary(target)
 	case "activate":
 		if _, err = p.Rollouts.CanActivate(target); err != nil {
 			break
@@ -154,6 +183,11 @@ func (p *Plugin) handleRollout(command eventmodel.CommandInvocation, ctx eventmo
 			break
 		}
 		_, err = p.Rollouts.Activate(target)
+	case "rollback":
+		if _, err = p.Rollouts.CanRollback(target); err != nil {
+			break
+		}
+		_, err = p.Rollouts.Rollback(target)
 	}
 	return p.recordAndJoin(command, ctx, actor, action, target, permission, true, err)
 }
@@ -284,8 +318,12 @@ func auditReason(action, permission string, actionErr error) string {
 			return "plugin_disabled"
 		case "prepare":
 			return "rollout_prepared"
+		case "canary":
+			return "rollout_canary_started"
 		case "activate":
 			return "rollout_activated"
+		case "rollback":
+			return "rollout_rolled_back"
 		default:
 			return ""
 		}
@@ -301,13 +339,15 @@ func auditReason(action, permission string, actionErr error) string {
 		return "scope_denied"
 	case strings.Contains(message, "rollout is not prepared"):
 		return "rollout_not_prepared"
+	case strings.Contains(message, "invalid rollout transition"):
+		return "rollout_invalid_transition"
 	case strings.Contains(message, "drifted after prepare"):
 		return "rollout_drifted"
 	case strings.Contains(message, "cannot replay a replayed event"):
 		return "replay_rejected"
 	case action == "replay":
 		return "replay_failed"
-	case action == "prepare" || action == "activate":
+	case action == "prepare" || action == "canary" || action == "activate" || action == "rollback":
 		return "rollout_failed"
 	default:
 		return "action_failed"
@@ -345,7 +385,11 @@ func permissionForAction(action string) string {
 		return "plugin:disable"
 	case "prepare":
 		return "plugin:rollout"
+	case "canary":
+		return "plugin:rollout"
 	case "activate":
+		return "plugin:rollout"
+	case "rollback":
 		return "plugin:rollout"
 	case "replay":
 		return "plugin:replay"
@@ -354,11 +398,14 @@ func permissionForAction(action string) string {
 	}
 }
 
-func (p *Plugin) currentAuthorizer() *pluginsdk.Authorizer {
+func (p *Plugin) currentAuthorizationService() AuthorizationService {
 	if p != nil && p.Provider != nil {
 		if authorizer := p.Provider.CurrentAuthorizer(); authorizer != nil {
 			return authorizer
 		}
+	}
+	if p != nil && p.DecisionAuthorizer != nil {
+		return p.DecisionAuthorizer
 	}
 	if p == nil || p.Authorizer == nil {
 		return pluginsdk.NewAuthorizer(nil, nil)

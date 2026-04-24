@@ -191,7 +191,6 @@ func (a *AdminCommandAuthorizer) AuthorizeCommand(_ context.Context, command eve
 	return errors.New(decision.Reason)
 }
 
-
 func (a *AdminCommandAuthorizer) authorizeTarget(snapshot *RBACAuthorizerSnapshot, actor, permission string, kind adminTargetKind, target string) pluginsdk.AuthorizationDecision {
 	if snapshot == nil || snapshot.Authorizer == nil {
 		return pluginsdk.AuthorizationDecision{Allowed: false, Permission: permission, Reason: "permission denied"}

@@ -510,6 +510,15 @@ func runtimeSubprocessHost(t *testing.T, host routedPluginHost) *runtimecore.Sub
 	return subprocessHost
 }
 
+func runtimeSubprocessHostForPlugin(t *testing.T, host routedPluginHost, pluginID string) *runtimecore.SubprocessPluginHost {
+	t.Helper()
+	subprocessHost, ok := host.hostForPlugin(pluginID).(*runtimecore.SubprocessPluginHost)
+	if !ok {
+		t.Fatalf("expected subprocess host route for %s, got %T", pluginID, host.hostForPlugin(pluginID))
+	}
+	return subprocessHost
+}
+
 func waitForRuntimeSubprocessCapture(t *testing.T, host *runtimecore.SubprocessPluginHost, predicate func(stdout string, stderr string) bool) (string, string) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
@@ -670,7 +679,7 @@ func TestRuntimeAppTracingExporterTestSinkReceivesCanonicalSpans(t *testing.T) {
 	}
 }
 
-func TestRuntimeAppDefaultPluginHostRoutingRoutesOfficialWave4PluginsThroughSubprocess(t *testing.T) {
+func TestRuntimeAppDefaultPluginHostRoutingRoutesOfficialS4PluginsThroughSubprocess(t *testing.T) {
 	t.Parallel()
 
 	app, err := newRuntimeApp(writeTestConfig(t))
@@ -680,25 +689,18 @@ func TestRuntimeAppDefaultPluginHostRoutingRoutesOfficialWave4PluginsThroughSubp
 	defer func() { _ = app.Close() }()
 
 	host := runtimeRoutedPluginHost(t, app)
-	if len(host.routes) != 2 {
-		t.Fatalf("expected exactly two official plugins to use subprocess routing in Wave 4, routes=%+v", host.routes)
+	if len(host.routes) != 4 {
+		t.Fatalf("expected exactly four official plugins to use subprocess routing in Active/1 S4, routes=%+v", host.routes)
 	}
-	for _, pluginID := range []string{"plugin-echo", "plugin-workflow-demo"} {
+	for _, pluginID := range []string{"plugin-echo", "plugin-workflow-demo", "plugin-admin", "plugin-ai-chat"} {
 		if _, routed := host.routes[pluginID]; !routed {
-			t.Fatalf("expected %s to use subprocess routing by default in Wave 4, routes=%+v", pluginID, host.routes)
+			t.Fatalf("expected %s to use subprocess routing by default in Active/1 S4, routes=%+v", pluginID, host.routes)
 		}
 		if _, ok := host.hostForPlugin(pluginID).(*runtimecore.SubprocessPluginHost); !ok {
 			t.Fatalf("expected %s to resolve to subprocess host, got %T", pluginID, host.hostForPlugin(pluginID))
 		}
 	}
-	for _, pluginID := range []string{"plugin-admin", "plugin-ai-chat"} {
-		if _, routed := host.routes[pluginID]; routed {
-			t.Fatalf("expected %s to remain on direct host this wave, routes=%+v", pluginID, host.routes)
-		}
-		if _, ok := host.hostForPlugin(pluginID).(runtimecore.DirectPluginHost); !ok {
-			t.Fatalf("expected %s to resolve to direct host, got %T", pluginID, host.hostForPlugin(pluginID))
-		}
-	}
+
 	workflowResp := performRuntimeWorkflowMessageRequest(t, app, `{"actor_id":"user-wave4","message":"start workflow"}`)
 	if workflowResp.Code != http.StatusOK {
 		t.Fatalf("expected workflow start 200, got %d: %s", workflowResp.Code, workflowResp.Body.String())
@@ -987,6 +989,158 @@ func TestRuntimeAppSubprocessWorkflowCallbackBridgeWorksAtSubstrateLevel(t *test
 	})
 	if !strings.Contains(stdout, `"callback":"workflow_start_or_resume"`) {
 		t.Fatalf("expected workflow callback capture, got %s", stdout)
+	}
+}
+
+func TestRuntimeAppDefaultPluginHostRoutingAdminEnableDisableUsesSubprocess(t *testing.T) {
+	t.Parallel()
+
+	app, err := newRuntimeApp(writeWriteActionRBACConfig(t))
+	if err != nil {
+		t.Fatalf("new runtime app: %v", err)
+	}
+	defer func() { _ = app.Close() }()
+
+	host := runtimeRoutedPluginHost(t, app)
+	if _, routed := host.routes["plugin-admin"]; !routed {
+		t.Fatalf("expected default routing to route plugin-admin through subprocess, routes=%+v", host.routes)
+	}
+	if _, ok := host.hostForPlugin("plugin-admin").(*runtimecore.SubprocessPluginHost); !ok {
+		t.Fatalf("expected plugin-admin to resolve to subprocess host by default, got %T", host.hostForPlugin("plugin-admin"))
+	}
+
+	disableReq := httptest.NewRequest(http.MethodPost, "/demo/plugins/plugin-echo/disable", nil)
+	disableReq.Header.Set(runtimecore.ConsoleReadActorHeader, "admin-user")
+	disableResp := httptest.NewRecorder()
+	app.ServeHTTP(disableResp, disableReq)
+	if disableResp.Code != http.StatusOK {
+		t.Fatalf("expected subprocess disable operator 200, got %d: %s", disableResp.Code, disableResp.Body.String())
+	}
+	var disablePayload operatorPluginResponsePayload
+	if err := json.Unmarshal(disableResp.Body.Bytes(), &disablePayload); err != nil {
+		t.Fatalf("decode subprocess disable response: %v", err)
+	}
+	if disablePayload.Status != "ok" || disablePayload.Action != "plugin.disable" || disablePayload.Target != "plugin-echo" || !disablePayload.Accepted || disablePayload.Reason != "plugin_disabled" || disablePayload.Enabled == nil || *disablePayload.Enabled {
+		t.Fatalf("unexpected subprocess disable payload %+v", disablePayload)
+	}
+
+	state, err := app.state.LoadPluginEnabledState(t.Context(), "plugin-echo")
+	if err != nil {
+		t.Fatalf("load subprocess-disabled plugin state: %v", err)
+	}
+	if state.Enabled {
+		t.Fatalf("expected subprocess-admin disable to persist plugin disabled state, got %+v", state)
+	}
+
+	messageResp := performRuntimeOneBotMessageRequest(t, app, runtimeDemoOneBotMessageBody(t, 9501, "disabled by subprocess admin"))
+	if messageResp.Code != http.StatusOK {
+		t.Fatalf("expected onebot request to stay successful after subprocess disable, got %d: %s", messageResp.Code, messageResp.Body.String())
+	}
+	if strings.Contains(messageResp.Body.String(), "echo: disabled by subprocess admin") {
+		t.Fatalf("expected disabled plugin-echo to skip replies after subprocess admin disable, got %s", messageResp.Body.String())
+	}
+
+	enableReq := httptest.NewRequest(http.MethodPost, "/demo/plugins/plugin-echo/enable", nil)
+	enableReq.Header.Set(runtimecore.ConsoleReadActorHeader, "admin-user")
+	enableResp := httptest.NewRecorder()
+	app.ServeHTTP(enableResp, enableReq)
+	if enableResp.Code != http.StatusOK {
+		t.Fatalf("expected subprocess enable operator 200, got %d: %s", enableResp.Code, enableResp.Body.String())
+	}
+	var enablePayload operatorPluginResponsePayload
+	if err := json.Unmarshal(enableResp.Body.Bytes(), &enablePayload); err != nil {
+		t.Fatalf("decode subprocess enable response: %v", err)
+	}
+	if enablePayload.Status != "ok" || enablePayload.Action != "plugin.enable" || enablePayload.Target != "plugin-echo" || !enablePayload.Accepted || enablePayload.Reason != "plugin_enabled" || enablePayload.Enabled == nil || !*enablePayload.Enabled {
+		t.Fatalf("unexpected subprocess enable payload %+v", enablePayload)
+	}
+
+	messageResp = performRuntimeOneBotMessageRequest(t, app, runtimeDemoOneBotMessageBody(t, 9502, "re-enabled by subprocess admin"))
+	if messageResp.Code != http.StatusOK {
+		t.Fatalf("expected onebot request after subprocess enable 200, got %d: %s", messageResp.Code, messageResp.Body.String())
+	}
+	if !strings.Contains(messageResp.Body.String(), "echo: re-enabled by subprocess admin") {
+		t.Fatalf("expected plugin-echo reply after subprocess admin enable, got %s", messageResp.Body.String())
+	}
+
+	entries := app.audits.AuditEntries()
+	if len(entries) < 2 {
+		t.Fatalf("expected subprocess admin audits for disable+enable, got %+v", entries)
+	}
+	if entries[0].Actor != "admin-user" || entries[0].Permission != "plugin:disable" || entries[0].Action != "plugin.disable" || entries[0].Target != "plugin-echo" || !entries[0].Allowed || entries[0].Reason != "plugin_disabled" || entries[0].PluginID != "plugin-admin" {
+		t.Fatalf("expected subprocess disable audit evidence, got %+v", entries[0])
+	}
+	if entries[1].Actor != "admin-user" || entries[1].Permission != "plugin:enable" || entries[1].Action != "plugin.enable" || entries[1].Target != "plugin-echo" || !entries[1].Allowed || entries[1].Reason != "plugin_enabled" || entries[1].PluginID != "plugin-admin" {
+		t.Fatalf("expected subprocess enable audit evidence, got %+v", entries[1])
+	}
+
+	subprocessHost := runtimeSubprocessHostForPlugin(t, host, "plugin-admin")
+	stdout, stderr := waitForRuntimeSubprocessCapture(t, subprocessHost, func(stdout string, stderr string) bool {
+		return strings.Contains(stderr, "runtime-plugin-echo-subprocess-online") && strings.Contains(stdout, `"callback":"admin_request"`) && strings.Contains(stdout, `"action":"disable_plugin"`) && strings.Contains(stdout, `"action":"enable_plugin"`) && strings.Contains(stdout, `"action":"record_audit"`)
+	})
+	if !strings.Contains(stderr, "runtime-plugin-echo-subprocess-online") {
+		t.Fatalf("expected default-routed admin subprocess to boot helper process, stderr=%s stdout=%s", stderr, stdout)
+	}
+	for _, expected := range []string{`"callback":"admin_request"`, `"action":"disable_plugin"`, `"action":"enable_plugin"`, `"action":"record_audit"`} {
+		if !strings.Contains(stdout, expected) {
+			t.Fatalf("expected subprocess admin callback evidence %q, stderr=%s stdout=%s", expected, stderr, stdout)
+		}
+	}
+	for _, result := range app.runtime.DispatchResults() {
+		if result.PluginID == "plugin-admin" && result.Kind == "command" && result.Success {
+			return
+		}
+	}
+	t.Fatalf("expected runtime dispatch results to record successful subprocess admin commands, got %+v", app.runtime.DispatchResults())
+}
+
+func TestRuntimeAppDefaultPluginHostRoutingAdminReplayUsesSubprocess(t *testing.T) {
+	t.Parallel()
+
+	app, err := newRuntimeApp(writeReplayRBACConfig(t))
+	if err != nil {
+		t.Fatalf("new runtime app: %v", err)
+	}
+	defer func() { _ = app.Close() }()
+
+	host := runtimeRoutedPluginHost(t, app)
+	if _, ok := host.hostForPlugin("plugin-admin").(*runtimecore.SubprocessPluginHost); !ok {
+		t.Fatalf("expected default routing to route plugin-admin to subprocess, got %T", host.hostForPlugin("plugin-admin"))
+	}
+
+	stored := runtimeStoredReplayableEvent("evt-runtime-admin-subprocess-replay", "replay through admin subprocess")
+	if err := app.state.RecordEvent(t.Context(), stored); err != nil {
+		t.Fatalf("record replay source event: %v", err)
+	}
+	beforeReplies := app.replies.Count()
+
+	if err := dispatchRuntimeAdminReplay(t, app, "replay-user", stored.EventID); err != nil {
+		t.Fatalf("dispatch subprocess admin replay command: %v", err)
+	}
+
+	replies := app.replies.Since(beforeReplies)
+	if len(replies) != 1 || replies[0].Payload != "echo: replay through admin subprocess" {
+		t.Fatalf("expected subprocess admin replay to redispatch stored event, got %+v", replies)
+	}
+	entries := app.audits.AuditEntries()
+	if len(entries) == 0 {
+		t.Fatal("expected subprocess replay audit evidence")
+	}
+	lastEntry := entries[len(entries)-1]
+	if lastEntry.Actor != "replay-user" || lastEntry.Action != "replay" || lastEntry.Target != stored.EventID || !lastEntry.Allowed || lastEntry.Permission != "plugin:replay" || lastEntry.PluginID != "plugin-admin" {
+		t.Fatalf("expected subprocess replay audit entry, got %+v", lastEntry)
+	}
+	subprocessHost := runtimeSubprocessHostForPlugin(t, host, "plugin-admin")
+	stdout, stderr := waitForRuntimeSubprocessCapture(t, subprocessHost, func(stdout string, stderr string) bool {
+		return strings.Contains(stderr, "runtime-plugin-echo-subprocess-online") && strings.Contains(stdout, `"callback":"admin_request"`) && strings.Contains(stdout, `"action":"authorize"`) && strings.Contains(stdout, `"action":"replay_event"`)
+	})
+	if !strings.Contains(stderr, "runtime-plugin-echo-subprocess-online") {
+		t.Fatalf("expected default-routed replay subprocess to boot helper process, stderr=%s stdout=%s", stderr, stdout)
+	}
+	for _, expected := range []string{`"callback":"admin_request"`, `"action":"authorize"`, `"action":"replay_event"`} {
+		if !strings.Contains(stdout, expected) {
+			t.Fatalf("expected subprocess replay callback evidence %q, stderr=%s stdout=%s", expected, stderr, stdout)
+		}
 	}
 }
 
@@ -2310,7 +2464,7 @@ func TestRuntimeAppConsoleReflectsRuntimeState(t *testing.T) {
 			t.Fatalf("expected console payload to include RBAC declaration detail %s, got %s", expected, resp.Body.String())
 		}
 	}
-	for _, expected := range []string{`"secrets.webhook_token_ref"`, `"adapter-webhook.NewWithSecretRef"`, `"secret.read"`, `"secret-write-api"`, `generic secret resolution failures`, `"/admin prepare \u003cplugin-id\u003e"`, `"prepared-record-required"`, `"replay_record_read_model": "sqlite-replay-operation-records"`, `"rollout_record_read_model": "sqlite-rollout-operation-records"`, `"job_status_source": "sqlite-jobs"`, `"schedule_status_source": "sqlite-schedule-plans"`} {
+	for _, expected := range []string{`"secrets.webhook_token_ref"`, `"adapter-webhook.NewWithSecretRef"`, `"secret.read"`, `"secret-write-api"`, `generic secret resolution failures`, `"/admin prepare \u003cplugin-id\u003e"`, `"prepared-record-required"`, `"replay_record_read_model": "sqlite-replay-operation-records"`, `"rollout_record_read_model": "sqlite-rollout-operation-records"`, `"rollout_head_read_model": "sqlite-rollout-heads"`, `"job_status_source": "sqlite-jobs"`, `"schedule_status_source": "sqlite-schedule-plans"`} {
 		if !strings.Contains(resp.Body.String(), expected) {
 			t.Fatalf("expected console payload to include %s, got %s", expected, resp.Body.String())
 		}
@@ -2338,6 +2492,54 @@ func TestRuntimeAppConsoleReflectsRuntimeState(t *testing.T) {
 	for _, expected := range []string{`"id": "plugin-admin"`, `"statusLevel": "registered"`, `"statusRecovery": "no-runtime-evidence"`, `"statusStaleness": "static-registration"`} {
 		if !strings.Contains(pluginLifecycleResp.Body.String(), expected) {
 			t.Fatalf("expected filtered plugin lifecycle payload to include %s, got %s", expected, pluginLifecycleResp.Body.String())
+		}
+	}
+}
+
+func TestRuntimeConsoleExposesRolloutHeadCurrentTruthAlongsideHistory(t *testing.T) {
+	t.Parallel()
+
+	app, err := newRuntimeApp(writeTestConfig(t))
+	if err != nil {
+		t.Fatalf("new runtime app: %v", err)
+	}
+	defer func() { _ = app.Close() }()
+
+	updatedAt := time.Date(2026, 4, 24, 12, 0, 0, 0, time.UTC)
+	if err := app.controlState.SaveRolloutOperationRecord(context.Background(), runtimecore.RolloutOperationRecord{
+		OperationID:      "rollout-op-runtime-console-1",
+		PluginID:         "plugin-echo",
+		Action:           "canary",
+		CurrentVersion:   "0.1.0",
+		CandidateVersion: "0.2.0-candidate",
+		Status:           "canarying",
+		OccurredAt:       updatedAt,
+		UpdatedAt:        updatedAt,
+	}); err != nil {
+		t.Fatalf("save rollout operation record: %v", err)
+	}
+	if err := app.controlState.SaveRolloutHead(context.Background(), runtimecore.RolloutHeadState{
+		PluginID:        "plugin-echo",
+		Stable:          runtimecore.RolloutSnapshotState{Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess},
+		Active:          runtimecore.RolloutSnapshotState{Version: "0.2.0-candidate", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess},
+		Candidate:       &runtimecore.RolloutSnapshotState{Version: "0.2.0-candidate", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess},
+		Phase:           string(pluginsdk.RolloutPhaseCanary),
+		Status:          string(pluginsdk.RolloutStatusCanarying),
+		LastOperationID: "rollout-op-runtime-console-1",
+		UpdatedAt:       updatedAt,
+	}); err != nil {
+		t.Fatalf("save rollout head: %v", err)
+	}
+
+	consoleReq := httptest.NewRequest(http.MethodGet, "/api/console?plugin_id=plugin-echo", nil)
+	consoleResp := httptest.NewRecorder()
+	app.ServeHTTP(consoleResp, consoleReq)
+	if consoleResp.Code != http.StatusOK {
+		t.Fatalf("expected console 200, got %d: %s", consoleResp.Code, consoleResp.Body.String())
+	}
+	for _, expected := range []string{`"rolloutHeads": [`, `"pluginId": "plugin-echo"`, `"phase": "canary"`, `"status": "canarying"`, `"stable": {`, `"active": {`, `"candidate": {`, `"version": "0.2.0-candidate"`, `"lastOperationId": "rollout-op-runtime-console-1"`, `"stateSource": "sqlite-rollout-heads"`, `"summary": "rollout head canary canarying for plugin-echo`, `"rolloutOps": [`, `"action": "canary"`, `"rollout_head_read_model": "sqlite-rollout-heads"`} {
+		if !strings.Contains(consoleResp.Body.String(), expected) {
+			t.Fatalf("expected runtime console rollout payload to include %q, got %s", expected, consoleResp.Body.String())
 		}
 	}
 }
@@ -5012,9 +5214,9 @@ func TestRuntimeAppOperatorWriteRoutesReturnForbiddenForAuthenticatedRBACDenials
 	}
 
 	for name, resp := range map[string]*httptest.ResponseRecorder{
-		"plugin disable": pluginResp,
-		"plugin config":  configResp,
-		"job retry":      retryResp,
+		"plugin disable":  pluginResp,
+		"plugin config":   configResp,
+		"job retry":       retryResp,
 		"schedule cancel": cancelResp,
 	} {
 		if !strings.Contains(resp.Body.String(), "permission denied") {
@@ -6141,6 +6343,133 @@ func TestRuntimeAppAIQueueDispatcherUsesRuntimeDispatchPath(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatal("expected AI queue dispatcher to complete job through runtime dispatch path")
+}
+
+func TestRuntimeAppDefaultPluginHostRoutingAIMessageEnqueuesExpectedJobAndSessionState(t *testing.T) {
+	t.Parallel()
+
+	app, err := newRuntimeApp(writeTestConfig(t))
+	if err != nil {
+		t.Fatalf("new runtime app: %v", err)
+	}
+	defer func() { _ = app.Close() }()
+
+	host := runtimeRoutedPluginHost(t, app)
+	if _, routed := host.routes["plugin-ai-chat"]; !routed {
+		t.Fatalf("expected default routing to route plugin-ai-chat through subprocess, routes=%+v", host.routes)
+	}
+	if _, ok := host.hostForPlugin("plugin-ai-chat").(*runtimecore.SubprocessPluginHost); !ok {
+		t.Fatalf("expected plugin-ai-chat to resolve to subprocess host by default, got %T", host.hostForPlugin("plugin-ai-chat"))
+	}
+
+	event := aiEvent("hello from default subprocess route", "user-ai-subprocess-event")
+	duplicate, err := app.persistAndDispatchEvent(t.Context(), event)
+	if err != nil {
+		t.Fatalf("dispatch subprocess ai-chat event: %v", err)
+	}
+	if duplicate {
+		t.Fatalf("expected default-routed ai-chat event not to be treated as duplicate")
+	}
+
+	jobID := "job-ai-chat-" + event.EventID
+	stored, err := app.queue.Inspect(t.Context(), jobID)
+	if err != nil {
+		t.Fatalf("inspect queued ai subprocess job: %v", err)
+	}
+	if stored.Status != runtimecore.JobStatusPending {
+		t.Fatalf("expected ai subprocess event path to enqueue pending job, got %+v", stored)
+	}
+	prompt, _ := stored.Payload["prompt"].(string)
+	if prompt != "hello from default subprocess route" {
+		t.Fatalf("expected queued prompt from subprocess event path, got %+v", stored.Payload)
+	}
+	replyHandle, _ := stored.Payload["reply_handle"].(map[string]any)
+	if capability, _ := replyHandle["capability"].(string); capability != "onebot.reply" {
+		t.Fatalf("expected queued reply handle from subprocess event path, got %+v", stored.Payload)
+	}
+	session, err := app.state.LoadSession(t.Context(), "session-user-ai-subprocess-event")
+	if err != nil {
+		t.Fatalf("load subprocess ai-chat session: %v", err)
+	}
+	if session.PluginID != "plugin-ai-chat" {
+		t.Fatalf("expected subprocess ai-chat session plugin id, got %+v", session)
+	}
+	if got, _ := session.State["last_prompt"].(string); got != "hello from default subprocess route" {
+		t.Fatalf("expected subprocess ai-chat session state to persist last prompt, got %+v", session)
+	}
+	if len(app.replies.Since(0)) != 0 {
+		t.Fatalf("expected ai subprocess event path not to reply before job execution, got %+v", app.replies.Since(0))
+	}
+
+	subprocessHost := runtimeSubprocessHostForPlugin(t, host, "plugin-ai-chat")
+	stdout, stderr := waitForRuntimeSubprocessCapture(t, subprocessHost, func(stdout string, stderr string) bool {
+		return strings.Contains(stderr, "runtime-plugin-echo-subprocess-online") && strings.Contains(stdout, `"callback":"ai_chat_queue"`) && strings.Contains(stdout, `"action":"enqueue"`) && strings.Contains(stdout, `"callback":"ai_chat_session"`)
+	})
+	if !strings.Contains(stderr, "runtime-plugin-echo-subprocess-online") {
+		t.Fatalf("expected default-routed ai-chat subprocess to boot helper process, stderr=%s stdout=%s", stderr, stdout)
+	}
+	for _, expected := range []string{`"callback":"ai_chat_queue"`, `"action":"enqueue"`, `"callback":"ai_chat_session"`} {
+		if !strings.Contains(stdout, expected) {
+			t.Fatalf("expected subprocess ai-chat event callback evidence %q, stderr=%s stdout=%s", expected, stderr, stdout)
+		}
+	}
+}
+
+func TestRuntimeAppDefaultPluginHostRoutingAIMessageCompletesJobAndRepliesThroughSubprocess(t *testing.T) {
+	t.Parallel()
+
+	app, err := newRuntimeApp(writeTestConfig(t))
+	if err != nil {
+		t.Fatalf("new runtime app: %v", err)
+	}
+	defer func() { _ = app.Close() }()
+
+	host := runtimeRoutedPluginHost(t, app)
+	if _, ok := host.hostForPlugin("plugin-ai-chat").(*runtimecore.SubprocessPluginHost); !ok {
+		t.Fatalf("expected plugin-ai-chat subprocess route by default, got %T", host.hostForPlugin("plugin-ai-chat"))
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/demo/ai/message", strings.NewReader(`{"prompt":"hello from subprocess job","user_id":"user-ai-subprocess-job"}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	app.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", resp.Code, resp.Body.String())
+	}
+
+	jobID := extractAIJobID(resp.Body.String())
+	stored := waitForAIJobStatus(t, app, jobID, runtimecore.JobStatusDone)
+	if stored.Status != runtimecore.JobStatusDone {
+		t.Fatalf("expected subprocess ai-chat job path done status, got %+v", stored)
+	}
+	replies := app.replies.Since(0)
+	if len(replies) == 0 || replies[len(replies)-1].Payload != "AI: hello from subprocess job" {
+		t.Fatalf("expected subprocess ai-chat job path to reply through runtime reply buffer, got %+v", replies)
+	}
+	entries := app.logs.Lines()
+	matched := false
+	for _, line := range entries {
+		if strings.Contains(line, "runtime dispatch started") && strings.Contains(line, `"dispatch_kind":"job"`) && strings.Contains(line, jobID) {
+			matched = true
+			break
+		}
+	}
+	if !matched {
+		t.Fatalf("expected runtime dispatch log for subprocess ai-chat job, got %+v", entries)
+	}
+
+	subprocessHost := runtimeSubprocessHostForPlugin(t, host, "plugin-ai-chat")
+	stdout, stderr := waitForRuntimeSubprocessCapture(t, subprocessHost, func(stdout string, stderr string) bool {
+		return strings.Contains(stderr, "runtime-plugin-echo-subprocess-online") && strings.Contains(stdout, `"callback":"ai_chat_queue"`) && strings.Contains(stdout, `"action":"inspect"`) && strings.Contains(stdout, `"action":"complete"`) && strings.Contains(stdout, `"callback":"ai_chat_provider"`) && strings.Contains(stdout, `"callback":"reply_text"`)
+	})
+	if !strings.Contains(stderr, "runtime-plugin-echo-subprocess-online") {
+		t.Fatalf("expected default-routed ai-chat subprocess to boot helper process, stderr=%s stdout=%s", stderr, stdout)
+	}
+	for _, expected := range []string{`"callback":"ai_chat_queue"`, `"action":"inspect"`, `"action":"complete"`, `"callback":"ai_chat_provider"`, `"callback":"reply_text"`} {
+		if !strings.Contains(stdout, expected) {
+			t.Fatalf("expected subprocess ai-chat job callback evidence %q, stderr=%s stdout=%s", expected, stderr, stdout)
+		}
+	}
 }
 
 func TestRuntimeAppInvalidAIReplyHandleTransitionsJobOutOfPending(t *testing.T) {

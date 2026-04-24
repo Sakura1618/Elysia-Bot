@@ -32,24 +32,24 @@ type workflowTransitionMetricKey struct {
 }
 
 type MetricsRegistry struct {
-	mu                         sync.RWMutex
-	eventThroughputTotal       int
-	handlerLatencyMs           map[string]float64
-	pluginErrors               map[string]int
-	queueLag                   int
-	runtimeDispatchTotals      map[dispatchMetricKey]int
-	runtimeDispatchLastMs      map[dispatchDurationKey]float64
-	subprocessDispatchTotals   map[dispatchMetricKey]int
-	subprocessDispatchLastMs   map[dispatchDurationKey]float64
-	subprocessFailures         map[subprocessFailureMetricKey]int
-	jobQueueActiveCount        int
-	jobCounts                  map[JobStatus]int
-	jobRecoveries              map[string]int
-	scheduleRecoveries         map[string]int
-	jobDispatchReadyCount      int
-	scheduleDueReadyCount      int
-	workflowInstanceCounts     map[WorkflowRuntimeStatus]int
-	workflowTransitionTotals   map[workflowTransitionMetricKey]int
+	mu                       sync.RWMutex
+	eventThroughputTotal     int
+	handlerLatencyMs         map[string]float64
+	pluginErrors             map[string]int
+	queueLag                 int
+	runtimeDispatchTotals    map[dispatchMetricKey]int
+	runtimeDispatchLastMs    map[dispatchDurationKey]float64
+	subprocessDispatchTotals map[dispatchMetricKey]int
+	subprocessDispatchLastMs map[dispatchDurationKey]float64
+	subprocessFailures       map[subprocessFailureMetricKey]int
+	jobQueueActiveCount      int
+	jobCounts                map[JobStatus]int
+	jobRecoveries            map[string]int
+	scheduleRecoveries       map[string]int
+	jobDispatchReadyCount    int
+	scheduleDueReadyCount    int
+	workflowInstanceCounts   map[WorkflowRuntimeStatus]int
+	workflowTransitionTotals map[workflowTransitionMetricKey]int
 }
 
 func NewMetricsRegistry() *MetricsRegistry {
@@ -191,13 +191,13 @@ func (m *MetricsRegistry) SetScheduleDueReadyCount(count int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.scheduleDueReadyCount = count
-	}
+}
 
 func (m *MetricsRegistry) SetWorkflowInstanceCount(status WorkflowRuntimeStatus, count int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.workflowInstanceCounts[status] = count
-	}
+}
 
 func (m *MetricsRegistry) RecordWorkflowTransition(pluginID string, outcome string) {
 	m.mu.Lock()

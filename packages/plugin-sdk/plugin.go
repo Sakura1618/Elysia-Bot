@@ -4,7 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
-	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -18,20 +18,22 @@ const (
 
 	PublishSourceTypeGit     = "git"
 	PublishSourceTypeArchive = "archive"
+
+	PluginManifestSchemaVersionV1        = "v1"
+	SupportedPluginManifestSchemaVersion = PluginManifestSchemaVersionV1
 )
 
-var runtimeVersionRangePattern = regexp.MustCompile(`^(>=|>|=|<=|<)\s*v?\d+\.\d+\.\d+(?:\s+(>=|>|=|<=|<)\s*v?\d+\.\d+\.\d+)?$`)
-
 type PluginManifest struct {
-	ID           string         `json:"id"`
-	Name         string         `json:"name"`
-	Version      string         `json:"version"`
-	APIVersion   string         `json:"apiVersion"`
-	Mode         string         `json:"mode"`
-	Permissions  []string       `json:"permissions,omitempty"`
-	ConfigSchema map[string]any `json:"configSchema,omitempty"`
-	Publish      *PluginPublish `json:"publish,omitempty"`
-	Entry        PluginEntry    `json:"entry"`
+	SchemaVersion string         `json:"schemaVersion"`
+	ID            string         `json:"id"`
+	Name          string         `json:"name"`
+	Version       string         `json:"version"`
+	APIVersion    string         `json:"apiVersion"`
+	Mode          string         `json:"mode"`
+	Permissions   []string       `json:"permissions,omitempty"`
+	ConfigSchema  map[string]any `json:"configSchema,omitempty"`
+	Publish       *PluginPublish `json:"publish,omitempty"`
+	Entry         PluginEntry    `json:"entry"`
 }
 
 type PluginPublish struct {
@@ -418,6 +420,12 @@ type Handlers struct {
 }
 
 func (m PluginManifest) Validate() error {
+	if strings.TrimSpace(m.SchemaVersion) == "" {
+		return errors.New("schemaVersion is required")
+	}
+	if strings.TrimSpace(m.SchemaVersion) != SupportedPluginManifestSchemaVersion {
+		return fmt.Errorf("unsupported schemaVersion %q", m.SchemaVersion)
+	}
 	if strings.TrimSpace(m.ID) == "" {
 		return errors.New("id is required")
 	}
@@ -471,15 +479,156 @@ func (p PluginPublish) Validate() error {
 		return fmt.Errorf("sourceUri %q must be an absolute URI", p.SourceURI)
 	}
 
-	runtimeVersionRange := strings.TrimSpace(p.RuntimeVersionRange)
-	if runtimeVersionRange == "" {
-		return errors.New("runtimeVersionRange is required")
-	}
-	if !runtimeVersionRangePattern.MatchString(runtimeVersionRange) {
-		return fmt.Errorf("runtimeVersionRange %q must use one or two comparator clauses", p.RuntimeVersionRange)
+	if err := ValidateRuntimeVersionRange(p.RuntimeVersionRange); err != nil {
+		return err
 	}
 
 	return nil
+}
+
+func ValidateRuntimeVersionRange(requiredRange string) error {
+	clauses, err := parseRuntimeVersionRangeClauses(requiredRange)
+	if err != nil {
+		return err
+	}
+	for _, clause := range clauses {
+		if _, err := parseRuntimeVersion(clause.version); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func RuntimeVersionSatisfiesRange(currentVersion, requiredRange string) (bool, error) {
+	current, err := parseRuntimeVersion(currentVersion)
+	if err != nil {
+		return false, err
+	}
+	clauses, err := parseRuntimeVersionRangeClauses(requiredRange)
+	if err != nil {
+		return false, err
+	}
+	for _, clause := range clauses {
+		required, err := parseRuntimeVersion(clause.version)
+		if err != nil {
+			return false, err
+		}
+		if !runtimeVersionMatchesComparator(current, clause.comparator, required) {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+type runtimeVersionRangeClause struct {
+	comparator string
+	version    string
+}
+
+func parseRuntimeVersionRangeClauses(requiredRange string) ([]runtimeVersionRangeClause, error) {
+	trimmed := strings.TrimSpace(requiredRange)
+	if trimmed == "" {
+		return nil, errors.New("runtimeVersionRange is required")
+	}
+	clauses := make([]runtimeVersionRangeClause, 0, 2)
+	for len(trimmed) > 0 {
+		comparator, remainder, ok := trimRuntimeVersionComparator(trimmed)
+		if !ok {
+			return nil, fmt.Errorf("runtimeVersionRange %q must use one or two comparator clauses", requiredRange)
+		}
+		version, rest, ok := trimRuntimeVersionToken(remainder)
+		if !ok {
+			return nil, fmt.Errorf("runtimeVersionRange %q must use one or two comparator clauses", requiredRange)
+		}
+		clauses = append(clauses, runtimeVersionRangeClause{comparator: comparator, version: version})
+		trimmed = strings.TrimSpace(rest)
+	}
+	if len(clauses) == 0 || len(clauses) > 2 {
+		return nil, fmt.Errorf("runtimeVersionRange %q must use one or two comparator clauses", requiredRange)
+	}
+	return clauses, nil
+}
+
+func trimRuntimeVersionComparator(raw string) (string, string, bool) {
+	trimmed := strings.TrimLeft(raw, " \t\r\n")
+	for _, comparator := range []string{">=", "<=", ">", "<", "="} {
+		if strings.HasPrefix(trimmed, comparator) {
+			return comparator, strings.TrimLeft(trimmed[len(comparator):], " \t\r\n"), true
+		}
+	}
+	return "", raw, false
+}
+
+func trimRuntimeVersionToken(raw string) (string, string, bool) {
+	trimmed := strings.TrimLeft(raw, " \t\r\n")
+	if trimmed == "" {
+		return "", raw, false
+	}
+	end := 0
+	for end < len(trimmed) {
+		switch trimmed[end] {
+		case ' ', '\t', '\r', '\n':
+			return trimmed[:end], trimmed[end:], true
+		default:
+			end++
+		}
+	}
+	return trimmed, "", true
+}
+
+type runtimeVersion struct {
+	major int
+	minor int
+	patch int
+}
+
+func parseRuntimeVersion(raw string) (runtimeVersion, error) {
+	trimmed := strings.TrimSpace(strings.TrimPrefix(raw, "v"))
+	parts := strings.Split(trimmed, ".")
+	if len(parts) != 3 {
+		return runtimeVersion{}, fmt.Errorf("runtime version %q must use major.minor.patch", raw)
+	}
+	major, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return runtimeVersion{}, fmt.Errorf("runtime version %q has invalid major component", raw)
+	}
+	minor, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return runtimeVersion{}, fmt.Errorf("runtime version %q has invalid minor component", raw)
+	}
+	patch, err := strconv.Atoi(parts[2])
+	if err != nil {
+		return runtimeVersion{}, fmt.Errorf("runtime version %q has invalid patch component", raw)
+	}
+	return runtimeVersion{major: major, minor: minor, patch: patch}, nil
+}
+
+func runtimeVersionMatchesComparator(current runtimeVersion, comparator string, required runtimeVersion) bool {
+	comparison := compareRuntimeVersions(current, required)
+	switch comparator {
+	case ">":
+		return comparison > 0
+	case ">=":
+		return comparison >= 0
+	case "=":
+		return comparison == 0
+	case "<=":
+		return comparison <= 0
+	case "<":
+		return comparison < 0
+	default:
+		return false
+	}
+}
+
+func compareRuntimeVersions(left, right runtimeVersion) int {
+	if left.major != right.major {
+		return left.major - right.major
+	}
+	if left.minor != right.minor {
+		return left.minor - right.minor
+	}
+	return left.patch - right.patch
 }
 
 func (e PluginEntry) Validate() error {

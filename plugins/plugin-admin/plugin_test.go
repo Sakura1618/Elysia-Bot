@@ -18,12 +18,16 @@ type lifecycleRecorder struct {
 }
 
 type rolloutRecorder struct {
-	prepared  []string
-	activated []string
-	checked   []string
-	err       error
-	records   map[string]pluginsdk.RolloutRecord
-	checkErr  error
+	prepared        []string
+	canaried        []string
+	activated       []string
+	rolledBack      []string
+	checked         []string
+	rollbackChecked []string
+	err             error
+	records         map[string]pluginsdk.RolloutRecord
+	checkErr        error
+	rollbackErr     error
 }
 
 type auditRecorder struct {
@@ -97,7 +101,17 @@ func (r *rolloutRecorder) Prepare(pluginID string) (pluginsdk.RolloutRecord, err
 
 func (r *rolloutRecorder) Activate(pluginID string) (pluginsdk.RolloutRecord, error) {
 	r.activated = append(r.activated, pluginID)
-	record := pluginsdk.RolloutRecord{PluginID: pluginID, Status: pluginsdk.RolloutStatusActivated}
+	record := pluginsdk.RolloutRecord{PluginID: pluginID, Phase: pluginsdk.RolloutPhaseStable, Status: pluginsdk.RolloutStatusActivated}
+	if r.records == nil {
+		r.records = map[string]pluginsdk.RolloutRecord{}
+	}
+	r.records[pluginID] = record
+	return record, r.err
+}
+
+func (r *rolloutRecorder) Canary(pluginID string) (pluginsdk.RolloutRecord, error) {
+	r.canaried = append(r.canaried, pluginID)
+	record := pluginsdk.RolloutRecord{PluginID: pluginID, Phase: pluginsdk.RolloutPhaseCanary, Status: pluginsdk.RolloutStatusCanarying}
 	if r.records == nil {
 		r.records = map[string]pluginsdk.RolloutRecord{}
 	}
@@ -118,6 +132,31 @@ func (r *rolloutRecorder) CanActivate(pluginID string) (pluginsdk.RolloutRecord,
 		return pluginsdk.RolloutRecord{}, errors.New("rollout is not prepared")
 	}
 	return record, nil
+}
+
+func (r *rolloutRecorder) CanRollback(pluginID string) (pluginsdk.RolloutRecord, error) {
+	r.rollbackChecked = append(r.rollbackChecked, pluginID)
+	if r.rollbackErr != nil {
+		return pluginsdk.RolloutRecord{}, r.rollbackErr
+	}
+	if r.records == nil {
+		return pluginsdk.RolloutRecord{}, errors.New("invalid rollout transition")
+	}
+	record, ok := r.records[pluginID]
+	if !ok || (record.Phase != pluginsdk.RolloutPhaseCanary && record.Status != pluginsdk.RolloutStatusActivated) {
+		return pluginsdk.RolloutRecord{}, errors.New("invalid rollout transition")
+	}
+	return record, nil
+}
+
+func (r *rolloutRecorder) Rollback(pluginID string) (pluginsdk.RolloutRecord, error) {
+	r.rolledBack = append(r.rolledBack, pluginID)
+	record := pluginsdk.RolloutRecord{PluginID: pluginID, Phase: pluginsdk.RolloutPhaseRollback, Status: pluginsdk.RolloutStatusRolledBack}
+	if r.records == nil {
+		r.records = map[string]pluginsdk.RolloutRecord{}
+	}
+	r.records[pluginID] = record
+	return record, r.err
 }
 
 func (r *rolloutRecorder) Record(pluginID string) (pluginsdk.RolloutRecord, bool) {
@@ -261,6 +300,32 @@ func TestPluginAdminBubblesLifecycleError(t *testing.T) {
 	}
 }
 
+func TestPluginAdminManifestAdoptsV1Contract(t *testing.T) {
+	t.Parallel()
+
+	plugin := New(&lifecycleRecorder{}, nil, nil, nil, map[string][]string{"admin-user": {"admin"}}, adminPolicies(), nil)
+	manifest := plugin.Manifest
+
+	if manifest.SchemaVersion != pluginsdk.SupportedPluginManifestSchemaVersion {
+		t.Fatalf("manifest schemaVersion = %q, want %q", manifest.SchemaVersion, pluginsdk.SupportedPluginManifestSchemaVersion)
+	}
+	if manifest.Publish == nil {
+		t.Fatal("manifest publish metadata is required")
+	}
+	if manifest.Publish.SourceType != pluginsdk.PublishSourceTypeGit {
+		t.Fatalf("manifest publish sourceType = %q, want %q", manifest.Publish.SourceType, pluginsdk.PublishSourceTypeGit)
+	}
+	if manifest.Publish.SourceURI != pluginAdminPublishSourceURI {
+		t.Fatalf("manifest publish sourceUri = %q, want %q", manifest.Publish.SourceURI, pluginAdminPublishSourceURI)
+	}
+	if manifest.Publish.RuntimeVersionRange != pluginAdminRuntimeVersionRange {
+		t.Fatalf("manifest publish runtimeVersionRange = %q, want %q", manifest.Publish.RuntimeVersionRange, pluginAdminRuntimeVersionRange)
+	}
+	if err := manifest.Validate(); err != nil {
+		t.Fatalf("expected plugin-admin manifest to validate, got %v", err)
+	}
+}
+
 func TestPluginAdminReturnsAuditRecorderFailure(t *testing.T) {
 	t.Parallel()
 
@@ -388,6 +453,36 @@ func TestPluginAdminPreparesAndActivatesRolloutWithinScope(t *testing.T) {
 	}
 }
 
+func TestPluginAdminCanariesAndRollsBackRolloutWithinScope(t *testing.T) {
+	t.Parallel()
+
+	rollouts := &rolloutRecorder{}
+	plugin := New(&lifecycleRecorder{}, rollouts, nil, nil, map[string][]string{"rollout-user": {"rollout-operator"}}, adminPolicies(), nil)
+	plugin.CurrentTime = func() time.Time { return time.Date(2026, 4, 10, 12, 30, 0, 0, time.UTC) }
+	if err := plugin.OnCommand(eventmodel.CommandInvocation{Name: "admin", Raw: "/admin prepare plugin-echo", Metadata: map[string]any{"actor": "rollout-user"}}, eventmodel.ExecutionContext{TraceID: "trace-20", EventID: "evt-20"}); err != nil {
+		t.Fatalf("prepare rollout: %v", err)
+	}
+	if err := plugin.OnCommand(eventmodel.CommandInvocation{Name: "admin", Raw: "/admin canary plugin-echo", Metadata: map[string]any{"actor": "rollout-user"}}, eventmodel.ExecutionContext{TraceID: "trace-21", EventID: "evt-21"}); err != nil {
+		t.Fatalf("canary rollout: %v", err)
+	}
+	if err := plugin.OnCommand(eventmodel.CommandInvocation{Name: "admin", Raw: "/admin rollback plugin-echo", Metadata: map[string]any{"actor": "rollout-user"}}, eventmodel.ExecutionContext{TraceID: "trace-22", EventID: "evt-22"}); err != nil {
+		t.Fatalf("rollback rollout: %v", err)
+	}
+	if len(rollouts.prepared) != 1 || len(rollouts.canaried) != 1 || len(rollouts.rollbackChecked) != 1 || len(rollouts.rolledBack) != 1 {
+		t.Fatalf("unexpected rollout integration calls prepared=%+v canaried=%+v rollbackChecked=%+v rolledBack=%+v", rollouts.prepared, rollouts.canaried, rollouts.rollbackChecked, rollouts.rolledBack)
+	}
+	audit := plugin.AuditLog()
+	if len(audit) != 3 {
+		t.Fatalf("expected three rollout audit entries, got %+v", audit)
+	}
+	if reason := auditReasonValue(audit[1]); reason != "rollout_canary_started" {
+		t.Fatalf("expected canary success audit reason rollout_canary_started, got %+v", audit)
+	}
+	if reason := auditReasonValue(audit[2]); reason != "rollout_rolled_back" {
+		t.Fatalf("expected rollback success audit reason rollout_rolled_back, got %+v", audit)
+	}
+}
+
 func TestPluginAdminRejectsActivateWhenRolloutIsNotPrepared(t *testing.T) {
 	t.Parallel()
 
@@ -405,6 +500,19 @@ func TestPluginAdminBubblesRolloutManagerActivationCheckError(t *testing.T) {
 	err := plugin.OnCommand(eventmodel.CommandInvocation{Name: "admin", Raw: "/admin activate plugin-echo", Metadata: map[string]any{"actor": "rollout-user"}}, eventmodel.ExecutionContext{TraceID: "trace-19", EventID: "evt-19"})
 	if err == nil || !strings.Contains(err.Error(), "drifted after prepare") {
 		t.Fatalf("expected rollout manager activation-check error to bubble, got %v", err)
+	}
+}
+
+func TestPluginAdminRejectsRollbackWhenRolloutStateCannotRollback(t *testing.T) {
+	t.Parallel()
+
+	plugin := New(&lifecycleRecorder{}, &rolloutRecorder{}, nil, nil, map[string][]string{"rollout-user": {"rollout-operator"}}, adminPolicies(), nil)
+	err := plugin.OnCommand(eventmodel.CommandInvocation{Name: "admin", Raw: "/admin rollback plugin-echo", Metadata: map[string]any{"actor": "rollout-user"}}, eventmodel.ExecutionContext{TraceID: "trace-23", EventID: "evt-23"})
+	if err == nil || !strings.Contains(err.Error(), "invalid rollout transition") {
+		t.Fatalf("expected rollback without canary/activation to fail, got %v", err)
+	}
+	if len(plugin.AuditLog()) != 1 || auditReasonValue(plugin.AuditLog()[0]) != "rollout_invalid_transition" {
+		t.Fatalf("expected rollback invalid transition audit reason, got %+v", plugin.AuditLog())
 	}
 }
 

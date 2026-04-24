@@ -3,6 +3,7 @@ package plugintemplatesmoke
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"reflect"
 	"strings"
@@ -23,6 +24,9 @@ func TestTemplateManifestConstantsStayInSync(t *testing.T) {
 	}
 	if manifest.ID != TemplatePluginID {
 		t.Fatalf("manifest id = %q, want %q", manifest.ID, TemplatePluginID)
+	}
+	if manifest.SchemaVersion != pluginsdk.SupportedPluginManifestSchemaVersion {
+		t.Fatalf("manifest schemaVersion = %q, want %q", manifest.SchemaVersion, pluginsdk.SupportedPluginManifestSchemaVersion)
 	}
 	if manifest.Name != TemplatePluginName {
 		t.Fatalf("manifest name = %q, want %q", manifest.Name, TemplatePluginName)
@@ -60,20 +64,37 @@ func TestTemplateManifestConstantsStayInSync(t *testing.T) {
 		t.Fatalf("go.mod module = %q, want suffix %q so it stays aligned with entry.module %q", goModulePath, "/"+manifest.Entry.Module, manifest.Entry.Module)
 	}
 
-	generatedManifest, err := marshalGeneratedManifest(manifest)
-	if err != nil {
-		t.Fatalf("marshal generated manifest: %v", err)
-	}
 	staticManifestBytes, err := os.ReadFile("manifest.json")
 	if err != nil {
 		t.Fatalf("read manifest.json: %v", err)
 	}
-	if !bytes.Equal(normalizeLineEndings(staticManifestBytes), normalizeLineEndings(generatedManifest)) {
-		t.Fatalf("manifest.json is out of date\n--- static ---\n%s\n--- generated ---\n%s", staticManifestBytes, generatedManifest)
+	if err := assertTemplateManifestArtifactMatchesGeneratedTruth(staticManifestBytes, manifest); err != nil {
+		t.Fatal(err)
 	}
 
 	if !reflect.DeepEqual(staticManifest, manifest) {
 		t.Fatalf("manifest.json decoded payload = %+v, want %+v", staticManifest, manifest)
+	}
+}
+
+func TestPluginTemplateSmokeManifestDriftDetected(t *testing.T) {
+	t.Parallel()
+
+	manifest := Manifest()
+	staleManifest := readStaticManifest(t)
+	staleManifest.Name = staleManifest.Name + " drifted"
+
+	staleManifestBytes, err := marshalGeneratedManifest(staleManifest)
+	if err != nil {
+		t.Fatalf("marshal stale manifest: %v", err)
+	}
+
+	err = assertTemplateManifestArtifactMatchesGeneratedTruth(staleManifestBytes, manifest)
+	if err == nil {
+		t.Fatal("expected manifest drift to be detected")
+	}
+	if !strings.Contains(err.Error(), "manifest.json is out of date") {
+		t.Fatalf("expected out-of-date manifest drift error, got %v", err)
 	}
 }
 
@@ -106,6 +127,17 @@ func marshalGeneratedManifest(manifest pluginsdk.PluginManifest) ([]byte, error)
 	return append(rawManifest, '\n'), nil
 }
 
+func assertTemplateManifestArtifactMatchesGeneratedTruth(staticManifestBytes []byte, manifest pluginsdk.PluginManifest) error {
+	generatedManifest, err := marshalGeneratedManifest(manifest)
+	if err != nil {
+		return fmt.Errorf("marshal generated manifest: %w", err)
+	}
+	if !bytes.Equal(normalizeLineEndings(staticManifestBytes), normalizeLineEndings(generatedManifest)) {
+		return fmt.Errorf("manifest.json is out of date\n--- static ---\n%s\n--- generated ---\n%s", staticManifestBytes, generatedManifest)
+	}
+	return nil
+}
+
 func readGoModulePath(t *testing.T) string {
 	t.Helper()
 
@@ -114,7 +146,7 @@ func readGoModulePath(t *testing.T) string {
 		t.Fatalf("read go.mod: %v", err)
 	}
 
-	for _, line := range strings.Split(string(rawGoMod), "\n") {
+	for line := range strings.SplitSeq(string(rawGoMod), "\n") {
 		fields := strings.Fields(line)
 		if len(fields) >= 2 && fields[0] == "module" {
 			return fields[1]

@@ -1,4 +1,5 @@
 {
+  "schemaVersion": "v1",
   "id": "plugin-template-smoke",
   "name": "Plugin Template Smoke",
   "version": "0.1.0",

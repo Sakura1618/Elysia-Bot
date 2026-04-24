@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"reflect"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -38,6 +37,10 @@ type SubprocessPluginHost struct {
 	stdoutLines                   []string
 	stderrLines                   []string
 	replyTextCallback             func(eventmodel.ReplyHandle, string) error
+	adminRequestCallback          func(context.Context, SubprocessAdminRequest) (SubprocessAdminResult, error)
+	aiChatQueueCallback           func(context.Context, SubprocessAIChatQueueRequest) (SubprocessAIChatQueueResult, error)
+	aiChatSessionCallback         func(context.Context, SubprocessAIChatSessionRequest) error
+	aiChatProviderCallback        func(context.Context, SubprocessAIChatProviderRequest) (SubprocessAIChatProviderResult, error)
 	workflowStartOrResumeCallback func(context.Context, SubprocessWorkflowStartOrResumeRequest) (WorkflowTransition, error)
 	now                           func() time.Time
 	maxCaptureLines               int
@@ -74,6 +77,10 @@ type hostResponse struct {
 	Error                 string                                   `json:"error,omitempty"`
 	Callback              string                                   `json:"callback,omitempty"`
 	ReplyText             *subprocessReplyTextCallback             `json:"reply_text,omitempty"`
+	AdminRequest          *subprocessAdminCallback                 `json:"admin_request,omitempty"`
+	AIChatQueue           *subprocessAIChatQueueCallback           `json:"ai_chat_queue,omitempty"`
+	AIChatSession         *subprocessAIChatSessionCallback         `json:"ai_chat_session,omitempty"`
+	AIChatProvider        *subprocessAIChatProviderCallback        `json:"ai_chat_provider,omitempty"`
 	WorkflowStartOrResume *subprocessWorkflowStartOrResumeCallback `json:"workflow_start_or_resume,omitempty"`
 }
 
@@ -82,33 +89,123 @@ type subprocessReplyTextCallback struct {
 	Text   string                 `json:"text"`
 }
 
+type SubprocessAdminRequest struct {
+	Action         string                            `json:"action"`
+	TargetPluginID string                            `json:"target_plugin_id,omitempty"`
+	EventID        string                            `json:"event_id,omitempty"`
+	AuditEntry     *pluginsdk.AuditEntry             `json:"audit_entry,omitempty"`
+	Actor          string                            `json:"actor,omitempty"`
+	Permission     string                            `json:"permission,omitempty"`
+	Target         string                            `json:"target,omitempty"`
+	TargetKind     pluginsdk.AuthorizationTargetKind `json:"target_kind,omitempty"`
+}
+
+type subprocessAdminCallback struct {
+	Action         string                            `json:"action"`
+	TargetPluginID string                            `json:"target_plugin_id,omitempty"`
+	EventID        string                            `json:"event_id,omitempty"`
+	AuditEntry     *pluginsdk.AuditEntry             `json:"audit_entry,omitempty"`
+	Actor          string                            `json:"actor,omitempty"`
+	Permission     string                            `json:"permission,omitempty"`
+	Target         string                            `json:"target,omitempty"`
+	TargetKind     pluginsdk.AuthorizationTargetKind `json:"target_kind,omitempty"`
+}
+
+type SubprocessAdminResult struct {
+	Authorization *pluginsdk.AuthorizationDecision `json:"authorization,omitempty"`
+	RolloutRecord *pluginsdk.RolloutRecord         `json:"rollout_record,omitempty"`
+	Event         *eventmodel.Event                `json:"event,omitempty"`
+}
+
+type subprocessAdminCallbackResult struct {
+	Authorization *pluginsdk.AuthorizationDecision `json:"authorization,omitempty"`
+	RolloutRecord *pluginsdk.RolloutRecord         `json:"rollout_record,omitempty"`
+	Event         *eventmodel.Event                `json:"event,omitempty"`
+}
+
+type SubprocessAIChatQueueRequest struct {
+	Action string         `json:"action"`
+	Job    *pluginsdk.Job `json:"job,omitempty"`
+	JobID  string         `json:"job_id,omitempty"`
+	Reason string         `json:"reason,omitempty"`
+}
+
+type subprocessAIChatQueueCallback struct {
+	Action string         `json:"action"`
+	Job    *pluginsdk.Job `json:"job,omitempty"`
+	JobID  string         `json:"job_id,omitempty"`
+	Reason string         `json:"reason,omitempty"`
+}
+
+type SubprocessAIChatQueueResult struct {
+	Job *pluginsdk.Job `json:"job,omitempty"`
+}
+
+type subprocessAIChatQueueCallbackResult struct {
+	Job *pluginsdk.Job `json:"job,omitempty"`
+}
+
+type SubprocessAIChatSessionRequest struct {
+	Session pluginsdk.SessionState `json:"session"`
+}
+
+type subprocessAIChatSessionCallback struct {
+	Session pluginsdk.SessionState `json:"session"`
+}
+
+type SubprocessAIChatProviderRequest struct {
+	Prompt string `json:"prompt"`
+}
+
+type subprocessAIChatProviderCallback struct {
+	Prompt string `json:"prompt"`
+}
+
+type SubprocessAIChatProviderResult struct {
+	Text string `json:"text,omitempty"`
+}
+
+type subprocessAIChatProviderCallbackResult struct {
+	Text string `json:"text,omitempty"`
+}
+
 type SubprocessWorkflowStartOrResumeRequest struct {
-	WorkflowID string   `json:"workflow_id"`
-	PluginID   string   `json:"plugin_id,omitempty"`
-	TraceID    string   `json:"trace_id,omitempty"`
-	EventType  string   `json:"event_type"`
-	EventID    string   `json:"event_id,omitempty"`
-	RunID      string   `json:"run_id,omitempty"`
-	CorrelationID string `json:"correlation_id,omitempty"`
-	Initial    Workflow `json:"initial"`
+	WorkflowID    string   `json:"workflow_id"`
+	PluginID      string   `json:"plugin_id,omitempty"`
+	TraceID       string   `json:"trace_id,omitempty"`
+	EventType     string   `json:"event_type"`
+	EventID       string   `json:"event_id,omitempty"`
+	RunID         string   `json:"run_id,omitempty"`
+	CorrelationID string   `json:"correlation_id,omitempty"`
+	Initial       Workflow `json:"initial"`
 }
 
 type subprocessWorkflowStartOrResumeCallback struct {
-	WorkflowID string   `json:"workflow_id"`
-	PluginID   string   `json:"plugin_id,omitempty"`
-	TraceID    string   `json:"trace_id,omitempty"`
-	EventType  string   `json:"event_type"`
-	EventID    string   `json:"event_id,omitempty"`
-	RunID      string   `json:"run_id,omitempty"`
-	CorrelationID string `json:"correlation_id,omitempty"`
-	Initial    Workflow `json:"initial"`
+	WorkflowID    string   `json:"workflow_id"`
+	PluginID      string   `json:"plugin_id,omitempty"`
+	TraceID       string   `json:"trace_id,omitempty"`
+	EventType     string   `json:"event_type"`
+	EventID       string   `json:"event_id,omitempty"`
+	RunID         string   `json:"run_id,omitempty"`
+	CorrelationID string   `json:"correlation_id,omitempty"`
+	Initial       Workflow `json:"initial"`
 }
 
 type hostCallbackResult struct {
-	Type                  string              `json:"type"`
-	Status                string              `json:"status,omitempty"`
-	Error                 string              `json:"error,omitempty"`
-	WorkflowStartOrResume *WorkflowTransition `json:"workflow_start_or_resume,omitempty"`
+	Type                  string                                  `json:"type"`
+	Status                string                                  `json:"status,omitempty"`
+	Error                 string                                  `json:"error,omitempty"`
+	AdminRequest          *subprocessAdminCallbackResult          `json:"admin_request,omitempty"`
+	AIChatQueue           *subprocessAIChatQueueCallbackResult    `json:"ai_chat_queue,omitempty"`
+	AIChatProvider        *subprocessAIChatProviderCallbackResult `json:"ai_chat_provider,omitempty"`
+	WorkflowStartOrResume *WorkflowTransition                     `json:"workflow_start_or_resume,omitempty"`
+}
+
+type subprocessCallbackResultPayload struct {
+	AdminRequest          *subprocessAdminCallbackResult
+	AIChatQueue           *subprocessAIChatQueueCallbackResult
+	AIChatProvider        *subprocessAIChatProviderCallbackResult
+	WorkflowStartOrResume *WorkflowTransition
 }
 
 type subprocessFailureStage string
@@ -143,12 +240,6 @@ type subprocessCompatibilityFailure struct {
 	compatibilityRule string
 	metadata          map[string]any
 	detail            string
-}
-
-type subprocessRuntimeVersion struct {
-	major int
-	minor int
-	patch int
 }
 
 func (e *subprocessCompatibilityFailure) Error() string {
@@ -222,6 +313,30 @@ func (h *SubprocessPluginHost) SetReplyTextCallback(callback func(eventmodel.Rep
 	h.replyTextCallback = callback
 }
 
+func (h *SubprocessPluginHost) SetAdminRequestCallback(callback func(context.Context, SubprocessAdminRequest) (SubprocessAdminResult, error)) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.adminRequestCallback = callback
+}
+
+func (h *SubprocessPluginHost) SetAIChatQueueCallback(callback func(context.Context, SubprocessAIChatQueueRequest) (SubprocessAIChatQueueResult, error)) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.aiChatQueueCallback = callback
+}
+
+func (h *SubprocessPluginHost) SetAIChatSessionCallback(callback func(context.Context, SubprocessAIChatSessionRequest) error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.aiChatSessionCallback = callback
+}
+
+func (h *SubprocessPluginHost) SetAIChatProviderCallback(callback func(context.Context, SubprocessAIChatProviderRequest) (SubprocessAIChatProviderResult, error)) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.aiChatProviderCallback = callback
+}
+
 func (h *SubprocessPluginHost) SetWorkflowStartOrResumeCallback(callback func(context.Context, SubprocessWorkflowStartOrResumeRequest) (WorkflowTransition, error)) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -268,10 +383,6 @@ func (h *SubprocessPluginHost) DispatchEvent(ctx context.Context, plugin plugins
 		executionContext.PluginID = plugin.Manifest.ID
 	}
 	executionContext = enrichExecutionContext(executionContext)
-	if err = validateSubprocessPlugin(plugin.Manifest); err != nil {
-		h.observeCompatibilityFailure(plugin.Manifest.ID, executionContext, "event", err)
-		return err
-	}
 	var payload []byte
 	payload, err = json.Marshal(struct {
 		Event eventmodel.Event            `json:"event"`
@@ -283,7 +394,16 @@ func (h *SubprocessPluginHost) DispatchEvent(ctx context.Context, plugin plugins
 	var request hostRequest
 	request, err = buildSubprocessHostRequest("event", payload, plugin)
 	if err != nil {
-		h.observeInstanceConfigFailure(plugin.Manifest.ID, executionContext, "event", err)
+		var instanceConfigErr *subprocessInstanceConfigFailure
+		if errors.As(err, &instanceConfigErr) {
+			h.observeInstanceConfigFailure(plugin.Manifest.ID, executionContext, "event", err)
+			return err
+		}
+		var compatibilityErr *subprocessCompatibilityFailure
+		if errors.As(err, &compatibilityErr) {
+			h.observeCompatibilityFailure(plugin.Manifest.ID, executionContext, "event", err)
+			return err
+		}
 		return err
 	}
 	return h.dispatchRequest(ctx, plugin.Manifest.ID, request, executionContext)
@@ -298,10 +418,6 @@ func (h *SubprocessPluginHost) DispatchCommand(ctx context.Context, plugin plugi
 		executionContext.PluginID = plugin.Manifest.ID
 	}
 	executionContext = enrichExecutionContext(executionContext)
-	if err = validateSubprocessPlugin(plugin.Manifest); err != nil {
-		h.observeCompatibilityFailure(plugin.Manifest.ID, executionContext, "command", err)
-		return err
-	}
 	var payload []byte
 	payload, err = json.Marshal(struct {
 		Command eventmodel.CommandInvocation `json:"command"`
@@ -313,7 +429,16 @@ func (h *SubprocessPluginHost) DispatchCommand(ctx context.Context, plugin plugi
 	var request hostRequest
 	request, err = buildSubprocessHostRequest("command", payload, plugin)
 	if err != nil {
-		h.observeInstanceConfigFailure(plugin.Manifest.ID, executionContext, "command", err)
+		var instanceConfigErr *subprocessInstanceConfigFailure
+		if errors.As(err, &instanceConfigErr) {
+			h.observeInstanceConfigFailure(plugin.Manifest.ID, executionContext, "command", err)
+			return err
+		}
+		var compatibilityErr *subprocessCompatibilityFailure
+		if errors.As(err, &compatibilityErr) {
+			h.observeCompatibilityFailure(plugin.Manifest.ID, executionContext, "command", err)
+			return err
+		}
 		return err
 	}
 	return h.dispatchRequest(ctx, plugin.Manifest.ID, request, executionContext)
@@ -328,10 +453,6 @@ func (h *SubprocessPluginHost) DispatchJob(ctx context.Context, plugin pluginsdk
 		executionContext.PluginID = plugin.Manifest.ID
 	}
 	executionContext = enrichExecutionContext(executionContext)
-	if err = validateSubprocessPlugin(plugin.Manifest); err != nil {
-		h.observeCompatibilityFailure(plugin.Manifest.ID, executionContext, "job", err)
-		return err
-	}
 	var payload []byte
 	payload, err = json.Marshal(struct {
 		Job pluginsdk.JobInvocation     `json:"job"`
@@ -343,7 +464,16 @@ func (h *SubprocessPluginHost) DispatchJob(ctx context.Context, plugin pluginsdk
 	var request hostRequest
 	request, err = buildSubprocessHostRequest("job", payload, plugin)
 	if err != nil {
-		h.observeInstanceConfigFailure(plugin.Manifest.ID, executionContext, "job", err)
+		var instanceConfigErr *subprocessInstanceConfigFailure
+		if errors.As(err, &instanceConfigErr) {
+			h.observeInstanceConfigFailure(plugin.Manifest.ID, executionContext, "job", err)
+			return err
+		}
+		var compatibilityErr *subprocessCompatibilityFailure
+		if errors.As(err, &compatibilityErr) {
+			h.observeCompatibilityFailure(plugin.Manifest.ID, executionContext, "job", err)
+			return err
+		}
 		return err
 	}
 	return h.dispatchRequest(ctx, plugin.Manifest.ID, request, executionContext)
@@ -358,10 +488,6 @@ func (h *SubprocessPluginHost) DispatchSchedule(ctx context.Context, plugin plug
 		executionContext.PluginID = plugin.Manifest.ID
 	}
 	executionContext = enrichExecutionContext(executionContext)
-	if err = validateSubprocessPlugin(plugin.Manifest); err != nil {
-		h.observeCompatibilityFailure(plugin.Manifest.ID, executionContext, "schedule", err)
-		return err
-	}
 	var payload []byte
 	payload, err = json.Marshal(struct {
 		Trigger pluginsdk.ScheduleTrigger   `json:"schedule_trigger"`
@@ -373,7 +499,16 @@ func (h *SubprocessPluginHost) DispatchSchedule(ctx context.Context, plugin plug
 	var request hostRequest
 	request, err = buildSubprocessHostRequest("schedule", payload, plugin)
 	if err != nil {
-		h.observeInstanceConfigFailure(plugin.Manifest.ID, executionContext, "schedule", err)
+		var instanceConfigErr *subprocessInstanceConfigFailure
+		if errors.As(err, &instanceConfigErr) {
+			h.observeInstanceConfigFailure(plugin.Manifest.ID, executionContext, "schedule", err)
+			return err
+		}
+		var compatibilityErr *subprocessCompatibilityFailure
+		if errors.As(err, &compatibilityErr) {
+			h.observeCompatibilityFailure(plugin.Manifest.ID, executionContext, "schedule", err)
+			return err
+		}
 		return err
 	}
 	return h.dispatchRequest(ctx, plugin.Manifest.ID, request, executionContext)
@@ -393,7 +528,11 @@ func buildSubprocessHostRequest(requestType string, payload json.RawMessage, plu
 	default:
 		return hostRequest{}, fmt.Errorf("unsupported host request type %q", requestType)
 	}
-	instanceConfig, err := marshalSubprocessInstanceConfig(plugin.Manifest, plugin.InstanceConfig)
+	evaluation, err := evaluatePluginCompatibilityPreflight(subprocessPluginCompatibilityPreflightRequest(), plugin.Manifest, plugin.InstanceConfig)
+	if err != nil {
+		return hostRequest{}, err
+	}
+	instanceConfig, err := marshalNormalizedSubprocessInstanceConfig(evaluation.normalizedInstanceConfig)
 	if err != nil {
 		return hostRequest{}, err
 	}
@@ -401,24 +540,15 @@ func buildSubprocessHostRequest(requestType string, payload json.RawMessage, plu
 	return request, nil
 }
 
-func marshalSubprocessInstanceConfig(manifest pluginsdk.PluginManifest, instanceConfig map[string]any) (json.RawMessage, error) {
-	mergedConfig, err := normalizeSubprocessInstanceConfig(manifest, instanceConfig)
-	if err != nil {
-		return nil, err
-	}
-	if len(mergedConfig) == 0 {
+func marshalNormalizedSubprocessInstanceConfig(normalizedConfig map[string]any) (json.RawMessage, error) {
+	if len(normalizedConfig) == 0 {
 		return nil, nil
 	}
-	encoded, err := json.Marshal(mergedConfig)
+	encoded, err := json.Marshal(normalizedConfig)
 	if err != nil {
 		return nil, err
 	}
 	return encoded, nil
-}
-
-func validateSubprocessInstanceConfig(manifest pluginsdk.PluginManifest, instanceConfig map[string]any) error {
-	_, err := normalizeSubprocessInstanceConfig(manifest, instanceConfig)
-	return err
 }
 
 func normalizeSubprocessInstanceConfig(manifest pluginsdk.PluginManifest, instanceConfig map[string]any) (map[string]any, error) {
@@ -1340,6 +1470,14 @@ func (h *SubprocessPluginHost) handleCallback(ctx context.Context, pluginID stri
 	switch response.Callback {
 	case "reply_text":
 		return h.handleReplyTextCallback(pluginID, response)
+	case "admin_request":
+		return h.handleAdminRequestCallback(ctx, pluginID, executionContext, response)
+	case "ai_chat_queue":
+		return h.handleAIChatQueueCallback(ctx, pluginID, executionContext, response)
+	case "ai_chat_session":
+		return h.handleAIChatSessionCallback(ctx, pluginID, executionContext, response)
+	case "ai_chat_provider":
+		return h.handleAIChatProviderCallback(ctx, pluginID, executionContext, response)
 	case "workflow_start_or_resume":
 		return h.handleWorkflowStartOrResumeCallback(ctx, pluginID, executionContext, response)
 	default:
@@ -1360,19 +1498,121 @@ func (h *SubprocessPluginHost) handleReplyTextCallback(pluginID string, response
 	return h.writeCallbackResult(pluginID, callbackErr, nil)
 }
 
+func (h *SubprocessPluginHost) handleAdminRequestCallback(ctx context.Context, pluginID string, executionContext eventmodel.ExecutionContext, response hostResponse) error {
+	if response.AdminRequest == nil {
+		return fmt.Errorf("subprocess callback %q missing payload", "admin_request")
+	}
+	request := SubprocessAdminRequest{
+		Action:         strings.TrimSpace(response.AdminRequest.Action),
+		TargetPluginID: strings.TrimSpace(response.AdminRequest.TargetPluginID),
+		EventID:        strings.TrimSpace(response.AdminRequest.EventID),
+		AuditEntry:     response.AdminRequest.AuditEntry,
+		Actor:          strings.TrimSpace(response.AdminRequest.Actor),
+		Permission:     strings.TrimSpace(response.AdminRequest.Permission),
+		Target:         strings.TrimSpace(response.AdminRequest.Target),
+		TargetKind:     response.AdminRequest.TargetKind,
+	}
+	ctx = withSubprocessExecutionContext(ctx, executionContext, pluginID)
+	var (
+		callbackErr error
+		result      SubprocessAdminResult
+	)
+	if h.adminRequestCallback == nil {
+		callbackErr = errors.New("subprocess admin_request callback is not configured")
+	} else {
+		result, callbackErr = h.adminRequestCallback(ctx, request)
+	}
+	if callbackErr != nil {
+		return h.writeCallbackResult(pluginID, callbackErr, nil)
+	}
+	return h.writeCallbackResult(pluginID, nil, &subprocessCallbackResultPayload{
+		AdminRequest: &subprocessAdminCallbackResult{
+			Authorization: result.Authorization,
+			RolloutRecord: result.RolloutRecord,
+			Event:         result.Event,
+		},
+	})
+}
+
+func (h *SubprocessPluginHost) handleAIChatQueueCallback(ctx context.Context, pluginID string, executionContext eventmodel.ExecutionContext, response hostResponse) error {
+	if response.AIChatQueue == nil {
+		return fmt.Errorf("subprocess callback %q missing payload", "ai_chat_queue")
+	}
+	request := SubprocessAIChatQueueRequest{
+		Action: strings.TrimSpace(response.AIChatQueue.Action),
+		Job:    response.AIChatQueue.Job,
+		JobID:  strings.TrimSpace(response.AIChatQueue.JobID),
+		Reason: strings.TrimSpace(response.AIChatQueue.Reason),
+	}
+	ctx = withSubprocessExecutionContext(ctx, executionContext, pluginID)
+	var (
+		callbackErr error
+		result      SubprocessAIChatQueueResult
+	)
+	if h.aiChatQueueCallback == nil {
+		callbackErr = errors.New("subprocess ai_chat_queue callback is not configured")
+	} else {
+		result, callbackErr = h.aiChatQueueCallback(ctx, request)
+	}
+	if callbackErr != nil {
+		return h.writeCallbackResult(pluginID, callbackErr, nil)
+	}
+	return h.writeCallbackResult(pluginID, nil, &subprocessCallbackResultPayload{
+		AIChatQueue: &subprocessAIChatQueueCallbackResult{Job: result.Job},
+	})
+}
+
+func (h *SubprocessPluginHost) handleAIChatSessionCallback(ctx context.Context, pluginID string, executionContext eventmodel.ExecutionContext, response hostResponse) error {
+	if response.AIChatSession == nil {
+		return fmt.Errorf("subprocess callback %q missing payload", "ai_chat_session")
+	}
+	request := SubprocessAIChatSessionRequest{Session: response.AIChatSession.Session}
+	ctx = withSubprocessExecutionContext(ctx, executionContext, pluginID)
+	var callbackErr error
+	if h.aiChatSessionCallback == nil {
+		callbackErr = errors.New("subprocess ai_chat_session callback is not configured")
+	} else {
+		callbackErr = h.aiChatSessionCallback(ctx, request)
+	}
+	return h.writeCallbackResult(pluginID, callbackErr, nil)
+}
+
+func (h *SubprocessPluginHost) handleAIChatProviderCallback(ctx context.Context, pluginID string, executionContext eventmodel.ExecutionContext, response hostResponse) error {
+	if response.AIChatProvider == nil {
+		return fmt.Errorf("subprocess callback %q missing payload", "ai_chat_provider")
+	}
+	request := SubprocessAIChatProviderRequest{Prompt: response.AIChatProvider.Prompt}
+	ctx = withSubprocessExecutionContext(ctx, executionContext, pluginID)
+	var (
+		callbackErr error
+		result      SubprocessAIChatProviderResult
+	)
+	if h.aiChatProviderCallback == nil {
+		callbackErr = errors.New("subprocess ai_chat_provider callback is not configured")
+	} else {
+		result, callbackErr = h.aiChatProviderCallback(ctx, request)
+	}
+	if callbackErr != nil {
+		return h.writeCallbackResult(pluginID, callbackErr, nil)
+	}
+	return h.writeCallbackResult(pluginID, nil, &subprocessCallbackResultPayload{
+		AIChatProvider: &subprocessAIChatProviderCallbackResult{Text: result.Text},
+	})
+}
+
 func (h *SubprocessPluginHost) handleWorkflowStartOrResumeCallback(ctx context.Context, pluginID string, executionContext eventmodel.ExecutionContext, response hostResponse) error {
 	if response.WorkflowStartOrResume == nil {
 		return fmt.Errorf("subprocess callback %q missing payload", "workflow_start_or_resume")
 	}
 	request := SubprocessWorkflowStartOrResumeRequest{
-		WorkflowID: strings.TrimSpace(response.WorkflowStartOrResume.WorkflowID),
-		PluginID:   pluginID,
-		TraceID:    strings.TrimSpace(response.WorkflowStartOrResume.TraceID),
-		EventType:  strings.TrimSpace(response.WorkflowStartOrResume.EventType),
-		EventID:    strings.TrimSpace(response.WorkflowStartOrResume.EventID),
-		RunID:      strings.TrimSpace(response.WorkflowStartOrResume.RunID),
+		WorkflowID:    strings.TrimSpace(response.WorkflowStartOrResume.WorkflowID),
+		PluginID:      pluginID,
+		TraceID:       strings.TrimSpace(response.WorkflowStartOrResume.TraceID),
+		EventType:     strings.TrimSpace(response.WorkflowStartOrResume.EventType),
+		EventID:       strings.TrimSpace(response.WorkflowStartOrResume.EventID),
+		RunID:         strings.TrimSpace(response.WorkflowStartOrResume.RunID),
 		CorrelationID: strings.TrimSpace(response.WorkflowStartOrResume.CorrelationID),
-		Initial:    response.WorkflowStartOrResume.Initial,
+		Initial:       response.WorkflowStartOrResume.Initial,
 	}
 	if request.EventID == "" {
 		request.EventID = executionContext.EventID
@@ -1405,17 +1645,38 @@ func (h *SubprocessPluginHost) handleWorkflowStartOrResumeCallback(ctx context.C
 	if callbackErr != nil {
 		return h.writeCallbackResult(pluginID, callbackErr, nil)
 	}
-	return h.writeCallbackResult(pluginID, nil, &transition)
+	return h.writeCallbackResult(pluginID, nil, &subprocessCallbackResultPayload{WorkflowStartOrResume: &transition})
 }
 
-func (h *SubprocessPluginHost) writeCallbackResult(pluginID string, callbackErr error, transition *WorkflowTransition) error {
+func withSubprocessExecutionContext(ctx context.Context, executionContext eventmodel.ExecutionContext, pluginID string) context.Context {
+	return WithWorkflowObservabilityContext(ctx, WorkflowObservabilityContext{
+		TraceID:       strings.TrimSpace(executionContext.TraceID),
+		EventID:       strings.TrimSpace(executionContext.EventID),
+		PluginID:      strings.TrimSpace(pluginID),
+		RunID:         strings.TrimSpace(executionContext.RunID),
+		CorrelationID: strings.TrimSpace(executionContext.CorrelationID),
+	})
+}
+
+func (h *SubprocessPluginHost) writeCallbackResult(pluginID string, callbackErr error, payload *subprocessCallbackResultPayload) error {
 	result := hostCallbackResult{Type: "callback_result", Status: "ok"}
 	if callbackErr != nil {
 		result.Status = "error"
 		result.Error = callbackErr.Error()
-	} else if transition != nil {
-		cloned := *transition
-		result.WorkflowStartOrResume = &cloned
+	} else if payload != nil {
+		if payload.AdminRequest != nil {
+			result.AdminRequest = payload.AdminRequest
+		}
+		if payload.AIChatQueue != nil {
+			result.AIChatQueue = payload.AIChatQueue
+		}
+		if payload.AIChatProvider != nil {
+			result.AIChatProvider = payload.AIChatProvider
+		}
+		if payload.WorkflowStartOrResume != nil {
+			cloned := *payload.WorkflowStartOrResume
+			result.WorkflowStartOrResume = &cloned
+		}
 	}
 	encoded, err := json.Marshal(result)
 	if err != nil {
@@ -1483,22 +1744,22 @@ func (h *SubprocessPluginHost) collectStream(scanner *bufio.Scanner, target *[]s
 	}()
 }
 
-func validateSubprocessPlugin(manifest pluginsdk.PluginManifest) error {
-	if manifest.Mode != pluginsdk.ModeSubprocess {
+func validateSubprocessManifestCompatibility(manifest pluginsdk.PluginManifest, request pluginCompatibilityPreflightRequest) error {
+	if manifest.Mode != request.hostMode {
 		return &subprocessCompatibilityFailure{
 			manifest: manifest,
 			reason:   subprocessFailureReasonManifestModeMismatch,
-			detail:   fmt.Sprintf("plugin %q is not compatible with subprocess host: mode must be %q", manifest.ID, pluginsdk.ModeSubprocess),
+			detail:   fmt.Sprintf("plugin %q is not compatible with subprocess host: mode must be %q", manifest.ID, request.hostMode),
 		}
 	}
-	if manifest.APIVersion != supportedSubprocessPluginAPIVersion {
+	if manifest.APIVersion != request.supportedAPIVersion {
 		return &subprocessCompatibilityFailure{
 			manifest: manifest,
 			reason:   subprocessFailureReasonManifestUnsupportedAPI,
 			detail:   fmt.Sprintf("plugin %q is not compatible with subprocess host: unsupported apiVersion %q", manifest.ID, manifest.APIVersion),
 		}
 	}
-	if err := validateSubprocessRuntimeVersion(manifest); err != nil {
+	if err := validateSubprocessRuntimeVersion(manifest, request.currentRuntimeVersion); err != nil {
 		return err
 	}
 	if strings.TrimSpace(manifest.Entry.Binary) == "" && strings.TrimSpace(manifest.Entry.Module) == "" {
@@ -1514,7 +1775,7 @@ func validateSubprocessPlugin(manifest pluginsdk.PluginManifest) error {
 	return nil
 }
 
-func validateSubprocessRuntimeVersion(manifest pluginsdk.PluginManifest) error {
+func validateSubprocessRuntimeVersion(manifest pluginsdk.PluginManifest, currentRuntimeVersion string) error {
 	requiredRange, ok := subprocessManifestRuntimeVersionRange(manifest)
 	if !ok {
 		return nil
@@ -1523,7 +1784,7 @@ func validateSubprocessRuntimeVersion(manifest pluginsdk.PluginManifest) error {
 	if requiredRange == "" {
 		return nil
 	}
-	compatible, err := subprocessRuntimeVersionSatisfiesRange(currentRuntimeVersion, requiredRange)
+	compatible, err := pluginsdk.RuntimeVersionSatisfiesRange(currentRuntimeVersion, requiredRange)
 	if err == nil && compatible {
 		return nil
 	}
@@ -1561,132 +1822,6 @@ func subprocessManifestRuntimeVersionRange(manifest pluginsdk.PluginManifest) (s
 		return "", false
 	}
 	return runtimeVersionRange, true
-}
-
-func subprocessRuntimeVersionSatisfiesRange(currentVersion, requiredRange string) (bool, error) {
-	current, err := parseSubprocessRuntimeVersion(currentVersion)
-	if err != nil {
-		return false, err
-	}
-	clauses, err := parseSubprocessRuntimeVersionRangeClauses(requiredRange)
-	if err != nil {
-		return false, err
-	}
-	if len(clauses) == 0 || len(clauses) > 2 {
-		return false, fmt.Errorf("runtimeVersionRange %q must use one or two comparator clauses", requiredRange)
-	}
-	for _, clause := range clauses {
-		required, err := parseSubprocessRuntimeVersion(clause.version)
-		if err != nil {
-			return false, err
-		}
-		if !subprocessRuntimeVersionMatchesComparator(current, clause.comparator, required) {
-			return false, nil
-		}
-	}
-	return true, nil
-}
-
-type subprocessRuntimeVersionRangeClause struct {
-	comparator string
-	version    string
-}
-
-func parseSubprocessRuntimeVersionRangeClauses(requiredRange string) ([]subprocessRuntimeVersionRangeClause, error) {
-	trimmed := strings.TrimSpace(requiredRange)
-	if trimmed == "" {
-		return nil, fmt.Errorf("runtimeVersionRange %q must use one or two comparator clauses", requiredRange)
-	}
-	clauses := make([]subprocessRuntimeVersionRangeClause, 0, 2)
-	for len(trimmed) > 0 {
-		comparator, remainder, ok := trimSubprocessRuntimeVersionComparator(trimmed)
-		if !ok {
-			return nil, fmt.Errorf("runtimeVersionRange %q must use one or two comparator clauses", requiredRange)
-		}
-		version, rest, ok := trimSubprocessRuntimeVersionToken(remainder)
-		if !ok {
-			return nil, fmt.Errorf("runtimeVersionRange %q must use one or two comparator clauses", requiredRange)
-		}
-		clauses = append(clauses, subprocessRuntimeVersionRangeClause{comparator: comparator, version: version})
-		trimmed = strings.TrimSpace(rest)
-	}
-	return clauses, nil
-}
-
-func trimSubprocessRuntimeVersionComparator(raw string) (string, string, bool) {
-	trimmed := strings.TrimLeft(raw, " \t\r\n")
-	for _, comparator := range []string{">=", "<=", ">", "<", "="} {
-		if strings.HasPrefix(trimmed, comparator) {
-			return comparator, strings.TrimLeft(trimmed[len(comparator):], " \t\r\n"), true
-		}
-	}
-	return "", raw, false
-}
-
-func trimSubprocessRuntimeVersionToken(raw string) (string, string, bool) {
-	trimmed := strings.TrimLeft(raw, " \t\r\n")
-	if trimmed == "" {
-		return "", raw, false
-	}
-	end := 0
-	for end < len(trimmed) {
-		switch trimmed[end] {
-		case ' ', '\t', '\r', '\n':
-			return trimmed[:end], trimmed[end:], true
-		default:
-			end++
-		}
-	}
-	return trimmed, "", true
-}
-
-func parseSubprocessRuntimeVersion(raw string) (subprocessRuntimeVersion, error) {
-	trimmed := strings.TrimSpace(strings.TrimPrefix(raw, "v"))
-	parts := strings.Split(trimmed, ".")
-	if len(parts) != 3 {
-		return subprocessRuntimeVersion{}, fmt.Errorf("runtime version %q must use major.minor.patch", raw)
-	}
-	major, err := strconv.Atoi(parts[0])
-	if err != nil {
-		return subprocessRuntimeVersion{}, fmt.Errorf("runtime version %q has invalid major component", raw)
-	}
-	minor, err := strconv.Atoi(parts[1])
-	if err != nil {
-		return subprocessRuntimeVersion{}, fmt.Errorf("runtime version %q has invalid minor component", raw)
-	}
-	patch, err := strconv.Atoi(parts[2])
-	if err != nil {
-		return subprocessRuntimeVersion{}, fmt.Errorf("runtime version %q has invalid patch component", raw)
-	}
-	return subprocessRuntimeVersion{major: major, minor: minor, patch: patch}, nil
-}
-
-func subprocessRuntimeVersionMatchesComparator(current subprocessRuntimeVersion, comparator string, required subprocessRuntimeVersion) bool {
-	comparison := compareSubprocessRuntimeVersions(current, required)
-	switch comparator {
-	case ">":
-		return comparison > 0
-	case ">=":
-		return comparison >= 0
-	case "=":
-		return comparison == 0
-	case "<=":
-		return comparison <= 0
-	case "<":
-		return comparison < 0
-	default:
-		return false
-	}
-}
-
-func compareSubprocessRuntimeVersions(left, right subprocessRuntimeVersion) int {
-	if left.major != right.major {
-		return left.major - right.major
-	}
-	if left.minor != right.minor {
-		return left.minor - right.minor
-	}
-	return left.patch - right.patch
 }
 
 func validateSubprocessConfigSchema(manifest pluginsdk.PluginManifest) error {

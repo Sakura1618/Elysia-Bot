@@ -7,19 +7,6 @@
 - 已完成事项直接从本文件删除，不做归档。
 - 本页只记录当前主链收口事项。远期方向仅在 Not now 保留边界提示，不作为当前承诺。
 
----
-
-## Active
-
-### 1. 收口插件契约、兼容性校验与发布回退基础
-- 为 manifest 建立版本化 schema 与 `runtimeVersionRange` 兼容矩阵，防止 host / runtime 演进时插件静默漂移。
-- 把 plugin template smoke 扩到 host mode / ABI / manifest drift / config schema drift 组合验证。
-- 为官方插件建立 inproc / subprocess 双模式兼容验证，但默认产品路径仍以 subprocess 为主。
-- 把 rollout 从 `prepare` / `activate` 扩到至少支持 candidate / canary / activate / rollback 所需的快照与状态基础。
-- 验收：官方插件在 CI 中可验证兼容性；发布失败时能回退到最近稳定版本且保留 manifest / config snapshot。
-
----
-
 ## Backlog
 
 ### 1. 补齐队列与 workflow 的可靠编排语义

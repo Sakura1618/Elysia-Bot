@@ -21,6 +21,7 @@ type ConsoleAPI struct {
 	alerts           consoleAlertReader
 	replayOps        consoleReplayOperationReader
 	rolloutOps       consoleRolloutOperationReader
+	rolloutHeads     consoleRolloutHeadReader
 	schedules        consoleScheduleReader
 	workflows        consoleWorkflowReader
 	adapterInstances consoleAdapterInstanceReader
@@ -113,6 +114,10 @@ type consoleReplayOperationReader interface {
 
 type consoleRolloutOperationReader interface {
 	ListRolloutOperationRecords() ([]RolloutOperationRecord, error)
+}
+
+type consoleRolloutHeadReader interface {
+	ListRolloutHeads() ([]RolloutHeadState, error)
 }
 
 type ConsoleJob struct {
@@ -218,6 +223,27 @@ type ConsoleRolloutOperation struct {
 	StateSource      string     `json:"stateSource,omitempty"`
 	Persisted        bool       `json:"persisted"`
 	Summary          string     `json:"summary,omitempty"`
+}
+
+type ConsoleRolloutSnapshot struct {
+	Version    string `json:"version,omitempty"`
+	APIVersion string `json:"apiVersion,omitempty"`
+	Mode       string `json:"mode,omitempty"`
+}
+
+type ConsoleRolloutHead struct {
+	PluginID        string                  `json:"pluginId"`
+	Stable          ConsoleRolloutSnapshot  `json:"stable"`
+	Active          ConsoleRolloutSnapshot  `json:"active"`
+	Candidate       *ConsoleRolloutSnapshot `json:"candidate,omitempty"`
+	Phase           string                  `json:"phase"`
+	Status          string                  `json:"status"`
+	Reason          string                  `json:"reason,omitempty"`
+	LastOperationID string                  `json:"lastOperationId,omitempty"`
+	UpdatedAt       *time.Time              `json:"updatedAt,omitempty"`
+	StateSource     string                  `json:"stateSource,omitempty"`
+	Persisted       bool                    `json:"persisted"`
+	Summary         string                  `json:"summary,omitempty"`
 }
 
 type ConsoleObservability struct {
@@ -386,6 +412,11 @@ type sqliteConsoleRolloutOperationReader struct {
 	source string
 }
 
+type sqliteConsoleRolloutHeadReader struct {
+	store  RolloutHeadStateStore
+	source string
+}
+
 type RuntimeStatus struct {
 	Adapters  int `json:"adapters"`
 	Plugins   int `json:"plugins"`
@@ -428,6 +459,13 @@ func NewSQLiteConsoleRolloutOperationReader(store interface {
 		return nil
 	}
 	return sqliteConsoleRolloutOperationReader{store: store, source: normalizeConsoleStateSource(firstConsoleStateSource(source...), "sqlite-rollout-operation-records")}
+}
+
+func NewSQLiteConsoleRolloutHeadReader(store RolloutHeadStateStore, source ...string) consoleRolloutHeadReader {
+	if store == nil {
+		return nil
+	}
+	return sqliteConsoleRolloutHeadReader{store: store, source: normalizeConsoleStateSource(firstConsoleStateSource(source...), "sqlite-rollout-heads")}
 }
 
 func NewSQLiteConsoleScheduleReader(store schedulerStore) consoleScheduleReader {
@@ -522,6 +560,10 @@ func (c *ConsoleAPI) SetReplayOperationReader(reader consoleReplayOperationReade
 
 func (c *ConsoleAPI) SetRolloutOperationReader(reader consoleRolloutOperationReader) {
 	c.rolloutOps = reader
+}
+
+func (c *ConsoleAPI) SetRolloutHeadReader(reader consoleRolloutHeadReader) {
+	c.rolloutHeads = reader
 }
 
 func (c *ConsoleAPI) SetRecoverySource(source consoleRecoverySource) {
@@ -1174,6 +1216,39 @@ func (c *ConsoleAPI) RolloutOperations() ([]ConsoleRolloutOperation, error) {
 	return items, nil
 }
 
+func (c *ConsoleAPI) RolloutHeads() ([]ConsoleRolloutHead, error) {
+	if c.rolloutHeads == nil {
+		return nil, nil
+	}
+	records, err := c.rolloutHeads.ListRolloutHeads()
+	if err != nil {
+		return nil, fmt.Errorf("load console rollout heads: %w", err)
+	}
+	items := make([]ConsoleRolloutHead, 0, len(records))
+	source := consoleRolloutHeadSource(c.rolloutHeads)
+	for _, record := range records {
+		item := ConsoleRolloutHead{
+			PluginID:        record.PluginID,
+			Stable:          consoleRolloutSnapshot(record.Stable),
+			Active:          consoleRolloutSnapshot(record.Active),
+			Phase:           record.Phase,
+			Status:          record.Status,
+			Reason:          record.Reason,
+			LastOperationID: record.LastOperationID,
+			UpdatedAt:       nullableConsoleTime(record.UpdatedAt),
+			StateSource:     source,
+			Persisted:       true,
+		}
+		if record.Candidate != nil {
+			candidate := consoleRolloutSnapshot(*record.Candidate)
+			item.Candidate = &candidate
+		}
+		item.Summary = consoleRolloutHeadSummary(item)
+		items = append(items, item)
+	}
+	return items, nil
+}
+
 func (c *ConsoleAPI) Audits() []pluginsdk.AuditEntry {
 	if c.audits == nil {
 		return nil
@@ -1277,6 +1352,10 @@ func (c *ConsoleAPI) renderJSONWithFilters(logQuery, jobQuery, pluginID string) 
 	if err != nil {
 		return "", err
 	}
+	rolloutHeads, err := c.RolloutHeads()
+	if err != nil {
+		return "", err
+	}
 	jobs, err := c.FilteredJobs(jobQuery)
 	if err != nil {
 		return "", err
@@ -1299,6 +1378,7 @@ func (c *ConsoleAPI) renderJSONWithFilters(logQuery, jobQuery, pluginID string) 
 		"alerts":        alerts,
 		"replayOps":     replayOps,
 		"rolloutOps":    rolloutOps,
+		"rolloutHeads":  rolloutHeads,
 		"plugins":       plugins,
 		"jobs":          jobs,
 		"schedules":     schedules,
@@ -1440,6 +1520,13 @@ func consoleRolloutOperationSource(reader consoleRolloutOperationReader) string 
 		return normalizeConsoleStateSource(typed.source, "sqlite-rollout-operation-records")
 	}
 	return "sqlite-rollout-operation-records"
+}
+
+func consoleRolloutHeadSource(reader consoleRolloutHeadReader) string {
+	if typed, ok := reader.(sqliteConsoleRolloutHeadReader); ok {
+		return normalizeConsoleStateSource(typed.source, "sqlite-rollout-heads")
+	}
+	return "sqlite-rollout-heads"
 }
 
 func consoleWorkflowSource(reader consoleWorkflowReader) string {
@@ -1586,6 +1673,10 @@ func (r sqliteConsoleReplayOperationReader) ListReplayOperationRecords() ([]Repl
 
 func (r sqliteConsoleRolloutOperationReader) ListRolloutOperationRecords() ([]RolloutOperationRecord, error) {
 	return r.store.ListRolloutOperationRecords(context.Background())
+}
+
+func (r sqliteConsoleRolloutHeadReader) ListRolloutHeads() ([]RolloutHeadState, error) {
+	return r.store.ListRolloutHeads(context.Background())
 }
 
 func nullableConsoleTime(value time.Time) *time.Time {
@@ -1912,6 +2003,34 @@ func consoleRolloutOperationSummary(item ConsoleRolloutOperation) string {
 	}
 	if item.StateSource != "" {
 		parts = append(parts, "via "+item.StateSource)
+	}
+	if item.Reason != "" {
+		parts = append(parts, "reason="+item.Reason)
+	}
+	return strings.Join(parts, " | ")
+}
+
+func consoleRolloutSnapshot(snapshot RolloutSnapshotState) ConsoleRolloutSnapshot {
+	return ConsoleRolloutSnapshot{
+		Version:    strings.TrimSpace(snapshot.Version),
+		APIVersion: strings.TrimSpace(snapshot.APIVersion),
+		Mode:       strings.TrimSpace(snapshot.Mode),
+	}
+}
+
+func consoleRolloutHeadSummary(item ConsoleRolloutHead) string {
+	parts := []string{fmt.Sprintf("rollout head %s %s for %s", item.Phase, item.Status, item.PluginID)}
+	if item.Stable.Version != "" || item.Active.Version != "" {
+		parts = append(parts, fmt.Sprintf("stable=%s active=%s", item.Stable.Version, item.Active.Version))
+	}
+	if item.Candidate != nil && item.Candidate.Version != "" {
+		parts = append(parts, fmt.Sprintf("candidate=%s", item.Candidate.Version))
+	}
+	if item.StateSource != "" {
+		parts = append(parts, "via "+item.StateSource)
+	}
+	if item.LastOperationID != "" {
+		parts = append(parts, "last_operation="+item.LastOperationID)
 	}
 	if item.Reason != "" {
 		parts = append(parts, "reason="+item.Reason)

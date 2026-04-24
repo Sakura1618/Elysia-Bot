@@ -20,10 +20,8 @@ type runtimeControlStateStore interface {
 	runtimecore.AuditLogReader
 	runtimecore.AuditRecorder
 	runtimecore.DispatchResultRecorder
-	SaveReplayOperationRecord(context.Context, runtimecore.ReplayOperationRecord) error
-	ListReplayOperationRecords(context.Context) ([]runtimecore.ReplayOperationRecord, error)
-	SaveRolloutOperationRecord(context.Context, runtimecore.RolloutOperationRecord) error
-	ListRolloutOperationRecords(context.Context) ([]runtimecore.RolloutOperationRecord, error)
+	runtimecore.ReplayOperationStateStore
+	runtimecore.RolloutStateStore
 	Counts(context.Context) (map[string]int, error)
 }
 
@@ -88,14 +86,13 @@ func runtimeRolloutPolicy(settings appRuntimeSettings) runtimecore.RolloutPolicy
 
 func runtimeControlCountKeys() []string {
 	return []string{
-		"event_journal",
 		"plugin_registry",
 		"plugin_enabled_overlays",
 		"plugin_configs",
 		"plugin_status_snapshots",
+		"rollout_heads",
 		"adapter_instances",
 		"sessions",
-		"idempotency_keys",
 		"operator_identities",
 		"rbac_snapshots",
 		"replay_operation_records",

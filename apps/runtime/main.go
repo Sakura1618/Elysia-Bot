@@ -101,6 +101,20 @@ type runtimeAuditEntriesReader interface {
 	AuditEntries() []pluginsdk.AuditEntry
 }
 
+type runtimeSubprocessAdminCallbackBridge struct {
+	lifecycle  *runtimecore.PluginLifecycleService
+	rollouts   *runtimecore.InMemoryRolloutManager
+	replay     *runtimeAppReplayService
+	audits     runtimecore.AuditRecorder
+	authorizer *runtimecore.CurrentRBACAuthorizerProvider
+}
+
+type runtimeSubprocessAIChatCallbackBridge struct {
+	queue    *runtimecore.JobQueue
+	sessions runtimeControlStateStore
+	provider pluginaichat.AIProvider
+}
+
 type sqliteRuntimeAuditRecorder struct {
 	store *runtimecore.SQLiteStateStore
 }
@@ -126,6 +140,210 @@ func (r sqliteRuntimeAuditRecorder) RecordAudit(entry pluginsdk.AuditEntry) erro
 		return results[0].Interface().(error)
 	}
 	return nil
+}
+
+func (b runtimeSubprocessAdminCallbackBridge) Handle(ctx context.Context, request runtimecore.SubprocessAdminRequest) (runtimecore.SubprocessAdminResult, error) {
+	switch strings.TrimSpace(request.Action) {
+	case "authorize":
+		return b.authorize(request), nil
+	case "enable_plugin":
+		if b.lifecycle == nil {
+			return runtimecore.SubprocessAdminResult{}, fmt.Errorf("plugin lifecycle service is required")
+		}
+		return runtimecore.SubprocessAdminResult{}, b.lifecycle.Enable(strings.TrimSpace(request.TargetPluginID))
+	case "disable_plugin":
+		if b.lifecycle == nil {
+			return runtimecore.SubprocessAdminResult{}, fmt.Errorf("plugin lifecycle service is required")
+		}
+		return runtimecore.SubprocessAdminResult{}, b.lifecycle.Disable(strings.TrimSpace(request.TargetPluginID))
+	case "prepare_rollout":
+		if b.rollouts == nil {
+			return runtimecore.SubprocessAdminResult{}, fmt.Errorf("rollout manager is required")
+		}
+		record, err := b.rollouts.Prepare(strings.TrimSpace(request.TargetPluginID))
+		if err != nil {
+			return runtimecore.SubprocessAdminResult{}, err
+		}
+		return runtimecore.SubprocessAdminResult{RolloutRecord: &record}, nil
+	case "canary_rollout":
+		if b.rollouts == nil {
+			return runtimecore.SubprocessAdminResult{}, fmt.Errorf("rollout manager is required")
+		}
+		record, err := b.rollouts.Canary(strings.TrimSpace(request.TargetPluginID))
+		if err != nil {
+			return runtimecore.SubprocessAdminResult{}, err
+		}
+		return runtimecore.SubprocessAdminResult{RolloutRecord: &record}, nil
+	case "can_activate_rollout":
+		if b.rollouts == nil {
+			return runtimecore.SubprocessAdminResult{}, fmt.Errorf("rollout manager is required")
+		}
+		record, err := b.rollouts.CanActivate(strings.TrimSpace(request.TargetPluginID))
+		if err != nil {
+			return runtimecore.SubprocessAdminResult{}, err
+		}
+		return runtimecore.SubprocessAdminResult{RolloutRecord: &record}, nil
+	case "activate_rollout":
+		if b.rollouts == nil {
+			return runtimecore.SubprocessAdminResult{}, fmt.Errorf("rollout manager is required")
+		}
+		record, err := b.rollouts.Activate(strings.TrimSpace(request.TargetPluginID))
+		if err != nil {
+			return runtimecore.SubprocessAdminResult{}, err
+		}
+		return runtimecore.SubprocessAdminResult{RolloutRecord: &record}, nil
+	case "can_rollback_rollout":
+		if b.rollouts == nil {
+			return runtimecore.SubprocessAdminResult{}, fmt.Errorf("rollout manager is required")
+		}
+		record, err := b.rollouts.CanRollback(strings.TrimSpace(request.TargetPluginID))
+		if err != nil {
+			return runtimecore.SubprocessAdminResult{}, err
+		}
+		return runtimecore.SubprocessAdminResult{RolloutRecord: &record}, nil
+	case "rollback_rollout":
+		if b.rollouts == nil {
+			return runtimecore.SubprocessAdminResult{}, fmt.Errorf("rollout manager is required")
+		}
+		record, err := b.rollouts.Rollback(strings.TrimSpace(request.TargetPluginID))
+		if err != nil {
+			return runtimecore.SubprocessAdminResult{}, err
+		}
+		return runtimecore.SubprocessAdminResult{RolloutRecord: &record}, nil
+	case "load_rollout_record":
+		if b.rollouts == nil {
+			return runtimecore.SubprocessAdminResult{}, nil
+		}
+		record, ok := b.rollouts.Record(strings.TrimSpace(request.TargetPluginID))
+		if !ok {
+			return runtimecore.SubprocessAdminResult{}, nil
+		}
+		return runtimecore.SubprocessAdminResult{RolloutRecord: &record}, nil
+	case "replay_event":
+		if b.replay == nil {
+			return runtimecore.SubprocessAdminResult{}, fmt.Errorf("replay service is required")
+		}
+		event, err := b.replay.ReplayEvent(strings.TrimSpace(request.EventID))
+		if err != nil {
+			return runtimecore.SubprocessAdminResult{}, err
+		}
+		return runtimecore.SubprocessAdminResult{Event: &event}, nil
+	case "record_audit":
+		if request.AuditEntry == nil || b.audits == nil {
+			return runtimecore.SubprocessAdminResult{}, nil
+		}
+		entry := *request.AuditEntry
+		if identity := runtimecore.RequestIdentityContextFromContext(ctx); strings.TrimSpace(entry.SessionID) == "" {
+			entry.SessionID = strings.TrimSpace(identity.SessionID)
+		}
+		return runtimecore.SubprocessAdminResult{}, b.audits.RecordAudit(entry)
+	default:
+		return runtimecore.SubprocessAdminResult{}, fmt.Errorf("unsupported subprocess admin action %q", request.Action)
+	}
+}
+
+func (b runtimeSubprocessAdminCallbackBridge) authorize(request runtimecore.SubprocessAdminRequest) runtimecore.SubprocessAdminResult {
+	permission := strings.TrimSpace(request.Permission)
+	target := strings.TrimSpace(request.Target)
+	decision := pluginsdk.AuthorizationDecision{Allowed: true, Permission: permission}
+	if permission != "" && target != "" {
+		if b.authorizer != nil {
+			decision = b.authorizeWithProvider(request)
+		} else {
+			decision = b.authorizeWithDefaultPolicy(request)
+		}
+	}
+	return runtimecore.SubprocessAdminResult{Authorization: &decision}
+}
+
+func (b runtimeSubprocessAdminCallbackBridge) authorizeWithDefaultPolicy(request runtimecore.SubprocessAdminRequest) pluginsdk.AuthorizationDecision {
+	permission := strings.TrimSpace(request.Permission)
+	target := strings.TrimSpace(request.Target)
+	defaultAuthorizer := pluginsdk.NewAuthorizer(actorRoles(nil), policies(nil))
+	actor := strings.TrimSpace(request.Actor)
+	if request.TargetKind == pluginsdk.AuthorizationTargetEvent {
+		return defaultAuthorizer.AuthorizeTarget(actor, permission, pluginsdk.AuthorizationTargetEvent, target)
+	}
+	return defaultAuthorizer.Authorize(actor, permission, target)
+}
+
+func (b runtimeSubprocessAIChatCallbackBridge) HandleQueue(ctx context.Context, request runtimecore.SubprocessAIChatQueueRequest) (runtimecore.SubprocessAIChatQueueResult, error) {
+	if b.queue == nil {
+		return runtimecore.SubprocessAIChatQueueResult{}, fmt.Errorf("job queue is required")
+	}
+	switch strings.TrimSpace(request.Action) {
+	case "enqueue":
+		if request.Job == nil {
+			return runtimecore.SubprocessAIChatQueueResult{}, fmt.Errorf("job is required")
+		}
+		job := *request.Job
+		if err := b.queue.Enqueue(ctx, job); err != nil {
+			return runtimecore.SubprocessAIChatQueueResult{}, err
+		}
+		stored, err := b.queue.Inspect(ctx, job.ID)
+		if err != nil {
+			return runtimecore.SubprocessAIChatQueueResult{}, err
+		}
+		return runtimecore.SubprocessAIChatQueueResult{Job: &stored}, nil
+	case "inspect":
+		stored, err := b.queue.Inspect(ctx, strings.TrimSpace(request.JobID))
+		if err != nil {
+			return runtimecore.SubprocessAIChatQueueResult{}, err
+		}
+		return runtimecore.SubprocessAIChatQueueResult{Job: &stored}, nil
+	case "mark_running":
+		stored, err := b.queue.MarkRunning(ctx, strings.TrimSpace(request.JobID))
+		if err != nil {
+			return runtimecore.SubprocessAIChatQueueResult{}, err
+		}
+		return runtimecore.SubprocessAIChatQueueResult{Job: &stored}, nil
+	case "complete":
+		stored, err := b.queue.Complete(ctx, strings.TrimSpace(request.JobID))
+		if err != nil {
+			return runtimecore.SubprocessAIChatQueueResult{}, err
+		}
+		return runtimecore.SubprocessAIChatQueueResult{Job: &stored}, nil
+	case "fail":
+		stored, err := b.queue.Fail(ctx, strings.TrimSpace(request.JobID), strings.TrimSpace(request.Reason))
+		if err != nil {
+			return runtimecore.SubprocessAIChatQueueResult{}, err
+		}
+		return runtimecore.SubprocessAIChatQueueResult{Job: &stored}, nil
+	default:
+		return runtimecore.SubprocessAIChatQueueResult{}, fmt.Errorf("unsupported subprocess ai-chat queue action %q", request.Action)
+	}
+}
+
+func (b runtimeSubprocessAIChatCallbackBridge) HandleSession(ctx context.Context, request runtimecore.SubprocessAIChatSessionRequest) error {
+	if b.sessions == nil {
+		return fmt.Errorf("session store is required")
+	}
+	return b.sessions.SaveSession(ctx, request.Session)
+}
+
+func (b runtimeSubprocessAIChatCallbackBridge) HandleProvider(ctx context.Context, request runtimecore.SubprocessAIChatProviderRequest) (runtimecore.SubprocessAIChatProviderResult, error) {
+	if b.provider == nil {
+		return runtimecore.SubprocessAIChatProviderResult{}, fmt.Errorf("ai provider is required")
+	}
+	text, err := b.provider.Generate(ctx, request.Prompt)
+	if err != nil {
+		return runtimecore.SubprocessAIChatProviderResult{}, err
+	}
+	return runtimecore.SubprocessAIChatProviderResult{Text: text}, nil
+}
+
+func (b runtimeSubprocessAdminCallbackBridge) authorizeWithProvider(request runtimecore.SubprocessAdminRequest) pluginsdk.AuthorizationDecision {
+	snapshot := b.authorizer.CurrentSnapshot()
+	permission := strings.TrimSpace(request.Permission)
+	if snapshot == nil || snapshot.Authorizer == nil {
+		return pluginsdk.AuthorizationDecision{Allowed: false, Permission: permission, Reason: "permission denied"}
+	}
+	actor := strings.TrimSpace(request.Actor)
+	target := strings.TrimSpace(request.Target)
+	if request.TargetKind == pluginsdk.AuthorizationTargetEvent {
+		return snapshot.Authorizer.AuthorizeTarget(actor, permission, pluginsdk.AuthorizationTargetEvent, target)
+	}
+	return snapshot.Authorizer.Authorize(actor, permission, target)
 }
 
 type sqliteRuntimeAuditEntriesReader struct {
@@ -418,9 +636,9 @@ type operatorPluginConfigResponse struct {
 
 type operatorJobResponse struct {
 	operatorActionResult
-	JobID      string            `json:"job_id,omitempty"`
-	RetriedJob *runtimecore.Job  `json:"retried_job,omitempty"`
-	CurrentJob *runtimecore.Job  `json:"current_job,omitempty"`
+	JobID      string           `json:"job_id,omitempty"`
+	RetriedJob *runtimecore.Job `json:"retried_job,omitempty"`
+	CurrentJob *runtimecore.Job `json:"current_job,omitempty"`
 }
 
 type operatorScheduleResponse struct {
@@ -911,9 +1129,20 @@ func newRuntimeAppWithOutputAndOptions(configPath string, output io.Writer, opti
 		eventScopes := map[string]map[string]struct{}{
 			"plugin-echo":          allowedSources(append(configuredEventIngressSources(settings), "runtime-demo-scheduler")...),
 			"plugin-workflow-demo": allowedSources("runtime-workflow-demo"),
+			"plugin-ai-chat":       allowedSources("runtime-ai"),
 		}
 		pluginHostFactory = func(replies *replyBuffer, workflowRuntime *runtimecore.WorkflowRuntime) runtimecore.PluginHost {
-			return newRuntimePluginHostWithEventScopes(replies, workflowRuntime, []string{"plugin-echo", "plugin-workflow-demo"}, eventScopes)
+			launcherConfig := runtimeDefaultSubprocessLauncherConfig()
+			direct := runtimecore.DirectPluginHost{}
+			primarySubprocess := newRuntimeSubprocessPluginHost(replies, workflowRuntime, launcherConfig)
+			adminSubprocess := newRuntimeSubprocessPluginHost(replies, workflowRuntime, launcherConfig)
+			aiChatSubprocess := newRuntimeSubprocessPluginHost(replies, workflowRuntime, launcherConfig)
+			return newRoutedPluginHostWithRouteMapAndEventScopes(direct, primarySubprocess, map[string]runtimecore.PluginHost{
+				"plugin-echo":          primarySubprocess,
+				"plugin-workflow-demo": primarySubprocess,
+				"plugin-admin":         adminSubprocess,
+				"plugin-ai-chat":       aiChatSubprocess,
+			}, eventScopes)
 		}
 	}
 	runtime := runtimecore.NewInMemoryRuntime(runtimecore.NoopSupervisor{}, pluginHostFactory(replies, workflowRuntime))
@@ -1007,6 +1236,28 @@ func newRuntimeAppWithOutputAndOptions(configPath string, output io.Writer, opti
 		aiDefinition.Manifest.ID:   nextRuntimeCandidateManifest(aiDefinition.Manifest),
 		"plugin-admin":             nextRuntimeCandidateManifest(pluginsdk.PluginManifest{ID: "plugin-admin", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess}),
 	}}, controlState)
+	if routed, ok := runtime.PluginHost().(routedPluginHost); ok {
+		adminBridge := runtimeSubprocessAdminCallbackBridge{
+			lifecycle:  lifecycle,
+			rollouts:   rolloutManager,
+			replay:     replayService,
+			audits:     persistedAuditRecorder,
+			authorizer: authorizerProvider,
+		}
+		if adminSubprocessHost, ok := routed.hostForPlugin("plugin-admin").(*runtimecore.SubprocessPluginHost); ok {
+			adminSubprocessHost.SetAdminRequestCallback(adminBridge.Handle)
+		}
+		if aiChatSubprocessHost, ok := routed.hostForPlugin("plugin-ai-chat").(*runtimecore.SubprocessPluginHost); ok {
+			aiChatBridge := runtimeSubprocessAIChatCallbackBridge{
+				queue:    queue,
+				sessions: controlState,
+				provider: aiProvider,
+			}
+			aiChatSubprocessHost.SetAIChatQueueCallback(aiChatBridge.HandleQueue)
+			aiChatSubprocessHost.SetAIChatSessionCallback(aiChatBridge.HandleSession)
+			aiChatSubprocessHost.SetAIChatProviderCallback(aiChatBridge.HandleProvider)
+		}
+	}
 	adminPlugin := pluginadmin.New(lifecycle, rolloutManager, replayService, authorizerProvider, actorRoles(config.RBAC), policies(config.RBAC), persistedAuditRecorder)
 	adminDefinition := adminPlugin.Definition()
 	if err := runtime.RegisterPlugin(adminDefinition); err != nil {
@@ -1294,6 +1545,7 @@ func (a *runtimeApp) handleConsole(w http.ResponseWriter, r *http.Request) {
 	console.SetAlertReader(runtimecore.NewSQLiteConsoleAlertReader(a.runtimeState))
 	console.SetReplayOperationReader(runtimecore.NewSQLiteConsoleReplayOperationReader(a.controlState, runtimeControlStateSource(a.settings, "replay-operation-records")))
 	console.SetRolloutOperationReader(runtimecore.NewSQLiteConsoleRolloutOperationReader(a.controlState, runtimeControlStateSource(a.settings, "rollout-operation-records")))
+	console.SetRolloutHeadReader(runtimecore.NewSQLiteConsoleRolloutHeadReader(a.controlState, runtimeControlStateSource(a.settings, "rollout-heads")))
 	console.SetScheduleReader(runtimecore.NewSQLiteConsoleScheduleReader(a.runtimeState))
 	console.SetWorkflowReader(runtimecore.NewSQLiteConsoleWorkflowReader(a.runtimeState, runtimeExecutionStateSource(a.settings, "workflow-instances")))
 	console.SetAdapterInstanceReader(runtimecore.NewSQLiteConsoleAdapterInstanceReader(a.controlState, runtimeControlStateSource(a.settings, "adapter-instances")))
@@ -1373,6 +1625,8 @@ func (a *runtimeApp) handleConsole(w http.ResponseWriter, r *http.Request) {
 	meta["rollout_record_store"] = runtimeRolloutRecordStore(a.settings)
 	meta["rollout_record_read_model"] = runtimeControlStateSource(a.settings, "rollout-operation-records")
 	meta["rollout_record_persisted"] = true
+	meta["rollout_head_read_model"] = runtimeControlStateSource(a.settings, "rollout-heads")
+	meta["rollout_head_persisted"] = true
 	meta["rollout_console_limitations"] = []string{"rollout policy declaration is read-only and mirrors existing runtime behavior only", "rollout remains limited to manual /admin prepare|activate with minimal manifest preflight and activate-time drift re-check; no rollback or staged rollout"}
 	meta["log_source"] = "runtime-log-buffer"
 	meta["trace_source"] = runtimeTraceSource(a.tracer, a.settings)

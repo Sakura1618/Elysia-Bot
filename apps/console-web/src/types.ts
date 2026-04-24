@@ -352,6 +352,32 @@ export type ConsolePayload = {
   alerts: AlertRecord[];
   replayOps: ReplayOperation[];
   rolloutOps: RolloutOperation[];
+  rolloutHeads: {
+    pluginId: string;
+    stable: {
+      version?: string;
+      apiVersion?: string;
+      mode?: string;
+    };
+    active: {
+      version?: string;
+      apiVersion?: string;
+      mode?: string;
+    };
+    candidate?: {
+      version?: string;
+      apiVersion?: string;
+      mode?: string;
+    };
+    phase: string;
+    status: string;
+    reason?: string;
+    lastOperationId?: string;
+    updatedAt?: string;
+    stateSource?: string;
+    persisted: boolean;
+    summary?: string;
+  }[];
   plugins: PluginManifest[];
   jobs: Job[];
   schedules: Schedule[];

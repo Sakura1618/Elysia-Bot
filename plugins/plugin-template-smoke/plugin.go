@@ -38,11 +38,12 @@ func New(replyService pluginsdk.ReplyService, config Config) Plugin {
 
 func Manifest() pluginsdk.PluginManifest {
 	return pluginsdk.PluginManifest{
-		ID:         TemplatePluginID,
-		Name:       TemplatePluginName,
-		Version:    "0.1.0",
-		APIVersion: "v0",
-		Mode:       pluginsdk.ModeSubprocess,
+		SchemaVersion: pluginsdk.SupportedPluginManifestSchemaVersion,
+		ID:            TemplatePluginID,
+		Name:          TemplatePluginName,
+		Version:       "0.1.0",
+		APIVersion:    "v0",
+		Mode:          pluginsdk.ModeSubprocess,
 		Permissions: []string{
 			"reply:send",
 		},

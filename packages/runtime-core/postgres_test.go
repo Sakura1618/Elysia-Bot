@@ -261,6 +261,9 @@ func TestPostgresStoreSaveMethodsIssueExpectedWrites(t *testing.T) {
 	if err := store.SaveRolloutOperationRecord(ctx, RolloutOperationRecord{OperationID: "rollout-op-1", PluginID: "plugin-echo", Action: "prepare", CurrentVersion: "0.1.0", CandidateVersion: "0.2.0-candidate", Status: "prepared"}); err != nil {
 		t.Fatalf("save rollout operation record: %v", err)
 	}
+	if err := store.SaveRolloutHead(ctx, RolloutHeadState{PluginID: "plugin-echo", Stable: RolloutSnapshotState{Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess}, Active: RolloutSnapshotState{Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess}, Candidate: &RolloutSnapshotState{Version: "0.2.0-candidate", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess}, Phase: "prepared", Status: "prepared", LastOperationID: "rollout-op-1", UpdatedAt: time.Date(2026, 4, 6, 10, 3, 30, 0, time.UTC)}); err != nil {
+		t.Fatalf("save rollout head: %v", err)
+	}
 	if err := store.RecordAlert(ctx, alert); err != nil {
 		t.Fatalf("record alert: %v", err)
 	}
@@ -281,8 +284,8 @@ func TestPostgresStoreSaveMethodsIssueExpectedWrites(t *testing.T) {
 		t.Fatalf("replace current rbac state: %v", err)
 	}
 
-	if len(pool.execSQL) != 17 {
-		t.Fatalf("expected 17 direct exec calls, got %d", len(pool.execSQL))
+	if len(pool.execSQL) != 18 {
+		t.Fatalf("expected 18 direct exec calls, got %d", len(pool.execSQL))
 	}
 	if pool.tx == nil {
 		t.Fatal("expected rbac replacement to use a transaction")
@@ -293,7 +296,7 @@ func TestPostgresStoreSaveMethodsIssueExpectedWrites(t *testing.T) {
 	if len(pool.tx.execSQL) != 4 {
 		t.Fatalf("expected 4 transactional exec calls for rbac replacement, got %d", len(pool.tx.execSQL))
 	}
-	for _, expected := range []string{"INSERT INTO event_log", "INSERT INTO jobs_pg", "INSERT INTO workflow_state", "INSERT INTO plugin_registry_pg", "INSERT INTO idempotency_keys_pg", "INSERT INTO audit_log", "INSERT INTO plugin_enabled_overlays_pg", "INSERT INTO plugin_configs_pg", "INSERT INTO plugin_status_snapshots_pg", "INSERT INTO sessions_pg", "INSERT INTO adapter_instances_pg", "INSERT INTO replay_operation_records_pg", "INSERT INTO rollout_operation_records_pg", "INSERT INTO alerts_pg", "INSERT INTO schedule_plans_pg", "UPDATE schedule_plans_pg", "INSERT INTO workflow_instances_pg", "INSERT INTO operator_identities_pg", "INSERT INTO rbac_snapshots_pg"} {
+	for _, expected := range []string{"INSERT INTO event_log", "INSERT INTO jobs_pg", "INSERT INTO workflow_state", "INSERT INTO plugin_registry_pg", "INSERT INTO idempotency_keys_pg", "INSERT INTO audit_log", "INSERT INTO plugin_enabled_overlays_pg", "INSERT INTO plugin_configs_pg", "INSERT INTO plugin_status_snapshots_pg", "INSERT INTO sessions_pg", "INSERT INTO adapter_instances_pg", "INSERT INTO replay_operation_records_pg", "INSERT INTO rollout_operation_records_pg", "INSERT INTO rollout_heads_pg", "INSERT INTO alerts_pg", "INSERT INTO schedule_plans_pg", "UPDATE schedule_plans_pg", "INSERT INTO workflow_instances_pg", "INSERT INTO operator_identities_pg", "INSERT INTO rbac_snapshots_pg"} {
 		matched := false
 		for _, sql := range pool.execSQL {
 			if strings.Contains(sql, expected) {
@@ -506,6 +509,8 @@ func TestPostgresStoreControlStateReadbacks(t *testing.T) {
 	recoveredAt := updatedAt.Add(2 * time.Minute)
 	pool := &fakePostgresPool{queryRowFunc: func(_ context.Context, query string, _ ...any) pgx.Row {
 		switch {
+		case strings.Contains(query, "FROM rollout_heads_pg"):
+			return fakeRow{values: []any{"plugin-echo", []byte(`{"Version":"0.1.0","APIVersion":"v0","Mode":"subprocess"}`), []byte(`{"Version":"0.1.0","APIVersion":"v0","Mode":"subprocess"}`), []byte(`{"Version":"0.2.0-candidate","APIVersion":"v0","Mode":"subprocess"}`), "prepared", "prepared", "", "rollout-op-prepare-1", updatedAt}}
 		case strings.Contains(query, "FROM sessions_pg"):
 			return fakeRow{values: []any{OperatorBearerSessionID("viewer-user"), OperatorAuthSessionPluginID, []byte(`{"actor_id":"viewer-user","token_id":"console-viewer","auth_method":"bearer"}`)}}
 		case strings.Contains(query, "FROM plugin_enabled_overlays_pg"):
@@ -556,6 +561,10 @@ func TestPostgresStoreControlStateReadbacks(t *testing.T) {
 	if err != nil || rbac.ConsoleReadPermission != "console:read" || rbac.Policies["viewer"].Permissions[0] != "console:read" {
 		t.Fatalf("load rbac snapshot: state=%+v err=%v", rbac, err)
 	}
+	head, err := store.LoadRolloutHead(ctx, "plugin-echo")
+	if err != nil || head.PluginID != "plugin-echo" || head.Stable.Version != "0.1.0" || head.Active.Version != "0.1.0" || head.Candidate == nil || head.Candidate.Version != "0.2.0-candidate" || head.LastOperationID != "rollout-op-prepare-1" {
+		t.Fatalf("load rollout head: state=%+v err=%v", head, err)
+	}
 }
 
 func TestPostgresStoreControlStateListReadbacks(t *testing.T) {
@@ -565,6 +574,8 @@ func TestPostgresStoreControlStateListReadbacks(t *testing.T) {
 	occurredAt := updatedAt.Add(-5 * time.Minute)
 	pool := &fakePostgresPool{queryFunc: func(_ context.Context, query string, _ ...any) (pgx.Rows, error) {
 		switch {
+		case strings.Contains(query, "FROM rollout_heads_pg"):
+			return &fakeRows{rows: [][]any{{"plugin-echo", []byte(`{"Version":"0.1.0","APIVersion":"v0","Mode":"subprocess"}`), []byte(`{"Version":"0.1.0","APIVersion":"v0","Mode":"subprocess"}`), []byte(`{"Version":"0.2.0-candidate","APIVersion":"v0","Mode":"subprocess"}`), "prepared", "prepared", "", "rollout-op-1", updatedAt}}}, nil
 		case strings.Contains(query, "FROM sessions_pg"):
 			return &fakeRows{rows: [][]any{{OperatorBearerSessionID("viewer-user"), OperatorAuthSessionPluginID, []byte(`{"actor_id":"viewer-user","token_id":"console-viewer","auth_method":"bearer"}`)}}}, nil
 		case strings.Contains(query, "FROM plugin_enabled_overlays_pg"):
@@ -623,6 +634,10 @@ func TestPostgresStoreControlStateListReadbacks(t *testing.T) {
 	if err != nil || len(rolloutRecords) != 1 || rolloutRecords[0].OperationID != "rollout-op-1" {
 		t.Fatalf("list rollout operation records: states=%+v err=%v", rolloutRecords, err)
 	}
+	rolloutHeads, err := store.ListRolloutHeads(ctx)
+	if err != nil || len(rolloutHeads) != 1 || rolloutHeads[0].PluginID != "plugin-echo" || rolloutHeads[0].Candidate == nil || rolloutHeads[0].Candidate.Version != "0.2.0-candidate" {
+		t.Fatalf("list rollout heads: states=%+v err=%v", rolloutHeads, err)
+	}
 	audits, err := store.ListAudits(ctx)
 	if err != nil || len(audits) != 1 || audits[0].Reason != "rollout_prepared" || audits[0].SessionID != "session-operator-bearer-admin-user" {
 		t.Fatalf("list audits: states=%+v err=%v", audits, err)
@@ -655,6 +670,8 @@ func TestPostgresStoreCountsReadsSmokeTables(t *testing.T) {
 			return fakeRow{values: []any{1}}
 		case strings.Contains(query, "FROM plugin_status_snapshots_pg"):
 			return fakeRow{values: []any{1}}
+		case strings.Contains(query, "FROM rollout_heads_pg"):
+			return fakeRow{values: []any{1}}
 		case strings.Contains(query, "FROM adapter_instances_pg"):
 			return fakeRow{values: []any{1}}
 		case strings.Contains(query, "FROM sessions_pg"):
@@ -683,8 +700,31 @@ func TestPostgresStoreCountsReadsSmokeTables(t *testing.T) {
 	if counts["event_journal"] != 3 || counts["jobs"] != 2 || counts["alerts"] != 1 || counts["schedule_plans"] != 4 || counts["workflow_instances"] != 1 || counts["idempotency_keys"] != 5 || counts["plugin_configs"] != 1 || counts["audit_log"] != 1 {
 		t.Fatalf("unexpected counts %+v", counts)
 	}
-	if len(pool.querySQL) != 17 {
-		t.Fatalf("expected 17 count queries, got %+v", pool.querySQL)
+	if len(pool.querySQL) != 18 {
+		t.Fatalf("expected 18 count queries, got %+v", pool.querySQL)
+	}
+}
+
+func TestPostgresScanRolloutHeadRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	updatedAt := time.Date(2026, 4, 24, 10, 0, 0, 0, time.UTC)
+	state, err := scanPostgresRolloutHead(fakeRow{values: []any{
+		"plugin-echo",
+		[]byte(`{"Version":"0.1.0","APIVersion":"v0","Mode":"subprocess"}`),
+		[]byte(`{"Version":"0.1.0","APIVersion":"v0","Mode":"subprocess"}`),
+		[]byte(`{"Version":"0.2.0-candidate","APIVersion":"v0","Mode":"subprocess"}`),
+		"prepared",
+		"prepared",
+		"",
+		"rollout-op-prepare-1",
+		updatedAt,
+	}})
+	if err != nil {
+		t.Fatalf("scan rollout head: %v", err)
+	}
+	if state.PluginID != "plugin-echo" || state.Stable.Version != "0.1.0" || state.Active.Version != "0.1.0" || state.Candidate == nil || state.Candidate.Version != "0.2.0-candidate" || state.LastOperationID != "rollout-op-prepare-1" || !state.UpdatedAt.Equal(updatedAt) {
+		t.Fatalf("unexpected scanned rollout head %+v", state)
 	}
 }
 

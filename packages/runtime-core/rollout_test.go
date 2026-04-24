@@ -35,6 +35,9 @@ func TestRolloutManagerPreparesCompatibleCandidate(t *testing.T) {
 	if record.Status != pluginsdk.RolloutStatusPrepared || record.CurrentVersion != "0.1.0" || record.CandidateVersion != "0.2.0" {
 		t.Fatalf("unexpected rollout record %+v", record)
 	}
+	if record.Phase != pluginsdk.RolloutPhaseCandidate || record.StableVersion != "0.1.0" || record.ActiveVersion != "0.1.0" {
+		t.Fatalf("expected candidate rollout foundation after prepare, got %+v", record)
+	}
 }
 
 func TestRolloutManagerRejectsIncompatibleCandidate(t *testing.T) {
@@ -69,6 +72,98 @@ func TestRolloutManagerActivatesPreparedRecord(t *testing.T) {
 	}
 	if record.Status != pluginsdk.RolloutStatusActivated {
 		t.Fatalf("expected activated rollout record, got %+v", record)
+	}
+	if record.Phase != pluginsdk.RolloutPhaseStable || record.CurrentVersion != "0.2.0" || record.StableVersion != "0.2.0" || record.ActiveVersion != "0.2.0" || record.CandidateVersion != "" {
+		t.Fatalf("expected activate to promote candidate into stable truth, got %+v", record)
+	}
+}
+
+func TestRolloutManagerCanariesPreparedCandidate(t *testing.T) {
+	t.Parallel()
+
+	manager := NewInMemoryRolloutManager(
+		manifestMapReader{"plugin-echo": {ID: "plugin-echo", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess}},
+		manifestMapReader{"plugin-echo": {ID: "plugin-echo", Version: "0.2.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess}},
+	)
+	if _, err := manager.Prepare("plugin-echo"); err != nil {
+		t.Fatalf("prepare rollout: %v", err)
+	}
+	record, err := manager.Canary("plugin-echo")
+	if err != nil {
+		t.Fatalf("canary rollout: %v", err)
+	}
+	if record.Phase != pluginsdk.RolloutPhaseCanary || record.Status != pluginsdk.RolloutStatusCanarying || record.StableVersion != "0.1.0" || record.ActiveVersion != "0.2.0" || record.CandidateVersion != "0.2.0" {
+		t.Fatalf("expected canary rollout foundation, got %+v", record)
+	}
+	stored, ok := manager.Record("plugin-echo")
+	if !ok || stored.Phase != pluginsdk.RolloutPhaseCanary || stored.Status != pluginsdk.RolloutStatusCanarying {
+		t.Fatalf("expected canary state to persist in manager truth, got %+v ok=%v", stored, ok)
+	}
+}
+
+func TestRolloutManagerRejectsCanaryOutsideCandidatePhase(t *testing.T) {
+	t.Parallel()
+
+	manager := NewInMemoryRolloutManager(
+		manifestMapReader{"plugin-echo": {ID: "plugin-echo", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess}},
+		manifestMapReader{"plugin-echo": {ID: "plugin-echo", Version: "0.2.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess}},
+	)
+	if _, err := manager.Prepare("plugin-echo"); err != nil {
+		t.Fatalf("prepare rollout: %v", err)
+	}
+	if _, err := manager.Canary("plugin-echo"); err != nil {
+		t.Fatalf("first canary rollout: %v", err)
+	}
+	if _, err := manager.Canary("plugin-echo"); err == nil || !strings.Contains(err.Error(), "invalid rollout transition") {
+		t.Fatalf("expected repeated canary to be rejected, got %v", err)
+	}
+}
+
+func TestRolloutManagerRollsBackCanaryToStable(t *testing.T) {
+	t.Parallel()
+
+	manager := NewInMemoryRolloutManager(
+		manifestMapReader{"plugin-echo": {ID: "plugin-echo", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess}},
+		manifestMapReader{"plugin-echo": {ID: "plugin-echo", Version: "0.2.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess}},
+	)
+	if _, err := manager.Prepare("plugin-echo"); err != nil {
+		t.Fatalf("prepare rollout: %v", err)
+	}
+	if _, err := manager.Canary("plugin-echo"); err != nil {
+		t.Fatalf("canary rollout: %v", err)
+	}
+	check, err := manager.CanRollback("plugin-echo")
+	if err != nil {
+		t.Fatalf("can rollback rollout: %v", err)
+	}
+	if check.Phase != pluginsdk.RolloutPhaseRollback || check.Status != pluginsdk.RolloutStatusRolledBack || check.CurrentVersion != "0.1.0" {
+		t.Fatalf("expected rollback readiness record to point at stable version, got %+v", check)
+	}
+	record, err := manager.Rollback("plugin-echo")
+	if err != nil {
+		t.Fatalf("rollback rollout: %v", err)
+	}
+	if record.Phase != pluginsdk.RolloutPhaseRollback || record.Status != pluginsdk.RolloutStatusRolledBack || record.CurrentVersion != "0.1.0" || record.ActiveVersion != "0.1.0" || record.CandidateVersion != "0.2.0" {
+		t.Fatalf("expected rollback foundation record, got %+v", record)
+	}
+	stored, ok := manager.Record("plugin-echo")
+	if !ok || stored.Phase != pluginsdk.RolloutPhaseStable || stored.Status != pluginsdk.RolloutStatusRolledBack || stored.CurrentVersion != "0.1.0" || stored.ActiveVersion != "0.1.0" {
+		t.Fatalf("expected rollback to return manager truth to stable active version, got %+v ok=%v", stored, ok)
+	}
+}
+
+func TestRolloutManagerRejectsRollbackWithoutCanaryOrActivation(t *testing.T) {
+	t.Parallel()
+
+	manager := NewInMemoryRolloutManager(
+		manifestMapReader{"plugin-echo": {ID: "plugin-echo", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess}},
+		manifestMapReader{"plugin-echo": {ID: "plugin-echo", Version: "0.2.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess}},
+	)
+	if _, err := manager.Prepare("plugin-echo"); err != nil {
+		t.Fatalf("prepare rollout: %v", err)
+	}
+	if _, err := manager.Rollback("plugin-echo"); err == nil || !strings.Contains(err.Error(), "invalid rollout transition") {
+		t.Fatalf("expected rollback before canary/activate to be rejected, got %v", err)
 	}
 }
 
@@ -106,6 +201,16 @@ func TestSQLiteRolloutManagerPersistsPrepareRecordAcrossRestart(t *testing.T) {
 	record, ok := manager2.Record("plugin-echo")
 	if !ok || record.Status != pluginsdk.RolloutStatusPrepared || record.CandidateVersion != "0.2.0" {
 		t.Fatalf("expected persisted prepared rollout record after restore, got %+v ok=%v", record, ok)
+	}
+	head, err := reopened.LoadRolloutHead(context.Background(), "plugin-echo")
+	if err != nil {
+		t.Fatalf("load rollout head: %v", err)
+	}
+	if head.PluginID != "plugin-echo" || head.Phase != string(pluginsdk.RolloutPhaseCandidate) || head.Status != "prepared" || head.Candidate == nil || head.Candidate.Version != "0.2.0" || !strings.Contains(head.LastOperationID, "rollout-op-prepare-plugin-echo-") {
+		t.Fatalf("expected persisted prepared rollout head after restore, got %+v", head)
+	}
+	if head.Stable.Version != "0.1.0" || head.Active.Version != "0.1.0" {
+		t.Fatalf("expected prepared rollout head to preserve stable active truth, got %+v", head)
 	}
 	records, err := reopened.ListRolloutOperationRecords(context.Background())
 	if err != nil {
@@ -154,6 +259,16 @@ func TestSQLiteRolloutManagerPersistsActivateRecordAcrossRestart(t *testing.T) {
 	record, ok := manager2.Record("plugin-echo")
 	if !ok || record.Status != pluginsdk.RolloutStatusActivated {
 		t.Fatalf("expected persisted activated rollout record after restore, got %+v ok=%v", record, ok)
+	}
+	head, err := reopened.LoadRolloutHead(context.Background(), "plugin-echo")
+	if err != nil {
+		t.Fatalf("load rollout head: %v", err)
+	}
+	if head.PluginID != "plugin-echo" || head.Phase != string(pluginsdk.RolloutPhaseStable) || head.Status != "activated" || head.Candidate != nil || !strings.Contains(head.LastOperationID, "rollout-op-activate-plugin-echo-") {
+		t.Fatalf("expected persisted activated rollout head after restore, got %+v", head)
+	}
+	if head.Stable.Version != "0.2.0" || head.Active.Version != "0.2.0" {
+		t.Fatalf("expected activated rollout head to promote candidate into stable active truth, got %+v", head)
 	}
 	records, err := reopened.ListRolloutOperationRecords(context.Background())
 	if err != nil {
@@ -232,6 +347,9 @@ func TestRolloutManagerRejectsActivateWhenCandidateDriftsAfterPrepare(t *testing
 	if !ok || record.Status != pluginsdk.RolloutStatusPrepared || record.CandidateVersion != "0.3.0" {
 		t.Fatalf("expected rollout record to refresh to latest prepared candidate, got %+v ok=%v", record, ok)
 	}
+	if record.Phase != pluginsdk.RolloutPhaseCandidate || record.ActiveVersion != "0.1.0" {
+		t.Fatalf("expected drifted prepare state to remain candidate phase with stable active version, got %+v", record)
+	}
 }
 
 func TestRolloutManagerRejectsActivateWhenCompatibilityDriftsAfterPrepare(t *testing.T) {
@@ -252,6 +370,9 @@ func TestRolloutManagerRejectsActivateWhenCompatibilityDriftsAfterPrepare(t *tes
 	if !ok || record.Status != pluginsdk.RolloutStatusRejected || !strings.Contains(record.Reason, "apiVersion mismatch") {
 		t.Fatalf("expected rollout record to refresh to rejected drift state, got %+v ok=%v", record, ok)
 	}
+	if record.Phase != pluginsdk.RolloutPhaseStable || record.ActiveVersion != "0.1.0" {
+		t.Fatalf("expected rejected drift state to fall back to stable truth, got %+v", record)
+	}
 }
 
 func TestRolloutManagerCanActivateChecksPreparedStateWithoutMutatingRecord(t *testing.T) {
@@ -268,11 +389,11 @@ func TestRolloutManagerCanActivateChecksPreparedStateWithoutMutatingRecord(t *te
 	if err != nil {
 		t.Fatalf("can activate rollout: %v", err)
 	}
-	if record.Status != pluginsdk.RolloutStatusPrepared {
+	if record.Status != pluginsdk.RolloutStatusPrepared || record.Phase != pluginsdk.RolloutPhaseCandidate {
 		t.Fatalf("expected can-activate to keep prepared state, got %+v", record)
 	}
 	stored, ok := manager.Record("plugin-echo")
-	if !ok || stored.Status != pluginsdk.RolloutStatusPrepared {
+	if !ok || stored.Status != pluginsdk.RolloutStatusPrepared || stored.Phase != pluginsdk.RolloutPhaseCandidate {
 		t.Fatalf("expected can-activate not to mutate stored record, got %+v ok=%v", stored, ok)
 	}
 }

@@ -6,12 +6,13 @@ import (
 	"testing"
 
 	eventmodel "github.com/ohmyopencode/bot-platform/packages/event-model"
+	pluginsdk "github.com/ohmyopencode/bot-platform/packages/plugin-sdk"
 	runtimecore "github.com/ohmyopencode/bot-platform/packages/runtime-core"
 )
 
 type replyRecorder struct {
 	handle eventmodel.ReplyHandle
-	texts []string
+	texts  []string
 }
 
 func (r *replyRecorder) ReplyText(handle eventmodel.ReplyHandle, text string) error {
@@ -126,5 +127,31 @@ func TestWorkflowDemoStartsAndResumesWorkflowFromRuntimeOwnedStore(t *testing.T)
 	}
 	if completed.TraceID != `trace-1` || completed.EventID != `evt-1` || completed.RunID != `run-1` || completed.CorrelationID != `corr-1` {
 		t.Fatalf(`expected origin observability ids to remain stable on resume, got %+v`, completed)
+	}
+}
+
+func TestWorkflowDemoManifestAdoptsV1Contract(t *testing.T) {
+	t.Parallel()
+
+	plugin := New(&replyRecorder{}, nil)
+	manifest := plugin.Manifest
+
+	if manifest.SchemaVersion != pluginsdk.SupportedPluginManifestSchemaVersion {
+		t.Fatalf("manifest schemaVersion = %q, want %q", manifest.SchemaVersion, pluginsdk.SupportedPluginManifestSchemaVersion)
+	}
+	if manifest.Publish == nil {
+		t.Fatal("manifest publish metadata is required")
+	}
+	if manifest.Publish.SourceType != pluginsdk.PublishSourceTypeGit {
+		t.Fatalf("manifest publish sourceType = %q, want %q", manifest.Publish.SourceType, pluginsdk.PublishSourceTypeGit)
+	}
+	if manifest.Publish.SourceURI != pluginWorkflowDemoPublishSourceURI {
+		t.Fatalf("manifest publish sourceUri = %q, want %q", manifest.Publish.SourceURI, pluginWorkflowDemoPublishSourceURI)
+	}
+	if manifest.Publish.RuntimeVersionRange != pluginWorkflowDemoRuntimeVersionRange {
+		t.Fatalf("manifest publish runtimeVersionRange = %q, want %q", manifest.Publish.RuntimeVersionRange, pluginWorkflowDemoRuntimeVersionRange)
+	}
+	if err := manifest.Validate(); err != nil {
+		t.Fatalf("expected plugin-workflow-demo manifest to validate, got %v", err)
 	}
 }

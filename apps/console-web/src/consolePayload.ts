@@ -409,6 +409,37 @@ function hasObservabilityShape(value: unknown): boolean {
   );
 }
 
+function hasRolloutSnapshotShape(value: unknown): boolean {
+	if (!isRecord(value)) {
+		return false;
+	}
+	return (
+		(value.version === undefined || isString(value.version)) &&
+		(value.apiVersion === undefined || isString(value.apiVersion)) &&
+		(value.mode === undefined || isString(value.mode))
+	);
+}
+
+function hasRolloutHeadShape(value: unknown): boolean {
+	if (!isRecord(value)) {
+		return false;
+	}
+	return (
+		isString(value.pluginId) &&
+		hasRolloutSnapshotShape(value.stable) &&
+		hasRolloutSnapshotShape(value.active) &&
+		(value.candidate === undefined || hasRolloutSnapshotShape(value.candidate)) &&
+		isString(value.phase) &&
+		isString(value.status) &&
+		(value.reason === undefined || isString(value.reason)) &&
+		(value.lastOperationId === undefined || isString(value.lastOperationId)) &&
+		(value.updatedAt === undefined || isString(value.updatedAt)) &&
+		(value.stateSource === undefined || isString(value.stateSource)) &&
+		isBoolean(value.persisted) &&
+		(value.summary === undefined || isString(value.summary))
+	);
+}
+
 export function isConsolePayload(value: unknown): value is ConsolePayload {
   if (!isRecord(value) || !isRecord(value.status)) {
     return false;
@@ -427,6 +458,8 @@ export function isConsolePayload(value: unknown): value is ConsolePayload {
     value.replayOps.every(hasReplayOperationShape) &&
     Array.isArray(value.rolloutOps) &&
     value.rolloutOps.every(hasRolloutOperationShape) &&
+    Array.isArray(value.rolloutHeads) &&
+    value.rolloutHeads.every(hasRolloutHeadShape) &&
     Array.isArray(value.plugins) &&
     value.plugins.every(hasPluginShape) &&
     Array.isArray(value.jobs) &&

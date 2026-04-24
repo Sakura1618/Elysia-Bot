@@ -153,3 +153,29 @@ func TestPluginSchedulerReturnsReplyError(t *testing.T) {
 		t.Fatal("expected reply error to bubble up")
 	}
 }
+
+func TestPluginSchedulerManifestAdoptsV1Contract(t *testing.T) {
+	t.Parallel()
+
+	plugin := New(schedulerAdapter{inner: runtimecore.NewScheduler()}, &recordingReplyService{})
+	manifest := plugin.Manifest
+
+	if manifest.SchemaVersion != pluginsdk.SupportedPluginManifestSchemaVersion {
+		t.Fatalf("manifest schemaVersion = %q, want %q", manifest.SchemaVersion, pluginsdk.SupportedPluginManifestSchemaVersion)
+	}
+	if manifest.Publish == nil {
+		t.Fatal("manifest publish metadata is required")
+	}
+	if manifest.Publish.SourceType != pluginsdk.PublishSourceTypeGit {
+		t.Fatalf("manifest publish sourceType = %q, want %q", manifest.Publish.SourceType, pluginsdk.PublishSourceTypeGit)
+	}
+	if manifest.Publish.SourceURI != pluginSchedulerPublishSourceURI {
+		t.Fatalf("manifest publish sourceUri = %q, want %q", manifest.Publish.SourceURI, pluginSchedulerPublishSourceURI)
+	}
+	if manifest.Publish.RuntimeVersionRange != pluginSchedulerRuntimeVersionRange {
+		t.Fatalf("manifest publish runtimeVersionRange = %q, want %q", manifest.Publish.RuntimeVersionRange, pluginSchedulerRuntimeVersionRange)
+	}
+	if err := manifest.Validate(); err != nil {
+		t.Fatalf("expected plugin-scheduler manifest to validate, got %v", err)
+	}
+}

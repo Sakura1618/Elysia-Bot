@@ -73,6 +73,33 @@ export const mockConsoleData: ConsolePayload = {
       summary: 'rollout prepare prepared for plugin-echo | current=0.1.0 candidate=0.2.0-candidate | via sqlite-rollout-operation-records | reason=prepared-record-required',
     },
   ],
+  rolloutHeads: [
+    {
+      pluginId: 'plugin-echo',
+      stable: {
+        version: '0.1.0',
+        apiVersion: 'v0',
+        mode: 'subprocess',
+      },
+      active: {
+        version: '0.2.0-candidate',
+        apiVersion: 'v0',
+        mode: 'subprocess',
+      },
+      candidate: {
+        version: '0.2.0-candidate',
+        apiVersion: 'v0',
+        mode: 'subprocess',
+      },
+      phase: 'canary',
+      status: 'canarying',
+      lastOperationId: 'rollout-console-1',
+      updatedAt: '2026-04-19T11:41:00Z',
+      stateSource: 'sqlite-rollout-heads',
+      persisted: true,
+      summary: 'rollout head canary canarying for plugin-echo | stable=0.1.0 active=0.2.0-candidate | candidate=0.2.0-candidate | via sqlite-rollout-heads | last_operation=rollout-console-1',
+    },
+  ],
   plugins: [
     {
       id: 'plugin-echo',

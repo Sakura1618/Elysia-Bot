@@ -4,16 +4,20 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"time"
 
 	eventmodel "github.com/ohmyopencode/bot-platform/packages/event-model"
 	pluginsdk "github.com/ohmyopencode/bot-platform/packages/plugin-sdk"
 	runtimecore "github.com/ohmyopencode/bot-platform/packages/runtime-core"
+	pluginadmin "github.com/ohmyopencode/bot-platform/plugins/plugin-admin"
+	pluginaichat "github.com/ohmyopencode/bot-platform/plugins/plugin-ai-chat"
 	pluginecho "github.com/ohmyopencode/bot-platform/plugins/plugin-echo"
 )
 
@@ -56,13 +60,31 @@ func newRoutedPluginHost(direct runtimecore.PluginHost, subprocess runtimecore.P
 		}
 		routes[pluginID] = subprocess
 	}
-	return routedPluginHost{direct: direct, subprocess: subprocess, routes: routes, defaultHost: direct}
+	return newRoutedPluginHostWithRouteMapAndEventScopes(direct, subprocess, routes, nil)
 }
 
 func newRoutedPluginHostWithEventScopes(direct runtimecore.PluginHost, subprocess runtimecore.PluginHost, subprocessPluginIDs []string, eventScopes map[string]map[string]struct{}) runtimecore.PluginHost {
-	host, _ := newRoutedPluginHost(direct, subprocess, subprocessPluginIDs).(routedPluginHost)
-	host.eventScopes = clonePluginEventScopes(eventScopes)
-	return host
+	routes := make(map[string]runtimecore.PluginHost, len(subprocessPluginIDs))
+	for _, pluginID := range subprocessPluginIDs {
+		pluginID = strings.TrimSpace(pluginID)
+		if pluginID == "" || subprocess == nil {
+			continue
+		}
+		routes[pluginID] = subprocess
+	}
+	return newRoutedPluginHostWithRouteMapAndEventScopes(direct, subprocess, routes, eventScopes)
+}
+
+func newRoutedPluginHostWithRouteMapAndEventScopes(direct runtimecore.PluginHost, subprocess runtimecore.PluginHost, routes map[string]runtimecore.PluginHost, eventScopes map[string]map[string]struct{}) runtimecore.PluginHost {
+	normalizedRoutes := make(map[string]runtimecore.PluginHost, len(routes))
+	for pluginID, host := range routes {
+		pluginID = strings.TrimSpace(pluginID)
+		if pluginID == "" || host == nil {
+			continue
+		}
+		normalizedRoutes[pluginID] = host
+	}
+	return routedPluginHost{direct: direct, subprocess: subprocess, routes: normalizedRoutes, defaultHost: direct, eventScopes: clonePluginEventScopes(eventScopes)}
 }
 
 func (h routedPluginHost) hostForPlugin(pluginID string) runtimecore.PluginHost {
@@ -148,17 +170,31 @@ func (h routedPluginHost) DispatchSchedule(ctx context.Context, plugin pluginsdk
 	return host.DispatchSchedule(ctx, plugin, trigger, executionContext)
 }
 
-func (h routedPluginHost) Close() error {
-	closed := map[runtimecore.PluginHost]struct{}{}
-	var errs []error
-	for _, candidate := range []runtimecore.PluginHost{h.defaultHost, h.direct, h.subprocess} {
+func (h routedPluginHost) uniqueHosts() []runtimecore.PluginHost {
+	seen := map[runtimecore.PluginHost]struct{}{}
+	hosts := make([]runtimecore.PluginHost, 0, len(h.routes)+3)
+	appendHost := func(candidate runtimecore.PluginHost) {
 		if candidate == nil {
-			continue
+			return
 		}
-		if _, seen := closed[candidate]; seen {
-			continue
+		if _, ok := seen[candidate]; ok {
+			return
 		}
-		closed[candidate] = struct{}{}
+		seen[candidate] = struct{}{}
+		hosts = append(hosts, candidate)
+	}
+	appendHost(h.defaultHost)
+	appendHost(h.direct)
+	appendHost(h.subprocess)
+	for _, candidate := range h.routes {
+		appendHost(candidate)
+	}
+	return hosts
+}
+
+func (h routedPluginHost) Close() error {
+	var errs []error
+	for _, candidate := range h.uniqueHosts() {
 		closer, ok := candidate.(runtimePluginHostCloser)
 		if !ok {
 			continue
@@ -174,15 +210,7 @@ func (h routedPluginHost) Close() error {
 }
 
 func (h routedPluginHost) SetObservability(logger *runtimecore.Logger, tracer *runtimecore.TraceRecorder, metrics *runtimecore.MetricsRegistry) {
-	configured := map[runtimecore.PluginHost]struct{}{}
-	for _, candidate := range []runtimecore.PluginHost{h.defaultHost, h.direct, h.subprocess} {
-		if candidate == nil {
-			continue
-		}
-		if _, seen := configured[candidate]; seen {
-			continue
-		}
-		configured[candidate] = struct{}{}
+	for _, candidate := range h.uniqueHosts() {
 		setter, ok := candidate.(runtimePluginHostObservabilitySetter)
 		if !ok {
 			continue
@@ -206,9 +234,7 @@ func newRuntimePluginHost(replies *replyBuffer, workflowRuntime *runtimecore.Wor
 	return newRuntimePluginHostWithEventScopes(replies, workflowRuntime, subprocessPluginIDs, nil)
 }
 
-func newRuntimePluginHostWithEventScopes(replies *replyBuffer, workflowRuntime *runtimecore.WorkflowRuntime, subprocessPluginIDs []string, eventScopes map[string]map[string]struct{}) runtimecore.PluginHost {
-	direct := runtimecore.DirectPluginHost{}
-	launcherConfig := runtimeDefaultSubprocessLauncherConfig()
+func newRuntimeSubprocessPluginHost(replies *replyBuffer, workflowRuntime *runtimecore.WorkflowRuntime, launcherConfig runtimeSubprocessLauncherConfig) *runtimecore.SubprocessPluginHost {
 	subprocess := runtimecore.NewSubprocessPluginHostWithErrorFactory(runtimePluginProcessFactory(launcherConfig))
 	subprocess.SetReplyTextCallback(replies.ReplyText)
 	if workflowRuntime != nil {
@@ -217,6 +243,13 @@ func newRuntimePluginHostWithEventScopes(replies *replyBuffer, workflowRuntime *
 		})
 	}
 	subprocess.SetRestartBudget(launcherConfig.restartBudget, launcherConfig.restartWindow)
+	return subprocess
+}
+
+func newRuntimePluginHostWithEventScopes(replies *replyBuffer, workflowRuntime *runtimecore.WorkflowRuntime, subprocessPluginIDs []string, eventScopes map[string]map[string]struct{}) runtimecore.PluginHost {
+	direct := runtimecore.DirectPluginHost{}
+	launcherConfig := runtimeDefaultSubprocessLauncherConfig()
+	subprocess := newRuntimeSubprocessPluginHost(replies, workflowRuntime, launcherConfig)
 	return newRoutedPluginHostWithEventScopes(direct, subprocess, subprocessPluginIDs, eventScopes)
 }
 
@@ -413,8 +446,18 @@ func runRuntimePluginEchoSubprocess(stdout *os.File, stderr *os.File) int {
 				_, _ = stdout.WriteString(string(encodedErr) + "\n")
 			}
 		case "command":
+			if err := runRuntimeSubprocessCommandBridge(reader, stdout, request.PluginID, request.Command, request.InstanceConfig); err != nil {
+				encodedErr, _ := json.Marshal(map[string]any{"type": "command", "status": "error", "error": err.Error()})
+				_, _ = stdout.WriteString(string(encodedErr) + "\n")
+				continue
+			}
 			_, _ = stdout.WriteString("{\"type\":\"command\",\"status\":\"ok\",\"message\":\"command-ok\"}\n")
 		case "job":
+			if err := runRuntimeSubprocessJobBridge(reader, stdout, request.PluginID, request.Job, request.InstanceConfig); err != nil {
+				encodedErr, _ := json.Marshal(map[string]any{"type": "job", "status": "error", "error": err.Error()})
+				_, _ = stdout.WriteString(string(encodedErr) + "\n")
+				continue
+			}
 			_, _ = stdout.WriteString("{\"type\":\"job\",\"status\":\"ok\",\"message\":\"job-ok\"}\n")
 		case "schedule":
 			_, _ = stdout.WriteString("{\"type\":\"schedule\",\"status\":\"ok\",\"message\":\"schedule-ok\"}\n")
@@ -429,6 +472,8 @@ type hostRequestEnvelope struct {
 	Type           string          `json:"type"`
 	PluginID       string          `json:"plugin_id,omitempty"`
 	Event          json.RawMessage `json:"event,omitempty"`
+	Command        json.RawMessage `json:"command,omitempty"`
+	Job            json.RawMessage `json:"job,omitempty"`
 	InstanceConfig json.RawMessage `json:"instance_config,omitempty"`
 }
 
@@ -437,10 +482,24 @@ type runtimePluginEchoEventPayload struct {
 	Ctx   eventmodel.ExecutionContext `json:"ctx"`
 }
 
+type runtimePluginCommandPayload struct {
+	Command eventmodel.CommandInvocation `json:"command"`
+	Ctx     eventmodel.ExecutionContext  `json:"ctx"`
+}
+
+type runtimePluginJobPayload struct {
+	Job pluginsdk.JobInvocation     `json:"job"`
+	Ctx eventmodel.ExecutionContext `json:"ctx"`
+}
+
 type runtimePluginEchoCallbackEnvelope struct {
 	Type                  string                                          `json:"type"`
 	Callback              string                                          `json:"callback,omitempty"`
 	ReplyText             *runtimePluginEchoReplyTextCallback             `json:"reply_text,omitempty"`
+	AdminRequest          *runtimecore.SubprocessAdminRequest             `json:"admin_request,omitempty"`
+	AIChatQueue           *runtimecore.SubprocessAIChatQueueRequest       `json:"ai_chat_queue,omitempty"`
+	AIChatSession         *runtimecore.SubprocessAIChatSessionRequest     `json:"ai_chat_session,omitempty"`
+	AIChatProvider        *runtimecore.SubprocessAIChatProviderRequest    `json:"ai_chat_provider,omitempty"`
 	WorkflowStartOrResume *runtimePluginEchoWorkflowStartOrResumeCallback `json:"workflow_start_or_resume,omitempty"`
 }
 
@@ -450,10 +509,13 @@ type runtimePluginEchoReplyTextCallback struct {
 }
 
 type runtimePluginEchoCallbackResult struct {
-	Type                  string          `json:"type"`
-	Status                string          `json:"status,omitempty"`
-	Error                 string          `json:"error,omitempty"`
-	WorkflowStartOrResume json.RawMessage `json:"workflow_start_or_resume,omitempty"`
+	Type                  string                                      `json:"type"`
+	Status                string                                      `json:"status,omitempty"`
+	Error                 string                                      `json:"error,omitempty"`
+	AdminRequest          *runtimecore.SubprocessAdminResult          `json:"admin_request,omitempty"`
+	AIChatQueue           *runtimecore.SubprocessAIChatQueueResult    `json:"ai_chat_queue,omitempty"`
+	AIChatProvider        *runtimecore.SubprocessAIChatProviderResult `json:"ai_chat_provider,omitempty"`
+	WorkflowStartOrResume json.RawMessage                             `json:"workflow_start_or_resume,omitempty"`
 }
 
 type runtimeWorkflowObservability struct {
@@ -484,18 +546,50 @@ type runtimePluginEchoReplyBridge struct {
 }
 
 type runtimePluginEchoWorkflowStartOrResumeCallback struct {
-	WorkflowID string               `json:"workflow_id"`
-	PluginID   string               `json:"plugin_id,omitempty"`
-	TraceID    string               `json:"trace_id,omitempty"`
-	EventType  string               `json:"event_type"`
-	EventID    string               `json:"event_id,omitempty"`
-	RunID      string               `json:"run_id,omitempty"`
-	CorrelationID string            `json:"correlation_id,omitempty"`
-	Initial    runtimecore.Workflow `json:"initial"`
+	WorkflowID    string               `json:"workflow_id"`
+	PluginID      string               `json:"plugin_id,omitempty"`
+	TraceID       string               `json:"trace_id,omitempty"`
+	EventType     string               `json:"event_type"`
+	EventID       string               `json:"event_id,omitempty"`
+	RunID         string               `json:"run_id,omitempty"`
+	CorrelationID string               `json:"correlation_id,omitempty"`
+	Initial       runtimecore.Workflow `json:"initial"`
+}
+
+type runtimeSubprocessAdminAuthorizationBridge struct {
+	bridge runtimePluginEchoReplyBridge
+}
+
+type runtimeSubprocessAdminLifecycleBridge struct {
+	bridge runtimePluginEchoReplyBridge
+}
+
+type runtimeSubprocessAdminRolloutBridge struct {
+	bridge runtimePluginEchoReplyBridge
+}
+
+type runtimeSubprocessAdminReplayBridge struct {
+	bridge runtimePluginEchoReplyBridge
+}
+
+type runtimeSubprocessAdminAuditBridge struct {
+	bridge runtimePluginEchoReplyBridge
+}
+
+type runtimeSubprocessAIChatQueueBridge struct {
+	bridge runtimePluginEchoReplyBridge
+}
+
+type runtimeSubprocessAIChatSessionBridge struct {
+	bridge runtimePluginEchoReplyBridge
+}
+
+type runtimeSubprocessAIChatProviderBridge struct {
+	bridge runtimePluginEchoReplyBridge
 }
 
 func (b runtimePluginEchoReplyBridge) ReplyText(handle eventmodel.ReplyHandle, text string) error {
-	encoded, err := json.Marshal(runtimePluginEchoCallbackEnvelope{
+	result, err := b.requestCallback(runtimePluginEchoCallbackEnvelope{
 		Type:     "callback",
 		Callback: "reply_text",
 		ReplyText: &runtimePluginEchoReplyTextCallback{
@@ -504,18 +598,7 @@ func (b runtimePluginEchoReplyBridge) ReplyText(handle eventmodel.ReplyHandle, t
 		},
 	})
 	if err != nil {
-		return fmt.Errorf("encode reply_text callback: %w", err)
-	}
-	if _, err := b.stdout.WriteString(string(encoded) + "\n"); err != nil {
-		return fmt.Errorf("write reply_text callback: %w", err)
-	}
-	line, err := b.reader.ReadString('\n')
-	if err != nil {
-		return fmt.Errorf("read reply_text callback result: %w", err)
-	}
-	var result runtimePluginEchoCallbackResult
-	if err := json.Unmarshal([]byte(strings.TrimSpace(line)), &result); err != nil {
-		return fmt.Errorf("decode reply_text callback result: %w", err)
+		return fmt.Errorf("reply_text callback: %w", err)
 	}
 	if result.Type != "callback_result" {
 		return fmt.Errorf("unexpected reply_text callback result type %q", result.Type)
@@ -537,34 +620,119 @@ func (runtimePluginEchoReplyBridge) ReplyFile(handle eventmodel.ReplyHandle, fil
 	return fmt.Errorf("reply file not supported in Wave 1: %s %s", handle.TargetID, fileURL)
 }
 
-func (b runtimePluginEchoReplyBridge) WorkflowStartOrResumeDetailed(workflowID, pluginID, traceID, eventType, eventID, runID, correlationID string, initial runtimecore.Workflow) (runtimecore.WorkflowTransition, runtimeWorkflowObservability, error) {
-	encoded, err := json.Marshal(runtimePluginEchoCallbackEnvelope{
-		Type:     "callback",
-		Callback: "workflow_start_or_resume",
-		WorkflowStartOrResume: &runtimePluginEchoWorkflowStartOrResumeCallback{
-			WorkflowID: workflowID,
-			PluginID:   pluginID,
-			TraceID:    traceID,
-			EventType:  eventType,
-			EventID:    eventID,
-			RunID:      runID,
-			CorrelationID: correlationID,
-			Initial:    initial,
-		},
-	})
+func (b runtimePluginEchoReplyBridge) AdminRequest(request runtimecore.SubprocessAdminRequest) (runtimecore.SubprocessAdminResult, error) {
+	result, err := b.requestCallback(runtimePluginEchoCallbackEnvelope{Type: "callback", Callback: "admin_request", AdminRequest: &request})
 	if err != nil {
-		return runtimecore.WorkflowTransition{}, runtimeWorkflowObservability{}, fmt.Errorf("encode workflow_start_or_resume callback: %w", err)
+		return runtimecore.SubprocessAdminResult{}, fmt.Errorf("admin_request callback: %w", err)
+	}
+	if result.Type != "callback_result" {
+		return runtimecore.SubprocessAdminResult{}, fmt.Errorf("unexpected admin_request callback result type %q", result.Type)
+	}
+	if result.Status != "ok" {
+		if strings.TrimSpace(result.Error) == "" {
+			return runtimecore.SubprocessAdminResult{}, fmt.Errorf("admin_request callback failed")
+		}
+		return runtimecore.SubprocessAdminResult{}, fmt.Errorf("admin_request callback failed: %s", result.Error)
+	}
+	if result.AdminRequest == nil {
+		return runtimecore.SubprocessAdminResult{}, fmt.Errorf("admin_request callback missing result")
+	}
+	return *result.AdminRequest, nil
+}
+
+func (b runtimePluginEchoReplyBridge) AIChatQueue(request runtimecore.SubprocessAIChatQueueRequest) (runtimecore.SubprocessAIChatQueueResult, error) {
+	result, err := b.requestCallback(runtimePluginEchoCallbackEnvelope{Type: "callback", Callback: "ai_chat_queue", AIChatQueue: &request})
+	if err != nil {
+		return runtimecore.SubprocessAIChatQueueResult{}, fmt.Errorf("ai_chat_queue callback: %w", err)
+	}
+	if result.Type != "callback_result" {
+		return runtimecore.SubprocessAIChatQueueResult{}, fmt.Errorf("unexpected ai_chat_queue callback result type %q", result.Type)
+	}
+	if result.Status != "ok" {
+		if strings.TrimSpace(result.Error) == "" {
+			return runtimecore.SubprocessAIChatQueueResult{}, fmt.Errorf("ai_chat_queue callback failed")
+		}
+		return runtimecore.SubprocessAIChatQueueResult{}, fmt.Errorf("ai_chat_queue callback failed: %s", result.Error)
+	}
+	if result.AIChatQueue == nil {
+		return runtimecore.SubprocessAIChatQueueResult{}, fmt.Errorf("ai_chat_queue callback missing result")
+	}
+	return *result.AIChatQueue, nil
+}
+
+func (b runtimePluginEchoReplyBridge) AIChatSession(request runtimecore.SubprocessAIChatSessionRequest) error {
+	result, err := b.requestCallback(runtimePluginEchoCallbackEnvelope{Type: "callback", Callback: "ai_chat_session", AIChatSession: &request})
+	if err != nil {
+		return fmt.Errorf("ai_chat_session callback: %w", err)
+	}
+	if result.Type != "callback_result" {
+		return fmt.Errorf("unexpected ai_chat_session callback result type %q", result.Type)
+	}
+	if result.Status != "ok" {
+		if strings.TrimSpace(result.Error) == "" {
+			return fmt.Errorf("ai_chat_session callback failed")
+		}
+		return fmt.Errorf("ai_chat_session callback failed: %s", result.Error)
+	}
+	return nil
+}
+
+func (b runtimePluginEchoReplyBridge) AIChatProvider(request runtimecore.SubprocessAIChatProviderRequest) (runtimecore.SubprocessAIChatProviderResult, error) {
+	result, err := b.requestCallback(runtimePluginEchoCallbackEnvelope{Type: "callback", Callback: "ai_chat_provider", AIChatProvider: &request})
+	if err != nil {
+		return runtimecore.SubprocessAIChatProviderResult{}, fmt.Errorf("ai_chat_provider callback: %w", err)
+	}
+	if result.Type != "callback_result" {
+		return runtimecore.SubprocessAIChatProviderResult{}, fmt.Errorf("unexpected ai_chat_provider callback result type %q", result.Type)
+	}
+	if result.Status != "ok" {
+		if strings.TrimSpace(result.Error) == "" {
+			return runtimecore.SubprocessAIChatProviderResult{}, fmt.Errorf("ai_chat_provider callback failed")
+		}
+		return runtimecore.SubprocessAIChatProviderResult{}, errors.New(strings.TrimSpace(result.Error))
+	}
+	if result.AIChatProvider == nil {
+		return runtimecore.SubprocessAIChatProviderResult{}, fmt.Errorf("ai_chat_provider callback missing result")
+	}
+	return *result.AIChatProvider, nil
+}
+
+func (b runtimePluginEchoReplyBridge) requestCallback(envelope runtimePluginEchoCallbackEnvelope) (runtimePluginEchoCallbackResult, error) {
+	encoded, err := json.Marshal(envelope)
+	if err != nil {
+		return runtimePluginEchoCallbackResult{}, fmt.Errorf("encode %s callback: %w", envelope.Callback, err)
 	}
 	if _, err := b.stdout.WriteString(string(encoded) + "\n"); err != nil {
-		return runtimecore.WorkflowTransition{}, runtimeWorkflowObservability{}, fmt.Errorf("write workflow_start_or_resume callback: %w", err)
+		return runtimePluginEchoCallbackResult{}, fmt.Errorf("write %s callback: %w", envelope.Callback, err)
 	}
 	line, err := b.reader.ReadString('\n')
 	if err != nil {
-		return runtimecore.WorkflowTransition{}, runtimeWorkflowObservability{}, fmt.Errorf("read workflow_start_or_resume callback result: %w", err)
+		return runtimePluginEchoCallbackResult{}, fmt.Errorf("read %s callback result: %w", envelope.Callback, err)
 	}
 	var result runtimePluginEchoCallbackResult
 	if err := json.Unmarshal([]byte(strings.TrimSpace(line)), &result); err != nil {
-		return runtimecore.WorkflowTransition{}, runtimeWorkflowObservability{}, fmt.Errorf("decode workflow_start_or_resume callback result: %w", err)
+		return runtimePluginEchoCallbackResult{}, fmt.Errorf("decode %s callback result: %w", envelope.Callback, err)
+	}
+	return result, nil
+}
+
+func (b runtimePluginEchoReplyBridge) WorkflowStartOrResumeDetailed(workflowID, pluginID, traceID, eventType, eventID, runID, correlationID string, initial runtimecore.Workflow) (runtimecore.WorkflowTransition, runtimeWorkflowObservability, error) {
+	result, err := b.requestCallback(runtimePluginEchoCallbackEnvelope{
+		Type:     "callback",
+		Callback: "workflow_start_or_resume",
+		WorkflowStartOrResume: &runtimePluginEchoWorkflowStartOrResumeCallback{
+			WorkflowID:    workflowID,
+			PluginID:      pluginID,
+			TraceID:       traceID,
+			EventType:     eventType,
+			EventID:       eventID,
+			RunID:         runID,
+			CorrelationID: correlationID,
+			Initial:       initial,
+		},
+	})
+	if err != nil {
+		return runtimecore.WorkflowTransition{}, runtimeWorkflowObservability{}, fmt.Errorf("workflow_start_or_resume callback: %w", err)
 	}
 	if result.Type != "callback_result" {
 		return runtimecore.WorkflowTransition{}, runtimeWorkflowObservability{}, fmt.Errorf("unexpected workflow_start_or_resume callback result type %q", result.Type)
@@ -600,10 +768,177 @@ func (b runtimePluginEchoReplyBridge) WorkflowStartOrResume(workflowID, pluginID
 	return transition, err
 }
 
+func (b runtimeSubprocessAdminAuthorizationBridge) Authorize(actor, permission, target string) pluginsdk.AuthorizationDecision {
+	return b.AuthorizeTarget(actor, permission, pluginsdk.AuthorizationTargetPlugin, target)
+}
+
+func (b runtimeSubprocessAdminAuthorizationBridge) AuthorizeTarget(actor, permission string, kind pluginsdk.AuthorizationTargetKind, target string) pluginsdk.AuthorizationDecision {
+	result, err := b.bridge.AdminRequest(runtimecore.SubprocessAdminRequest{
+		Action:     "authorize",
+		Actor:      strings.TrimSpace(actor),
+		Permission: strings.TrimSpace(permission),
+		Target:     strings.TrimSpace(target),
+		TargetKind: kind,
+	})
+	if err != nil {
+		return pluginsdk.AuthorizationDecision{Allowed: false, Permission: strings.TrimSpace(permission), Reason: err.Error()}
+	}
+	if result.Authorization == nil {
+		return pluginsdk.AuthorizationDecision{Allowed: false, Permission: strings.TrimSpace(permission), Reason: "authorization callback missing result"}
+	}
+	return *result.Authorization
+}
+
+func (b runtimeSubprocessAdminLifecycleBridge) Enable(pluginID string) error {
+	_, err := b.bridge.AdminRequest(runtimecore.SubprocessAdminRequest{Action: "enable_plugin", TargetPluginID: strings.TrimSpace(pluginID)})
+	return err
+}
+
+func (b runtimeSubprocessAdminLifecycleBridge) Disable(pluginID string) error {
+	_, err := b.bridge.AdminRequest(runtimecore.SubprocessAdminRequest{Action: "disable_plugin", TargetPluginID: strings.TrimSpace(pluginID)})
+	return err
+}
+
+func (b runtimeSubprocessAdminRolloutBridge) Prepare(pluginID string) (pluginsdk.RolloutRecord, error) {
+	result, err := b.bridge.AdminRequest(runtimecore.SubprocessAdminRequest{Action: "prepare_rollout", TargetPluginID: strings.TrimSpace(pluginID)})
+	if err != nil {
+		return pluginsdk.RolloutRecord{}, err
+	}
+	if result.RolloutRecord == nil {
+		return pluginsdk.RolloutRecord{}, fmt.Errorf("prepare_rollout callback missing result")
+	}
+	return *result.RolloutRecord, nil
+}
+
+func (b runtimeSubprocessAdminRolloutBridge) Canary(pluginID string) (pluginsdk.RolloutRecord, error) {
+	result, err := b.bridge.AdminRequest(runtimecore.SubprocessAdminRequest{Action: "canary_rollout", TargetPluginID: strings.TrimSpace(pluginID)})
+	if err != nil {
+		return pluginsdk.RolloutRecord{}, err
+	}
+	if result.RolloutRecord == nil {
+		return pluginsdk.RolloutRecord{}, fmt.Errorf("canary_rollout callback missing result")
+	}
+	return *result.RolloutRecord, nil
+}
+
+func (b runtimeSubprocessAdminRolloutBridge) CanActivate(pluginID string) (pluginsdk.RolloutRecord, error) {
+	result, err := b.bridge.AdminRequest(runtimecore.SubprocessAdminRequest{Action: "can_activate_rollout", TargetPluginID: strings.TrimSpace(pluginID)})
+	if err != nil {
+		return pluginsdk.RolloutRecord{}, err
+	}
+	if result.RolloutRecord == nil {
+		return pluginsdk.RolloutRecord{}, fmt.Errorf("can_activate_rollout callback missing result")
+	}
+	return *result.RolloutRecord, nil
+}
+
+func (b runtimeSubprocessAdminRolloutBridge) Activate(pluginID string) (pluginsdk.RolloutRecord, error) {
+	result, err := b.bridge.AdminRequest(runtimecore.SubprocessAdminRequest{Action: "activate_rollout", TargetPluginID: strings.TrimSpace(pluginID)})
+	if err != nil {
+		return pluginsdk.RolloutRecord{}, err
+	}
+	if result.RolloutRecord == nil {
+		return pluginsdk.RolloutRecord{}, fmt.Errorf("activate_rollout callback missing result")
+	}
+	return *result.RolloutRecord, nil
+}
+
+func (b runtimeSubprocessAdminRolloutBridge) CanRollback(pluginID string) (pluginsdk.RolloutRecord, error) {
+	result, err := b.bridge.AdminRequest(runtimecore.SubprocessAdminRequest{Action: "can_rollback_rollout", TargetPluginID: strings.TrimSpace(pluginID)})
+	if err != nil {
+		return pluginsdk.RolloutRecord{}, err
+	}
+	if result.RolloutRecord == nil {
+		return pluginsdk.RolloutRecord{}, fmt.Errorf("can_rollback_rollout callback missing result")
+	}
+	return *result.RolloutRecord, nil
+}
+
+func (b runtimeSubprocessAdminRolloutBridge) Rollback(pluginID string) (pluginsdk.RolloutRecord, error) {
+	result, err := b.bridge.AdminRequest(runtimecore.SubprocessAdminRequest{Action: "rollback_rollout", TargetPluginID: strings.TrimSpace(pluginID)})
+	if err != nil {
+		return pluginsdk.RolloutRecord{}, err
+	}
+	if result.RolloutRecord == nil {
+		return pluginsdk.RolloutRecord{}, fmt.Errorf("rollback_rollout callback missing result")
+	}
+	return *result.RolloutRecord, nil
+}
+
+func (b runtimeSubprocessAdminRolloutBridge) Record(pluginID string) (pluginsdk.RolloutRecord, bool) {
+	result, err := b.bridge.AdminRequest(runtimecore.SubprocessAdminRequest{Action: "load_rollout_record", TargetPluginID: strings.TrimSpace(pluginID)})
+	if err != nil || result.RolloutRecord == nil {
+		return pluginsdk.RolloutRecord{}, false
+	}
+	return *result.RolloutRecord, true
+}
+
+func (b runtimeSubprocessAdminReplayBridge) ReplayEvent(eventID string) (eventmodel.Event, error) {
+	result, err := b.bridge.AdminRequest(runtimecore.SubprocessAdminRequest{Action: "replay_event", EventID: strings.TrimSpace(eventID)})
+	if err != nil {
+		return eventmodel.Event{}, err
+	}
+	if result.Event == nil {
+		return eventmodel.Event{}, fmt.Errorf("replay_event callback missing result")
+	}
+	return *result.Event, nil
+}
+
+func (b runtimeSubprocessAdminAuditBridge) RecordAudit(entry pluginsdk.AuditEntry) error {
+	_, err := b.bridge.AdminRequest(runtimecore.SubprocessAdminRequest{Action: "record_audit", AuditEntry: &entry})
+	return err
+}
+
+func (b runtimeSubprocessAIChatQueueBridge) Enqueue(_ context.Context, job pluginsdk.Job) error {
+	_, err := b.bridge.AIChatQueue(runtimecore.SubprocessAIChatQueueRequest{Action: "enqueue", Job: &job})
+	return err
+}
+
+func (b runtimeSubprocessAIChatQueueBridge) MarkRunning(_ context.Context, jobID string) (pluginsdk.Job, error) {
+	return b.queueAction("mark_running", jobID, "")
+}
+
+func (b runtimeSubprocessAIChatQueueBridge) Complete(_ context.Context, jobID string) (pluginsdk.Job, error) {
+	return b.queueAction("complete", jobID, "")
+}
+
+func (b runtimeSubprocessAIChatQueueBridge) Fail(_ context.Context, jobID string, reason string) (pluginsdk.Job, error) {
+	return b.queueAction("fail", jobID, reason)
+}
+
+func (b runtimeSubprocessAIChatQueueBridge) Inspect(_ context.Context, jobID string) (pluginsdk.Job, error) {
+	return b.queueAction("inspect", jobID, "")
+}
+
+func (b runtimeSubprocessAIChatQueueBridge) queueAction(action string, jobID string, reason string) (pluginsdk.Job, error) {
+	result, err := b.bridge.AIChatQueue(runtimecore.SubprocessAIChatQueueRequest{Action: action, JobID: strings.TrimSpace(jobID), Reason: strings.TrimSpace(reason)})
+	if err != nil {
+		return pluginsdk.Job{}, err
+	}
+	if result.Job == nil {
+		return pluginsdk.Job{}, fmt.Errorf("ai chat queue %s callback missing job result", action)
+	}
+	return *result.Job, nil
+}
+
+func (b runtimeSubprocessAIChatSessionBridge) SaveSession(_ context.Context, session pluginsdk.SessionState) error {
+	return b.bridge.AIChatSession(runtimecore.SubprocessAIChatSessionRequest{Session: session})
+}
+
+func (b runtimeSubprocessAIChatProviderBridge) Generate(_ context.Context, prompt string) (string, error) {
+	result, err := b.bridge.AIChatProvider(runtimecore.SubprocessAIChatProviderRequest{Prompt: prompt})
+	if err != nil {
+		return "", err
+	}
+	return result.Text, nil
+}
+
 func handleRuntimeSubprocessEvent(reader *bufio.Reader, stdout *os.File, pluginID string, rawPayload json.RawMessage, rawInstanceConfig json.RawMessage) error {
 	switch strings.TrimSpace(pluginID) {
 	case "", "plugin-echo":
 		return handleRuntimePluginEchoEvent(reader, stdout, rawPayload, rawInstanceConfig)
+	case "plugin-ai-chat":
+		return handleRuntimePluginAIChatEvent(reader, stdout, rawPayload)
 	case "plugin-workflow-demo":
 		return handleRuntimePluginWorkflowDemoEvent(reader, stdout, rawPayload)
 	default:
@@ -676,6 +1011,132 @@ func handleRuntimePluginWorkflowDemoEvent(reader *bufio.Reader, stdout *os.File,
 		}
 	}
 	_, _ = stdout.WriteString("{\"type\":\"event\",\"status\":\"ok\",\"message\":\"event-ok\"}\n")
+	return nil
+}
+
+func handleRuntimePluginAIChatEvent(reader *bufio.Reader, stdout *os.File, rawPayload json.RawMessage) error {
+	var payload runtimePluginEchoEventPayload
+	if err := json.Unmarshal(rawPayload, &payload); err != nil {
+		return fmt.Errorf("decode event payload: %w", err)
+	}
+	bridge := runtimePluginEchoReplyBridge{reader: reader, stdout: stdout}
+	plugin := pluginaichat.New(
+		runtimeSubprocessAIChatQueueBridge{bridge: bridge},
+		runtimeSubprocessAIChatProviderBridge{bridge: bridge},
+		runtimeSubprocessAIChatSessionBridge{bridge: bridge},
+		bridge,
+	)
+	if err := plugin.OnEvent(payload.Event, payload.Ctx); err != nil {
+		return err
+	}
+	_, _ = stdout.WriteString("{\"type\":\"event\",\"status\":\"ok\",\"message\":\"event-ok\"}\n")
+	return nil
+}
+
+func handleRuntimeSubprocessCommand(pluginID string, rawPayload json.RawMessage, _ json.RawMessage) error {
+	pluginID = strings.TrimSpace(pluginID)
+	if len(rawPayload) == 0 {
+		return fmt.Errorf("missing command payload")
+	}
+	var payload runtimePluginCommandPayload
+	if err := json.Unmarshal(rawPayload, &payload); err != nil {
+		return fmt.Errorf("decode command payload: %w", err)
+	}
+	if strings.TrimSpace(payload.Command.Name) == "" {
+		return fmt.Errorf("command payload missing command name")
+	}
+	if err := payload.Ctx.Validate(); err != nil {
+		return fmt.Errorf("validate command execution context: %w", err)
+	}
+	_ = pluginID
+	return nil
+}
+
+func runRuntimeSubprocessCommandBridge(reader *bufio.Reader, stdout *os.File, pluginID string, rawPayload json.RawMessage, rawInstanceConfig json.RawMessage) error {
+	if err := handleRuntimeSubprocessCommand(pluginID, rawPayload, rawInstanceConfig); err != nil {
+		return err
+	}
+	switch strings.TrimSpace(pluginID) {
+	case "plugin-admin":
+		return handleRuntimePluginAdminCommand(reader, stdout, rawPayload)
+	default:
+		return nil
+	}
+}
+
+func runRuntimeSubprocessJobBridge(reader *bufio.Reader, stdout *os.File, pluginID string, rawPayload json.RawMessage, rawInstanceConfig json.RawMessage) error {
+	if err := handleRuntimeSubprocessJob(pluginID, rawPayload, rawInstanceConfig); err != nil {
+		return err
+	}
+	switch strings.TrimSpace(pluginID) {
+	case "plugin-ai-chat":
+		return handleRuntimePluginAIChatJob(reader, stdout, rawPayload)
+	default:
+		return nil
+	}
+}
+
+func handleRuntimePluginAdminCommand(reader *bufio.Reader, stdout *os.File, rawPayload json.RawMessage) error {
+	var payload runtimePluginCommandPayload
+	if err := json.Unmarshal(rawPayload, &payload); err != nil {
+		return fmt.Errorf("decode command payload: %w", err)
+	}
+	bridge := runtimePluginEchoReplyBridge{reader: reader, stdout: stdout}
+	plugin := pluginadmin.New(
+		runtimeSubprocessAdminLifecycleBridge{bridge: bridge},
+		runtimeSubprocessAdminRolloutBridge{bridge: bridge},
+		runtimeSubprocessAdminReplayBridge{bridge: bridge},
+		nil,
+		nil,
+		nil,
+		runtimeSubprocessAdminAuditBridge{bridge: bridge},
+	)
+	method := reflect.ValueOf(plugin).MethodByName("SetDecisionAuthorizer")
+	if !method.IsValid() {
+		return fmt.Errorf("plugin-admin decision authorizer setter is unavailable")
+	}
+	method.Call([]reflect.Value{reflect.ValueOf(runtimeSubprocessAdminAuthorizationBridge{bridge: bridge})})
+	plugin.CurrentTime = time.Now().UTC
+	return plugin.OnCommand(payload.Command, payload.Ctx)
+}
+
+func handleRuntimePluginAIChatJob(reader *bufio.Reader, stdout *os.File, rawPayload json.RawMessage) error {
+	var payload runtimePluginJobPayload
+	if err := json.Unmarshal(rawPayload, &payload); err != nil {
+		return fmt.Errorf("decode job payload: %w", err)
+	}
+	bridge := runtimePluginEchoReplyBridge{reader: reader, stdout: stdout}
+	plugin := pluginaichat.New(
+		runtimeSubprocessAIChatQueueBridge{bridge: bridge},
+		runtimeSubprocessAIChatProviderBridge{bridge: bridge},
+		runtimeSubprocessAIChatSessionBridge{bridge: bridge},
+		bridge,
+	)
+	return plugin.OnJob(payload.Job, payload.Ctx)
+}
+
+func handleRuntimeSubprocessJob(pluginID string, rawPayload json.RawMessage, _ json.RawMessage) error {
+	pluginID = strings.TrimSpace(pluginID)
+	if len(rawPayload) == 0 {
+		return fmt.Errorf("missing job payload")
+	}
+	var payload runtimePluginJobPayload
+	if err := json.Unmarshal(rawPayload, &payload); err != nil {
+		return fmt.Errorf("decode job payload: %w", err)
+	}
+	if strings.TrimSpace(payload.Job.ID) == "" {
+		return fmt.Errorf("job payload missing job id")
+	}
+	if strings.TrimSpace(payload.Job.Type) == "" {
+		return fmt.Errorf("job payload missing job type")
+	}
+	if err := payload.Ctx.Validate(); err != nil {
+		return fmt.Errorf("validate job execution context: %w", err)
+	}
+	if pluginID == "plugin-ai-chat" && payload.Ctx.Reply == nil {
+		return fmt.Errorf("validate job execution context: reply handle is required for ai-chat job dispatch")
+	}
+	_ = pluginID
 	return nil
 }
 

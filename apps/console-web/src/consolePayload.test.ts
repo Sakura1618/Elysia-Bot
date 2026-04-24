@@ -24,6 +24,10 @@ describe('parseConsolePayload', () => {
     expect(parsed.audits[0]?.session_id).toBe('session-operator-bearer-admin-user');
     expect(parsed.audits[0]?.error_code).toBe('plugin_disabled');
     expect(parsed.audits[2]?.session_id).toBe('session-operator-bearer-job-operator');
+    expect(parsed.rolloutHeads[0]?.pluginId).toBe('plugin-echo');
+    expect(parsed.rolloutHeads[0]?.phase).toBe('canary');
+    expect(parsed.rolloutHeads[0]?.active.version).toBe('0.2.0-candidate');
+    expect(parsed.rolloutHeads[0]?.stateSource).toBe('sqlite-rollout-heads');
     expect(parsed.meta.request_identity).toEqual({
       actor_id: 'viewer-user',
       token_id: 'viewer-main',
@@ -76,6 +80,13 @@ describe('parseConsolePayload', () => {
 
     expect(() => parseConsolePayload(payload)).toThrow('Console API payload shape is incompatible with Console Web A11');
   });
+
+	it('rejects payloads when rollout heads stop exposing required stable or active snapshots', () => {
+		const payload = cloneMockConsoleData();
+		payload.rolloutHeads[0] = { ...payload.rolloutHeads[0], stable: 'not-a-snapshot' as never };
+
+		expect(() => parseConsolePayload(payload)).toThrow('Console API payload shape is incompatible with Console Web A11');
+	});
 
   it('rejects payloads when request identity metadata stops using strings', () => {
     const payload = cloneMockConsoleData();

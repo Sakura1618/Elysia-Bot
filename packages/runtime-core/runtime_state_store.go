@@ -63,6 +63,18 @@ type ReplayOperationStateStore interface {
 	ListReplayOperationRecords(context.Context) ([]ReplayOperationRecord, error)
 }
 
+type RolloutHeadStateStore interface {
+	SaveRolloutHead(context.Context, RolloutHeadState) error
+	LoadRolloutHead(context.Context, string) (RolloutHeadState, error)
+	ListRolloutHeads(context.Context) ([]RolloutHeadState, error)
+}
+
+type RolloutStateStore interface {
+	RolloutHeadStateStore
+	SaveRolloutOperationRecord(context.Context, RolloutOperationRecord) error
+	ListRolloutOperationRecords(context.Context) ([]RolloutOperationRecord, error)
+}
+
 type RuntimeStateStore interface {
 	EventJournalReader
 	PluginManifestStateStore
@@ -73,6 +85,7 @@ type RuntimeStateStore interface {
 	AdapterInstanceStateStore
 	RBACStateStore
 	ReplayOperationStateStore
+	RolloutHeadStateStore
 	jobQueueStore
 	AlertSink
 	deadLetterTransactionalAlertSink

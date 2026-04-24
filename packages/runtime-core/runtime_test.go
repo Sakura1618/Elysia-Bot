@@ -214,7 +214,7 @@ func TestRuntimeRegistersAdapterAndPluginThenDispatchesViaHost(t *testing.T) {
 		Handlers: pluginsdk.Handlers{Event: handler},
 	}
 
-	if err := runtime.RegisterPlugin(plugin); err != nil {
+	if err := registerPluginWithTestSchema(runtime, plugin); err != nil {
 		t.Fatalf("register plugin: %v", err)
 	}
 
@@ -267,7 +267,7 @@ func TestRuntimeDispatchPassesReplyHandleIntoExecutionContext(t *testing.T) {
 		Handlers: pluginsdk.Handlers{Event: handler},
 	}
 
-	if err := runtime.RegisterPlugin(plugin); err != nil {
+	if err := registerPluginWithTestSchema(runtime, plugin); err != nil {
 		t.Fatalf("register plugin: %v", err)
 	}
 
@@ -314,7 +314,7 @@ func TestRuntimeDispatchRecordsObservability(t *testing.T) {
 		},
 		Handlers: pluginsdk.Handlers{Event: handler},
 	}
-	if err := runtime.RegisterPlugin(plugin); err != nil {
+	if err := registerPluginWithTestSchema(runtime, plugin); err != nil {
 		t.Fatalf("register plugin: %v", err)
 	}
 
@@ -377,7 +377,7 @@ func TestRuntimeDispatchPassesInstanceConfigIntoSubprocessHostRequest(t *testing
 		InstanceConfig: map[string]any{"prefix": "!"},
 		Handlers:       pluginsdk.Handlers{Event: handler},
 	}
-	if err := runtime.RegisterPlugin(plugin); err != nil {
+	if err := registerPluginWithTestSchema(runtime, plugin); err != nil {
 		t.Fatalf("register plugin: %v", err)
 	}
 
@@ -451,7 +451,7 @@ func TestRuntimeDispatchDoesNotInjectDeeperNestedManifestDefaultIntoSubprocessHo
 		InstanceConfig: map[string]any{"settings": map[string]any{"labels": map[string]any{}}},
 		Handlers:       pluginsdk.Handlers{Event: handler},
 	}
-	if err := runtime.RegisterPlugin(plugin); err != nil {
+	if err := registerPluginWithTestSchema(runtime, plugin); err != nil {
 		t.Fatalf("register plugin: %v", err)
 	}
 
@@ -509,7 +509,7 @@ func TestRuntimeDispatchRejectsBeyondSupportedDeeperNestedObjectNodeMismatchInto
 		InstanceConfig: map[string]any{"settings": map[string]any{"labels": map[string]any{"naming": true}}},
 		Handlers:       pluginsdk.Handlers{Event: handler},
 	}
-	if err := runtime.RegisterPlugin(plugin); err != nil {
+	if err := registerPluginWithTestSchema(runtime, plugin); err != nil {
 		t.Fatalf("register plugin: %v", err)
 	}
 
@@ -583,7 +583,7 @@ func TestRuntimeDispatchRejectsBeyondSupportedDeeperNestedRequiredEnumDefaultExp
 				InstanceConfig: tc.instanceConfig,
 				Handlers:       pluginsdk.Handlers{Event: handler},
 			}
-			if err := runtime.RegisterPlugin(plugin); err != nil {
+			if err := registerPluginWithTestSchema(runtime, plugin); err != nil {
 				t.Fatalf("register plugin: %v", err)
 			}
 
@@ -666,7 +666,7 @@ func TestRuntimeDispatchRejectsBeyondSupportedDeeperNestedValidationOnExistingNa
 				InstanceConfig: tc.instanceConfig,
 				Handlers:       pluginsdk.Handlers{Event: handler},
 			}
-			if err := runtime.RegisterPlugin(plugin); err != nil {
+			if err := registerPluginWithTestSchema(runtime, plugin); err != nil {
 				t.Fatalf("register plugin: %v", err)
 			}
 
@@ -739,7 +739,7 @@ func TestRuntimeDispatchMergesBeyondSupportedDeeperNestedDefaultVariantsOnExisti
 				InstanceConfig: testBeyondSupportedDeeperNestedEmptyNamingInstanceConfig(),
 				Handlers:       pluginsdk.Handlers{Event: handler},
 			}
-			if err := runtime.RegisterPlugin(plugin); err != nil {
+			if err := registerPluginWithTestSchema(runtime, plugin); err != nil {
 				t.Fatalf("register plugin: %v", err)
 			}
 
@@ -821,7 +821,7 @@ func TestRuntimeDispatchMaterializesBeyondSupportedDeeperNestedRequiredEnumDefau
 		InstanceConfig: map[string]any{"settings": map[string]any{"labels": map[string]any{}}},
 		Handlers:       pluginsdk.Handlers{Event: handler},
 	}
-	if err := runtime.RegisterPlugin(plugin); err != nil {
+	if err := registerPluginWithTestSchema(runtime, plugin); err != nil {
 		t.Fatalf("register plugin: %v", err)
 	}
 
@@ -907,7 +907,7 @@ func TestRuntimeDispatchMergesBeyondSupportedDeeperNestedDefaultIntoExistingNami
 		InstanceConfig: map[string]any{"settings": map[string]any{"labels": map[string]any{"naming": map[string]any{}}}},
 		Handlers:       pluginsdk.Handlers{Event: handler},
 	}
-	if err := runtime.RegisterPlugin(plugin); err != nil {
+	if err := registerPluginWithTestSchema(runtime, plugin); err != nil {
 		t.Fatalf("register plugin: %v", err)
 	}
 
@@ -994,7 +994,7 @@ func TestRuntimeDispatchPassesBeyondSupportedDeeperNestedRequiredEnumDefaultPare
 		InstanceConfig: map[string]any{"settings": map[string]any{}},
 		Handlers:       pluginsdk.Handlers{Event: handler},
 	}
-	if err := runtime.RegisterPlugin(plugin); err != nil {
+	if err := registerPluginWithTestSchema(runtime, plugin); err != nil {
 		t.Fatalf("register plugin: %v", err)
 	}
 
@@ -1081,7 +1081,7 @@ func TestRuntimeDispatchPassesBeyondSupportedDeeperNestedRequiredEnumDefaultRoot
 		InstanceConfig: map[string]any{},
 		Handlers:       pluginsdk.Handlers{Event: handler},
 	}
-	if err := runtime.RegisterPlugin(plugin); err != nil {
+	if err := registerPluginWithTestSchema(runtime, plugin); err != nil {
 		t.Fatalf("register plugin: %v", err)
 	}
 
@@ -1176,7 +1176,7 @@ func TestRuntimeDispatchTreatsNilAndEmptyInstanceConfigAsEquivalentBeyondSupport
 				InstanceConfig: tc.instanceConfig,
 				Handlers:       pluginsdk.Handlers{Event: handler},
 			}
-			if err := runtime.RegisterPlugin(plugin); err != nil {
+			if err := registerPluginWithTestSchema(runtime, plugin); err != nil {
 				t.Fatalf("register plugin: %v", err)
 			}
 
@@ -1254,7 +1254,7 @@ func TestRuntimeDispatchRejectsNestedInstanceConfigValueTypeMismatchBeforePlugin
 		InstanceConfig: map[string]any{"settings": map[string]any{"prefix": true}},
 		Handlers:       pluginsdk.Handlers{Event: handler},
 	}
-	if err := runtime.RegisterPlugin(plugin); err != nil {
+	if err := registerPluginWithTestSchema(runtime, plugin); err != nil {
 		t.Fatalf("register plugin: %v", err)
 	}
 
@@ -1341,7 +1341,7 @@ func TestRuntimeDispatchRejectsDeeperNestedInstanceConfigValueTypeMismatchBefore
 		InstanceConfig: map[string]any{"settings": map[string]any{"labels": map[string]any{"prefix": true}}},
 		Handlers:       pluginsdk.Handlers{Event: handler},
 	}
-	if err := runtime.RegisterPlugin(plugin); err != nil {
+	if err := registerPluginWithTestSchema(runtime, plugin); err != nil {
 		t.Fatalf("register plugin: %v", err)
 	}
 
@@ -1428,7 +1428,7 @@ func TestRuntimeDispatchRejectsDeeperNestedInstanceConfigValueOutsideManifestEnu
 		InstanceConfig: map[string]any{"settings": map[string]any{"labels": map[string]any{"prefix": "oops"}}},
 		Handlers:       pluginsdk.Handlers{Event: handler},
 	}
-	if err := runtime.RegisterPlugin(plugin); err != nil {
+	if err := registerPluginWithTestSchema(runtime, plugin); err != nil {
 		t.Fatalf("register plugin: %v", err)
 	}
 
@@ -1533,7 +1533,7 @@ func TestRuntimeDispatchRejectsDeeperNestedArrayValueTypeMismatchBeforePluginDel
 		InstanceConfig: map[string]any{"settings": map[string]any{"labels": map[string]any{"prefix": []any{"oops"}}}},
 		Handlers:       pluginsdk.Handlers{Event: handler},
 	}
-	if err := runtime.RegisterPlugin(plugin); err != nil {
+	if err := registerPluginWithTestSchema(runtime, plugin); err != nil {
 		t.Fatalf("register plugin: %v", err)
 	}
 
@@ -1620,7 +1620,7 @@ func TestRuntimeDispatchRejectsDeeperNestedObjectValueTypeMismatchBeforePluginDe
 		InstanceConfig: map[string]any{"settings": map[string]any{"labels": map[string]any{"prefix": map[string]any{"bad": true}}}},
 		Handlers:       pluginsdk.Handlers{Event: handler},
 	}
-	if err := runtime.RegisterPlugin(plugin); err != nil {
+	if err := registerPluginWithTestSchema(runtime, plugin); err != nil {
 		t.Fatalf("register plugin: %v", err)
 	}
 
@@ -1708,7 +1708,7 @@ func TestRuntimeDispatchRejectsDeeperNestedMissingRequiredInstanceConfigBeforePl
 		InstanceConfig: map[string]any{"settings": map[string]any{"labels": map[string]any{}}},
 		Handlers:       pluginsdk.Handlers{Event: handler},
 	}
-	if err := runtime.RegisterPlugin(plugin); err != nil {
+	if err := registerPluginWithTestSchema(runtime, plugin); err != nil {
 		t.Fatalf("register plugin: %v", err)
 	}
 
@@ -1759,7 +1759,7 @@ func TestRuntimeDispatchFailureRecordsPluginErrorMetric(t *testing.T) {
 	buffer := &bytes.Buffer{}
 	runtime := NewInMemoryRuntime(NoopSupervisor{}, DirectPluginHost{})
 	runtime.SetObservability(NewLogger(buffer), NewTraceRecorder(), NewMetricsRegistry())
-	if err := runtime.RegisterPlugin(pluginsdk.Plugin{
+	if err := registerPluginWithTestSchema(runtime, pluginsdk.Plugin{
 		Manifest: pluginsdk.PluginManifest{ID: "plugin-fail", Name: "Fail", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, Entry: pluginsdk.PluginEntry{Module: "plugins/fail", Symbol: "Plugin"}},
 		Handlers: pluginsdk.Handlers{Event: failingEventHandler{}},
 	}); err != nil {
@@ -1786,7 +1786,7 @@ func TestRuntimeDispatchEventStopsBeforePluginWhenEventAuthorizerDenies(t *testi
 	runtime.SetAuditRecorder(audits)
 	runtime.SetObservability(NewLogger(buffer), NewTraceRecorder(), NewMetricsRegistry())
 	runtime.SetEventAuthorizer(authorizer)
-	if err := runtime.RegisterPlugin(pluginsdk.Plugin{
+	if err := registerPluginWithTestSchema(runtime, pluginsdk.Plugin{
 		Manifest: pluginsdk.PluginManifest{ID: "plugin-echo", Name: "Echo Plugin", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, Permissions: []string{"message:read"}, Entry: pluginsdk.PluginEntry{Module: "plugins/echo", Symbol: "Plugin"}},
 		Handlers: pluginsdk.Handlers{Event: handler},
 	}); err != nil {
@@ -1852,13 +1852,13 @@ func TestRuntimeDispatchEventWithConfiguredMetadataAuthorizerAllowsScopedPluginA
 			"echo-reader": {Permissions: []string{"message:read"}, PluginScope: []string{"plugin-echo"}},
 		},
 	}))
-	if err := runtime.RegisterPlugin(pluginsdk.Plugin{
+	if err := registerPluginWithTestSchema(runtime, pluginsdk.Plugin{
 		Manifest: pluginsdk.PluginManifest{ID: "plugin-echo", Name: "Echo Plugin", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, Permissions: []string{"message:read"}, Entry: pluginsdk.PluginEntry{Module: "plugins/echo", Symbol: "Plugin"}},
 		Handlers: pluginsdk.Handlers{Event: allowed},
 	}); err != nil {
 		t.Fatalf("register allowed plugin: %v", err)
 	}
-	if err := runtime.RegisterPlugin(pluginsdk.Plugin{
+	if err := registerPluginWithTestSchema(runtime, pluginsdk.Plugin{
 		Manifest: pluginsdk.PluginManifest{ID: "plugin-ai-chat", Name: "AI Plugin", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, Permissions: []string{"message:read"}, Entry: pluginsdk.PluginEntry{Module: "plugins/ai-chat", Symbol: "Plugin"}},
 		Handlers: pluginsdk.Handlers{Event: blocked},
 	}); err != nil {
@@ -1902,7 +1902,7 @@ func TestRuntimeDispatchEventWithoutPermissionMetadataDoesNotRecordDenyAudit(t *
 			"echo-reader": {Permissions: []string{"message:read"}, PluginScope: []string{"plugin-echo"}},
 		},
 	}))
-	if err := runtime.RegisterPlugin(pluginsdk.Plugin{
+	if err := registerPluginWithTestSchema(runtime, pluginsdk.Plugin{
 		Manifest: pluginsdk.PluginManifest{ID: "plugin-echo", Name: "Echo Plugin", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, Entry: pluginsdk.PluginEntry{Module: "plugins/echo", Symbol: "Plugin"}},
 		Handlers: pluginsdk.Handlers{Event: handler},
 	}); err != nil {
@@ -1935,7 +1935,7 @@ func TestRuntimeDispatchEventRequiresDeclaredManifestPermissionWhenPermissionMet
 			"reader": {Permissions: []string{"message:read"}, PluginScope: []string{"*"}},
 		},
 	}))
-	if err := runtime.RegisterPlugin(pluginsdk.Plugin{
+	if err := registerPluginWithTestSchema(runtime, pluginsdk.Plugin{
 		Manifest: pluginsdk.PluginManifest{ID: "plugin-echo", Name: "Echo Plugin", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, Entry: pluginsdk.PluginEntry{Module: "plugins/echo", Symbol: "Plugin"}},
 		Handlers: pluginsdk.Handlers{Event: handler},
 	}); err != nil {
@@ -1991,7 +1991,7 @@ func TestRuntimeDispatchesCommandViaHost(t *testing.T) {
 		Handlers: pluginsdk.Handlers{Command: handler},
 	}
 
-	if err := runtime.RegisterPlugin(plugin); err != nil {
+	if err := registerPluginWithTestSchema(runtime, plugin); err != nil {
 		t.Fatalf("register plugin: %v", err)
 	}
 
@@ -2034,7 +2034,7 @@ func TestRuntimeSkipsDisabledPluginFromEnabledOverlay(t *testing.T) {
 			Handlers: pluginsdk.Handlers{Event: blocked},
 		},
 	} {
-		if err := runtime.RegisterPlugin(plugin); err != nil {
+		if err := registerPluginWithTestSchema(runtime, plugin); err != nil {
 			t.Fatalf("register plugin %s: %v", plugin.Manifest.ID, err)
 		}
 		if err := store.SavePluginManifest(context.Background(), plugin.Manifest); err != nil {
@@ -2066,7 +2066,7 @@ func TestRuntimeDispatchCommandWithoutAuthorizerPreservesExistingBehavior(t *tes
 
 	handler := &recordingCommandHandler{}
 	runtime := NewInMemoryRuntime(NoopSupervisor{}, DirectPluginHost{})
-	if err := runtime.RegisterPlugin(pluginsdk.Plugin{
+	if err := registerPluginWithTestSchema(runtime, pluginsdk.Plugin{
 		Manifest: pluginsdk.PluginManifest{ID: "plugin-admin", Name: "Admin Plugin", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, Permissions: []string{"plugin:enable", "plugin:disable", "plugin:rollout"}, Entry: pluginsdk.PluginEntry{Module: "plugins/admin", Symbol: "Plugin"}},
 		Handlers: pluginsdk.Handlers{Command: handler},
 	}); err != nil {
@@ -2088,7 +2088,7 @@ func TestRuntimeDispatchCommandStopsBeforePluginWhenAuthorizerDenies(t *testing.
 	supervisor := &recordingSupervisor{}
 	runtime := NewInMemoryRuntime(supervisor, DirectPluginHost{})
 	runtime.SetCommandAuthorizer(authorizer)
-	if err := runtime.RegisterPlugin(pluginsdk.Plugin{
+	if err := registerPluginWithTestSchema(runtime, pluginsdk.Plugin{
 		Manifest: pluginsdk.PluginManifest{ID: "plugin-admin", Name: "Admin Plugin", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, Permissions: []string{"plugin:enable", "plugin:disable", "plugin:rollout"}, Entry: pluginsdk.PluginEntry{Module: "plugins/admin", Symbol: "Plugin"}},
 		Handlers: pluginsdk.Handlers{Command: handler},
 	}); err != nil {
@@ -2120,13 +2120,13 @@ func TestRuntimeCommandAuthorizerDoesNotAffectJobOrScheduleDispatch(t *testing.T
 	scheduleHandler := &recordingScheduleHandler{}
 	runtime := NewInMemoryRuntime(NoopSupervisor{}, DirectPluginHost{})
 	runtime.SetCommandAuthorizer(authorizer)
-	if err := runtime.RegisterPlugin(pluginsdk.Plugin{
+	if err := registerPluginWithTestSchema(runtime, pluginsdk.Plugin{
 		Manifest: pluginsdk.PluginManifest{ID: "plugin-job", Name: "Job Plugin", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, Entry: pluginsdk.PluginEntry{Module: "plugins/job", Symbol: "Plugin"}},
 		Handlers: pluginsdk.Handlers{Job: jobHandler},
 	}); err != nil {
 		t.Fatalf("register job plugin: %v", err)
 	}
-	if err := runtime.RegisterPlugin(pluginsdk.Plugin{
+	if err := registerPluginWithTestSchema(runtime, pluginsdk.Plugin{
 		Manifest: pluginsdk.PluginManifest{ID: "plugin-schedule", Name: "Schedule Plugin", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, Entry: pluginsdk.PluginEntry{Module: "plugins/schedule", Symbol: "Plugin"}},
 		Handlers: pluginsdk.Handlers{Schedule: scheduleHandler},
 	}); err != nil {
@@ -2156,7 +2156,7 @@ func TestRuntimeDispatchJobStopsBeforePluginWhenJobAuthorizerDenies(t *testing.T
 	runtime := NewInMemoryRuntime(supervisor, DirectPluginHost{})
 	runtime.SetAuditRecorder(audits)
 	runtime.SetJobAuthorizer(authorizer)
-	if err := runtime.RegisterPlugin(pluginsdk.Plugin{
+	if err := registerPluginWithTestSchema(runtime, pluginsdk.Plugin{
 		Manifest: pluginsdk.PluginManifest{ID: "plugin-ai-chat", Name: "AI Plugin", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, Permissions: []string{"job:run"}, Entry: pluginsdk.PluginEntry{Module: "plugins/ai-chat", Symbol: "Plugin"}},
 		Handlers: pluginsdk.Handlers{Job: handler},
 	}); err != nil {
@@ -2200,7 +2200,7 @@ func TestRuntimeDispatchJobWithoutPermissionMetadataDoesNotRecordDenyAudit(t *te
 			"ai-runner": {Permissions: []string{"job:run"}, PluginScope: []string{"plugin-ai-chat"}},
 		},
 	}))
-	if err := runtime.RegisterPlugin(pluginsdk.Plugin{
+	if err := registerPluginWithTestSchema(runtime, pluginsdk.Plugin{
 		Manifest: pluginsdk.PluginManifest{ID: "plugin-ai-chat", Name: "AI Plugin", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, Entry: pluginsdk.PluginEntry{Module: "plugins/ai-chat", Symbol: "Plugin"}},
 		Handlers: pluginsdk.Handlers{Job: handler},
 	}); err != nil {
@@ -2231,13 +2231,13 @@ func TestRuntimeDispatchJobWithConfiguredMetadataAuthorizerAllowsScopedPluginAnd
 			"ai-runner": {Permissions: []string{"job:run"}, PluginScope: []string{"plugin-ai-chat"}},
 		},
 	}))
-	if err := runtime.RegisterPlugin(pluginsdk.Plugin{
+	if err := registerPluginWithTestSchema(runtime, pluginsdk.Plugin{
 		Manifest: pluginsdk.PluginManifest{ID: "plugin-ai-chat", Name: "AI Plugin", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, Permissions: []string{"job:run"}, Entry: pluginsdk.PluginEntry{Module: "plugins/ai-chat", Symbol: "Plugin"}},
 		Handlers: pluginsdk.Handlers{Job: allowed},
 	}); err != nil {
 		t.Fatalf("register allowed plugin: %v", err)
 	}
-	if err := runtime.RegisterPlugin(pluginsdk.Plugin{
+	if err := registerPluginWithTestSchema(runtime, pluginsdk.Plugin{
 		Manifest: pluginsdk.PluginManifest{ID: "plugin-workflow-demo", Name: "Workflow Plugin", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, Permissions: []string{"job:run"}, Entry: pluginsdk.PluginEntry{Module: "plugins/workflow-demo", Symbol: "Plugin"}},
 		Handlers: pluginsdk.Handlers{Job: blocked},
 	}); err != nil {
@@ -2257,13 +2257,13 @@ func TestRuntimeDispatchJobTargetsSinglePluginWhenTargetPluginIDProvided(t *test
 	allowed := &recordingJobHandler{}
 	blocked := &recordingJobHandler{}
 	runtime := NewInMemoryRuntime(&recordingSupervisor{}, DirectPluginHost{})
-	if err := runtime.RegisterPlugin(pluginsdk.Plugin{
+	if err := registerPluginWithTestSchema(runtime, pluginsdk.Plugin{
 		Manifest: pluginsdk.PluginManifest{ID: "plugin-ai-chat", Name: "AI Plugin", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, Permissions: []string{"job:run"}, Entry: pluginsdk.PluginEntry{Module: "plugins/ai-chat", Symbol: "Plugin"}},
 		Handlers: pluginsdk.Handlers{Job: allowed},
 	}); err != nil {
 		t.Fatalf("register allowed plugin: %v", err)
 	}
-	if err := runtime.RegisterPlugin(pluginsdk.Plugin{
+	if err := registerPluginWithTestSchema(runtime, pluginsdk.Plugin{
 		Manifest: pluginsdk.PluginManifest{ID: "plugin-other-job", Name: "Other Job Plugin", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, Permissions: []string{"job:run"}, Entry: pluginsdk.PluginEntry{Module: "plugins/other", Symbol: "Plugin"}},
 		Handlers: pluginsdk.Handlers{Job: blocked},
 	}); err != nil {
@@ -2292,13 +2292,13 @@ func TestRuntimeDispatchScheduleWithConfiguredMetadataAuthorizerAllowsScopedPlug
 			"schedule-operator": {Permissions: []string{"schedule:manage"}, PluginScope: []string{"plugin-scheduler"}},
 		},
 	}))
-	if err := runtime.RegisterPlugin(pluginsdk.Plugin{
+	if err := registerPluginWithTestSchema(runtime, pluginsdk.Plugin{
 		Manifest: pluginsdk.PluginManifest{ID: "plugin-scheduler", Name: "Scheduler Plugin", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, Permissions: []string{"schedule:manage"}, Entry: pluginsdk.PluginEntry{Module: "plugins/scheduler", Symbol: "Plugin"}},
 		Handlers: pluginsdk.Handlers{Schedule: allowed},
 	}); err != nil {
 		t.Fatalf("register allowed plugin: %v", err)
 	}
-	if err := runtime.RegisterPlugin(pluginsdk.Plugin{
+	if err := registerPluginWithTestSchema(runtime, pluginsdk.Plugin{
 		Manifest: pluginsdk.PluginManifest{ID: "plugin-workflow-demo", Name: "Workflow Plugin", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, Permissions: []string{"schedule:manage"}, Entry: pluginsdk.PluginEntry{Module: "plugins/workflow-demo", Symbol: "Plugin"}},
 		Handlers: pluginsdk.Handlers{Schedule: blocked},
 	}); err != nil {
@@ -2325,7 +2325,7 @@ func TestRuntimeDispatchScheduleWithConfiguredMetadataAuthorizerRecordsDeniedAud
 			"schedule-viewer": {Permissions: []string{"schedule:view"}, PluginScope: []string{"*"}},
 		},
 	}))
-	if err := runtime.RegisterPlugin(pluginsdk.Plugin{
+	if err := registerPluginWithTestSchema(runtime, pluginsdk.Plugin{
 		Manifest: pluginsdk.PluginManifest{ID: "plugin-scheduler", Name: "Scheduler Plugin", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, Permissions: []string{"schedule:manage"}, Entry: pluginsdk.PluginEntry{Module: "plugins/scheduler", Symbol: "Plugin"}},
 		Handlers: pluginsdk.Handlers{Schedule: handler},
 	}); err != nil {
@@ -2364,7 +2364,7 @@ func TestRuntimeDispatchScheduleWithoutPermissionMetadataDoesNotRecordDenyAudit(
 			"schedule-operator": {Permissions: []string{"schedule:manage"}, PluginScope: []string{"plugin-scheduler"}},
 		},
 	}))
-	if err := runtime.RegisterPlugin(pluginsdk.Plugin{
+	if err := registerPluginWithTestSchema(runtime, pluginsdk.Plugin{
 		Manifest: pluginsdk.PluginManifest{ID: "plugin-scheduler", Name: "Scheduler Plugin", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, Entry: pluginsdk.PluginEntry{Module: "plugins/scheduler", Symbol: "Plugin"}},
 		Handlers: pluginsdk.Handlers{Schedule: handler},
 	}); err != nil {
@@ -2395,7 +2395,7 @@ func TestRuntimeDispatchScheduleWithConfiguredMetadataAuthorizerRecordsScopeDeni
 			"schedule-operator": {Permissions: []string{"schedule:manage"}, PluginScope: []string{"plugin-other"}},
 		},
 	}))
-	if err := runtime.RegisterPlugin(pluginsdk.Plugin{
+	if err := registerPluginWithTestSchema(runtime, pluginsdk.Plugin{
 		Manifest: pluginsdk.PluginManifest{ID: "plugin-scheduler", Name: "Scheduler Plugin", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, Permissions: []string{"schedule:manage"}, Entry: pluginsdk.PluginEntry{Module: "plugins/scheduler", Symbol: "Plugin"}},
 		Handlers: pluginsdk.Handlers{Schedule: handler},
 	}); err != nil {
@@ -2432,7 +2432,7 @@ func TestRuntimeDispatchScheduleRequiresDeclaredManifestPermissionWhenPermission
 			"schedule-operator": {Permissions: []string{"schedule:manage"}, PluginScope: []string{"*"}},
 		},
 	}))
-	if err := runtime.RegisterPlugin(pluginsdk.Plugin{
+	if err := registerPluginWithTestSchema(runtime, pluginsdk.Plugin{
 		Manifest: pluginsdk.PluginManifest{ID: "plugin-scheduler", Name: "Scheduler Plugin", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, Entry: pluginsdk.PluginEntry{Module: "plugins/scheduler", Symbol: "Plugin"}},
 		Handlers: pluginsdk.Handlers{Schedule: handler},
 	}); err != nil {
@@ -2467,7 +2467,7 @@ func TestRuntimeDispatchCommandWithConfiguredAdminAuthorizerAllowsAndDenies(t *t
 			"viewer": {Permissions: []string{"plugin:disable"}, PluginScope: []string{"*"}},
 		},
 	}))
-	if err := runtime.RegisterPlugin(pluginsdk.Plugin{
+	if err := registerPluginWithTestSchema(runtime, pluginsdk.Plugin{
 		Manifest: pluginsdk.PluginManifest{ID: "plugin-admin", Name: "Admin Plugin", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, Permissions: []string{"plugin:enable", "plugin:disable", "plugin:rollout"}, Entry: pluginsdk.PluginEntry{Module: "plugins/admin", Symbol: "Plugin"}},
 		Handlers: pluginsdk.Handlers{Command: handler},
 	}); err != nil {
@@ -2519,7 +2519,7 @@ func TestRuntimeDispatchCommandWithConfiguredAdminAuthorizerRejectsScopeAndAllow
 			"rollout-admin": {Permissions: []string{"plugin:rollout"}, PluginScope: []string{"plugin-echo"}},
 		},
 	}))
-	if err := runtime.RegisterPlugin(pluginsdk.Plugin{
+	if err := registerPluginWithTestSchema(runtime, pluginsdk.Plugin{
 		Manifest: pluginsdk.PluginManifest{ID: "plugin-admin", Name: "Admin Plugin", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, Permissions: []string{"plugin:enable", "plugin:disable", "plugin:rollout"}, Entry: pluginsdk.PluginEntry{Module: "plugins/admin", Symbol: "Plugin"}},
 		Handlers: pluginsdk.Handlers{Command: handler},
 	}); err != nil {
@@ -2549,6 +2549,13 @@ func TestRuntimeDispatchCommandWithConfiguredAdminAuthorizerRejectsScopeAndAllow
 	if entries := audits.AuditEntries(); len(entries) != 1 {
 		t.Fatalf("expected allowed rollout command not to add deny audit, got %+v", entries)
 	}
+	handler.called = false
+	if err := runtime.DispatchCommand(context.Background(), eventmodel.CommandInvocation{Name: "admin", Raw: "/admin canary plugin-echo", Metadata: map[string]any{"actor": "rollout-user"}}, eventmodel.ExecutionContext{TraceID: "trace-rollout-canary", EventID: "evt-rollout-canary"}); err != nil {
+		t.Fatalf("expected canary rollout command to be allowed, got %v", err)
+	}
+	if !handler.called {
+		t.Fatal("expected canary rollout command to reach plugin handler")
+	}
 }
 
 func TestRuntimeDispatchCommandEmitsRolloutEvidenceFields(t *testing.T) {
@@ -2566,7 +2573,7 @@ func TestRuntimeDispatchCommandEmitsRolloutEvidenceFields(t *testing.T) {
 			"rollout-admin": {Permissions: []string{"plugin:rollout"}, PluginScope: []string{"plugin-echo"}},
 		},
 	}))
-	if err := runtime.RegisterPlugin(pluginsdk.Plugin{
+	if err := registerPluginWithTestSchema(runtime, pluginsdk.Plugin{
 		Manifest: pluginsdk.PluginManifest{ID: "plugin-admin", Name: "Admin Plugin", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, Permissions: []string{"plugin:rollout"}, Entry: pluginsdk.PluginEntry{Module: "plugins/admin", Symbol: "Plugin"}},
 		Handlers: pluginsdk.Handlers{Command: handler},
 	}); err != nil {
@@ -2585,6 +2592,16 @@ func TestRuntimeDispatchCommandEmitsRolloutEvidenceFields(t *testing.T) {
 	if rendered := tracer.RenderTrace("trace-rollout-observe"); !strings.Contains(rendered, "runtime.dispatch") || !strings.Contains(rendered, "plugin.invoke") {
 		t.Fatalf("expected rollout observability trace spans, got %s", rendered)
 	}
+	buffer.Reset()
+	if err := runtime.DispatchCommand(context.Background(), eventmodel.CommandInvocation{Name: "admin", Raw: "/admin rollback plugin-echo", Metadata: map[string]any{"actor": "rollout-user"}}, eventmodel.ExecutionContext{TraceID: "trace-rollout-rollback", EventID: "evt-rollout-rollback"}); err != nil {
+		t.Fatalf("dispatch rollback rollout command: %v", err)
+	}
+	logs = buffer.String()
+	for _, expected := range []string{`"command_name":"admin"`, `"actor":"rollout-user"`, `"action":"rollback"`, `"target":"plugin-echo"`} {
+		if !strings.Contains(logs, expected) {
+			t.Fatalf("expected rollback observability log %q, got %s", expected, logs)
+		}
+	}
 }
 
 func TestRuntimeDispatchCommandWithConfiguredAdminAuthorizerSupportsStructuredArguments(t *testing.T) {
@@ -2598,7 +2615,7 @@ func TestRuntimeDispatchCommandWithConfiguredAdminAuthorizerSupportsStructuredAr
 			"admin": {Permissions: []string{"plugin:enable"}, PluginScope: []string{"*"}},
 		},
 	}))
-	if err := runtime.RegisterPlugin(pluginsdk.Plugin{
+	if err := registerPluginWithTestSchema(runtime, pluginsdk.Plugin{
 		Manifest: pluginsdk.PluginManifest{ID: "plugin-admin", Name: "Admin Plugin", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, Permissions: []string{"plugin:enable", "plugin:disable", "plugin:rollout"}, Entry: pluginsdk.PluginEntry{Module: "plugins/admin", Symbol: "Plugin"}},
 		Handlers: pluginsdk.Handlers{Command: handler},
 	}); err != nil {
@@ -2626,7 +2643,7 @@ func TestRuntimeDispatchCommandRequiresAdminHandlerPluginToDeclareManifestPermis
 			"admin": {Permissions: []string{"plugin:enable"}, PluginScope: []string{"*"}},
 		},
 	}))
-	if err := runtime.RegisterPlugin(pluginsdk.Plugin{
+	if err := registerPluginWithTestSchema(runtime, pluginsdk.Plugin{
 		Manifest: pluginsdk.PluginManifest{ID: "plugin-admin", Name: "Admin Plugin", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, Permissions: []string{"plugin:disable"}, Entry: pluginsdk.PluginEntry{Module: "plugins/admin", Symbol: "Plugin"}},
 		Handlers: pluginsdk.Handlers{Command: handler},
 	}); err != nil {
@@ -2661,7 +2678,7 @@ func TestRuntimeDispatchReplayCommandUsesReplayPermissionAndManifestGate(t *test
 			"replay-role": {Permissions: []string{"plugin:replay"}, PluginScope: []string{"evt-allowed"}},
 		},
 	}))
-	if err := runtime.RegisterPlugin(pluginsdk.Plugin{
+	if err := registerPluginWithTestSchema(runtime, pluginsdk.Plugin{
 		Manifest: pluginsdk.PluginManifest{ID: "plugin-admin", Name: "Admin Plugin", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, Permissions: []string{"plugin:replay"}, Entry: pluginsdk.PluginEntry{Module: "plugins/admin", Symbol: "Plugin"}},
 		Handlers: pluginsdk.Handlers{Command: handler},
 	}); err != nil {
@@ -2681,7 +2698,7 @@ func TestRuntimeDispatchReplayCommandUsesReplayPermissionAndManifestGate(t *test
 			"replay-role": {Permissions: []string{"plugin:replay"}, PluginScope: []string{"evt-allowed"}},
 		},
 	}))
-	if err := runtime2.RegisterPlugin(pluginsdk.Plugin{
+	if err := registerPluginWithTestSchema(runtime2, pluginsdk.Plugin{
 		Manifest: pluginsdk.PluginManifest{ID: "plugin-admin", Name: "Admin Plugin", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, Permissions: []string{"plugin:enable"}, Entry: pluginsdk.PluginEntry{Module: "plugins/admin", Symbol: "Plugin"}},
 		Handlers: pluginsdk.Handlers{Command: &recordingCommandHandler{}},
 	}); err != nil {
@@ -2706,7 +2723,7 @@ func TestRuntimeDispatchJobRequiresDeclaredManifestPermissionWhenPermissionMetad
 			"worker": {Permissions: []string{"job:run"}, PluginScope: []string{"*"}},
 		},
 	}))
-	if err := runtime.RegisterPlugin(pluginsdk.Plugin{
+	if err := registerPluginWithTestSchema(runtime, pluginsdk.Plugin{
 		Manifest: pluginsdk.PluginManifest{ID: "plugin-job", Name: "Job Plugin", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, Entry: pluginsdk.PluginEntry{Module: "plugins/job", Symbol: "Plugin"}},
 		Handlers: pluginsdk.Handlers{Job: handler},
 	}); err != nil {
@@ -2731,7 +2748,7 @@ func TestRuntimeDispatchNonAdminCommandDoesNotRequireManifestPermission(t *testi
 	audits := NewInMemoryAuditLog()
 	runtime := NewInMemoryRuntime(NoopSupervisor{}, DirectPluginHost{})
 	runtime.SetAuditRecorder(audits)
-	if err := runtime.RegisterPlugin(pluginsdk.Plugin{
+	if err := registerPluginWithTestSchema(runtime, pluginsdk.Plugin{
 		Manifest: pluginsdk.PluginManifest{ID: "plugin-generic", Name: "Generic Plugin", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, Entry: pluginsdk.PluginEntry{Module: "plugins/generic", Symbol: "Plugin"}},
 		Handlers: pluginsdk.Handlers{Command: handler},
 	}); err != nil {
@@ -2766,7 +2783,7 @@ func TestRuntimeDispatchesJobViaHost(t *testing.T) {
 		Handlers: pluginsdk.Handlers{Job: handler},
 	}
 
-	if err := runtime.RegisterPlugin(plugin); err != nil {
+	if err := registerPluginWithTestSchema(runtime, plugin); err != nil {
 		t.Fatalf("register plugin: %v", err)
 	}
 
@@ -2802,7 +2819,7 @@ func TestRuntimeDispatchesScheduleViaHost(t *testing.T) {
 		Handlers: pluginsdk.Handlers{Schedule: handler},
 	}
 
-	if err := runtime.RegisterPlugin(plugin); err != nil {
+	if err := registerPluginWithTestSchema(runtime, plugin); err != nil {
 		t.Fatalf("register plugin: %v", err)
 	}
 
@@ -2837,7 +2854,7 @@ func TestRuntimeSkipsPluginsWithoutMatchingHandler(t *testing.T) {
 		Handlers: pluginsdk.Handlers{Event: &recordingEventHandler{}},
 	}
 
-	if err := runtime.RegisterPlugin(plugin); err != nil {
+	if err := registerPluginWithTestSchema(runtime, plugin); err != nil {
 		t.Fatalf("register plugin: %v", err)
 	}
 
@@ -2894,7 +2911,7 @@ func TestRuntimeDispatchQueuedJobUsesPersistedEnvelope(t *testing.T) {
 		},
 		Handlers: pluginsdk.Handlers{Job: handler},
 	}
-	if err := runtime.RegisterPlugin(plugin); err != nil {
+	if err := registerPluginWithTestSchema(runtime, plugin); err != nil {
 		t.Fatalf("register plugin: %v", err)
 	}
 
@@ -3257,7 +3274,7 @@ func TestRuntimeDispatchCapturesFailureWithoutCrashingSuccessfulPlugin(t *testin
 	}
 
 	for _, plugin := range plugins {
-		if err := runtime.RegisterPlugin(plugin); err != nil {
+		if err := registerPluginWithTestSchema(runtime, plugin); err != nil {
 			t.Fatalf("register plugin %s: %v", plugin.Manifest.ID, err)
 		}
 	}

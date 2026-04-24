@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,6 +16,52 @@ import (
 type schedulerRecordingHandler struct {
 	called   bool
 	typeSeen string
+}
+
+type schedulerTestClock struct {
+	mu      sync.RWMutex
+	current time.Time
+}
+
+func newSchedulerTestClock(start time.Time) *schedulerTestClock {
+	return &schedulerTestClock{current: start}
+}
+
+func (c *schedulerTestClock) Now() time.Time {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.current
+}
+
+func (c *schedulerTestClock) Set(now time.Time) {
+	c.mu.Lock()
+	c.current = now
+	c.mu.Unlock()
+}
+
+func (c *schedulerTestClock) Add(delta time.Duration) {
+	c.mu.Lock()
+	c.current = c.current.Add(delta)
+	c.mu.Unlock()
+}
+
+func requireSchedulerEventually(t *testing.T, timeout time.Duration, check func() (bool, string)) {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	for {
+		ok, failure := check()
+		if ok {
+			return
+		}
+		if time.Now().After(deadline) {
+			if strings.TrimSpace(failure) == "" {
+				failure = "expected scheduler condition to be met before timeout"
+			}
+			t.Fatal(failure)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 func (h *schedulerRecordingHandler) OnEvent(event eventmodel.Event, ctx eventmodel.ExecutionContext) error {
@@ -55,7 +102,7 @@ func TestSchedulerOutputCanUseSameDispatchChain(t *testing.T) {
 
 	handler := &schedulerRecordingHandler{}
 	runtime := NewInMemoryRuntime(NoopSupervisor{}, DirectPluginHost{})
-	if err := runtime.RegisterPlugin(pluginsdk.Plugin{
+	if err := registerPluginWithTestSchema(runtime, pluginsdk.Plugin{
 		Manifest: pluginsdk.PluginManifest{
 			ID:         "plugin-scheduler-demo",
 			Name:       "Scheduler Demo Plugin",
@@ -465,10 +512,10 @@ func TestSchedulerStoreRemovesFiredDelayPlanAfterAutoRun(t *testing.T) {
 	store := openTempSQLiteStore(t)
 	defer func() { _ = store.Close() }()
 
+	clock := newSchedulerTestClock(time.Date(2026, 4, 8, 10, 0, 0, 0, time.UTC))
 	scheduler := NewScheduler()
-	start := time.Date(2026, 4, 8, 10, 0, 0, 0, time.UTC)
-	current := start
-	scheduler.now = func() time.Time { return current }
+	start := clock.Now()
+	scheduler.now = clock.Now
 	scheduler.SetStore(store)
 	if err := scheduler.Register(SchedulePlan{ID: "delay-store-auto", Kind: ScheduleKindDelay, Delay: 20 * time.Millisecond, Source: "scheduler", EventType: "schedule.triggered"}); err != nil {
 		t.Fatalf("register delay schedule: %v", err)
@@ -484,7 +531,7 @@ func TestSchedulerStoreRemovesFiredDelayPlanAfterAutoRun(t *testing.T) {
 		t.Fatalf("start scheduler: %v", err)
 	}
 
-	current = start.Add(25 * time.Millisecond)
+	clock.Set(start.Add(25 * time.Millisecond))
 	select {
 	case <-events:
 	case <-time.After(200 * time.Millisecond):
@@ -493,16 +540,12 @@ func TestSchedulerStoreRemovesFiredDelayPlanAfterAutoRun(t *testing.T) {
 
 	fresh := NewScheduler()
 	fresh.SetStore(store)
-	deadline := time.Now().Add(200 * time.Millisecond)
-	for {
+	requireSchedulerEventually(t, 200*time.Millisecond, func() (bool, string) {
 		if _, err := fresh.Plan("delay-store-auto"); err != nil {
-			break
+			return true, ""
 		}
-		if time.Now().After(deadline) {
-			t.Fatal("expected fired delay schedule to be deleted from store")
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+		return false, "expected fired delay schedule to be deleted from store"
+	})
 }
 
 func TestSchedulerStorePersistsClaimBeforeDispatch(t *testing.T) {
@@ -511,10 +554,10 @@ func TestSchedulerStorePersistsClaimBeforeDispatch(t *testing.T) {
 	store := openTempSQLiteStore(t)
 	defer func() { _ = store.Close() }()
 
+	clock := newSchedulerTestClock(time.Date(2026, 4, 8, 10, 10, 0, 0, time.UTC))
 	scheduler := NewScheduler()
-	start := time.Date(2026, 4, 8, 10, 10, 0, 0, time.UTC)
-	current := start
-	scheduler.now = func() time.Time { return current }
+	start := clock.Now()
+	scheduler.now = clock.Now
 	scheduler.SetStore(store)
 	scheduler.SetRuntimeID("runtime-local:test-scheduler")
 	if err := scheduler.Register(SchedulePlan{ID: "delay-store-claim", Kind: ScheduleKindDelay, Delay: 20 * time.Millisecond, Source: "scheduler", EventType: "schedule.triggered"}); err != nil {
@@ -535,7 +578,7 @@ func TestSchedulerStorePersistsClaimBeforeDispatch(t *testing.T) {
 		t.Fatalf("start scheduler: %v", err)
 	}
 
-	current = start.Add(25 * time.Millisecond)
+	clock.Set(start.Add(25 * time.Millisecond))
 	select {
 	case stored := <-claimed:
 		if stored.ClaimOwner != "runtime-local:test-scheduler" || stored.ClaimedAt == nil {
@@ -606,9 +649,9 @@ func TestSchedulerStoreUpdatesCronDueAtAfterAutoRun(t *testing.T) {
 	store := openTempSQLiteStore(t)
 	defer func() { _ = store.Close() }()
 
+	clock := newSchedulerTestClock(time.Date(2026, 4, 8, 11, 0, 0, 0, time.UTC))
 	scheduler := NewScheduler()
-	current := time.Date(2026, 4, 8, 11, 0, 0, 0, time.UTC)
-	scheduler.now = func() time.Time { return current }
+	scheduler.now = clock.Now
 	scheduler.SetStore(store)
 	if err := scheduler.Register(SchedulePlan{ID: "cron-store-auto", Kind: ScheduleKindCron, CronExpr: "* * * * *", Source: "scheduler", EventType: "schedule.triggered"}); err != nil {
 		t.Fatalf("register cron schedule: %v", err)
@@ -628,27 +671,23 @@ func TestSchedulerStoreUpdatesCronDueAtAfterAutoRun(t *testing.T) {
 		t.Fatalf("start scheduler: %v", err)
 	}
 
-	current = current.Add(time.Minute)
+	clock.Add(time.Minute)
 	select {
 	case <-events:
 	case <-time.After(200 * time.Millisecond):
 		t.Fatal("expected persisted cron schedule to auto-fire")
 	}
 
-	deadline := time.Now().Add(200 * time.Millisecond)
-	for {
+	requireSchedulerEventually(t, 200*time.Millisecond, func() (bool, string) {
 		after, err := store.LoadSchedulePlan(context.Background(), "cron-store-auto")
 		if err != nil {
-			t.Fatalf("load persisted cron schedule after run: %v", err)
+			return false, "load persisted cron schedule after run: " + err.Error()
 		}
 		if before.DueAt != nil && after.DueAt != nil && after.DueAt.After(*before.DueAt) {
-			break
+			return true, ""
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("expected persisted cron dueAt to move forward, before=%+v after=%+v", before, after)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+		return false, "expected persisted cron dueAt to move forward after auto-run"
+	})
 	fresh := NewScheduler()
 	fresh.SetStore(store)
 	if _, err := fresh.Plan("cron-store-auto"); err != nil {
@@ -669,10 +708,10 @@ func TestSchedulerStoreRetainsDelayPlanAfterDispatchFailure(t *testing.T) {
 	store := openTempSQLiteStore(t)
 	defer func() { _ = store.Close() }()
 
+	clock := newSchedulerTestClock(time.Date(2026, 4, 8, 11, 30, 0, 0, time.UTC))
 	scheduler := NewScheduler()
-	start := time.Date(2026, 4, 8, 11, 30, 0, 0, time.UTC)
-	current := start
-	scheduler.now = func() time.Time { return current }
+	start := clock.Now()
+	scheduler.now = clock.Now
 	scheduler.SetStore(store)
 	if err := scheduler.Register(SchedulePlan{ID: "delay-store-fail", Kind: ScheduleKindDelay, Delay: 20 * time.Millisecond, Source: "scheduler", EventType: "schedule.triggered"}); err != nil {
 		t.Fatalf("register delay schedule: %v", err)
@@ -680,17 +719,21 @@ func TestSchedulerStoreRetainsDelayPlanAfterDispatchFailure(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	attempts := 0
+	attempted := make(chan struct{}, 1)
 	if err := scheduler.Start(ctx, 5*time.Millisecond, func(event eventmodel.Event) error {
-		attempts++
+		select {
+		case attempted <- struct{}{}:
+		default:
+		}
 		return context.Canceled
 	}); err != nil {
 		t.Fatalf("start scheduler: %v", err)
 	}
 
-	current = start.Add(25 * time.Millisecond)
-	time.Sleep(50 * time.Millisecond)
-	if attempts == 0 {
+	clock.Set(start.Add(25 * time.Millisecond))
+	select {
+	case <-attempted:
+	case <-time.After(200 * time.Millisecond):
 		t.Fatal("expected failed delay schedule dispatch to be attempted")
 	}
 	fresh := NewScheduler()
@@ -867,9 +910,9 @@ func TestSchedulerStoreRetainsCronDueAtAfterDispatchFailure(t *testing.T) {
 	store := openTempSQLiteStore(t)
 	defer func() { _ = store.Close() }()
 
+	clock := newSchedulerTestClock(time.Date(2026, 4, 8, 12, 0, 0, 0, time.UTC))
 	scheduler := NewScheduler()
-	current := time.Date(2026, 4, 8, 12, 0, 0, 0, time.UTC)
-	scheduler.now = func() time.Time { return current }
+	scheduler.now = clock.Now
 	scheduler.SetStore(store)
 	if err := scheduler.Register(SchedulePlan{ID: "cron-store-fail", Kind: ScheduleKindCron, CronExpr: "* * * * *", Source: "scheduler", EventType: "schedule.triggered"}); err != nil {
 		t.Fatalf("register cron schedule: %v", err)
@@ -881,14 +924,23 @@ func TestSchedulerStoreRetainsCronDueAtAfterDispatchFailure(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	attempted := make(chan struct{}, 1)
 	if err := scheduler.Start(ctx, 5*time.Millisecond, func(event eventmodel.Event) error {
+		select {
+		case attempted <- struct{}{}:
+		default:
+		}
 		return context.Canceled
 	}); err != nil {
 		t.Fatalf("start scheduler: %v", err)
 	}
 
-	current = current.Add(3 * time.Minute)
-	time.Sleep(50 * time.Millisecond)
+	clock.Add(3 * time.Minute)
+	select {
+	case <-attempted:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("expected failed cron schedule dispatch to be attempted")
+	}
 	after, err := store.LoadSchedulePlan(context.Background(), "cron-store-fail")
 	if err != nil {
 		t.Fatalf("load persisted cron schedule after failure: %v", err)
@@ -1303,9 +1355,9 @@ func TestSchedulerStartRestoresPersistedDelayPlanAndFires(t *testing.T) {
 		t.Fatalf("save delay schedule plan: %v", err)
 	}
 
-	current := start
+	clock := newSchedulerTestClock(start)
 	scheduler := NewScheduler()
-	scheduler.now = func() time.Time { return current }
+	scheduler.now = clock.Now
 	scheduler.SetStore(store)
 
 	events := make(chan eventmodel.Event, 1)
@@ -1318,7 +1370,7 @@ func TestSchedulerStartRestoresPersistedDelayPlanAndFires(t *testing.T) {
 		t.Fatalf("start restored scheduler: %v", err)
 	}
 
-	current = start.Add(25 * time.Millisecond)
+	clock.Set(start.Add(25 * time.Millisecond))
 	select {
 	case event := <-events:
 		if event.System == nil || event.System.Name != "restore-delay-fire" {

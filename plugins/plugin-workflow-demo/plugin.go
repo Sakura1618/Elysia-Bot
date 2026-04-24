@@ -9,6 +9,11 @@ import (
 	runtimecore "github.com/ohmyopencode/bot-platform/packages/runtime-core"
 )
 
+const (
+	pluginWorkflowDemoPublishSourceURI    = "https://github.com/ohmyopencode/bot-platform/tree/main/plugins/plugin-workflow-demo"
+	pluginWorkflowDemoRuntimeVersionRange = ">=0.1.0 <1.0.0"
+)
+
 type WorkflowService interface {
 	StartOrResume(context.Context, string, string, string, string, runtimecore.Workflow) (runtimecore.WorkflowTransition, error)
 }
@@ -22,13 +27,19 @@ type Plugin struct {
 func New(replyService pluginsdk.ReplyService, workflows WorkflowService) *Plugin {
 	return &Plugin{
 		Manifest: pluginsdk.PluginManifest{
-			ID:         "plugin-workflow-demo",
-			Name:       "Workflow Demo Plugin",
-			Version:    "0.1.0",
-			APIVersion: "v0",
-			Mode:       pluginsdk.ModeSubprocess,
+			SchemaVersion: pluginsdk.SupportedPluginManifestSchemaVersion,
+			ID:            "plugin-workflow-demo",
+			Name:          "Workflow Demo Plugin",
+			Version:       "0.1.0",
+			APIVersion:    "v0",
+			Mode:          pluginsdk.ModeSubprocess,
 			Permissions: []string{
 				"reply:send",
+			},
+			Publish: &pluginsdk.PluginPublish{
+				SourceType:          pluginsdk.PublishSourceTypeGit,
+				SourceURI:           pluginWorkflowDemoPublishSourceURI,
+				RuntimeVersionRange: pluginWorkflowDemoRuntimeVersionRange,
 			},
 			Entry: pluginsdk.PluginEntry{Module: "plugins/plugin-workflow-demo", Symbol: "Plugin"},
 		},

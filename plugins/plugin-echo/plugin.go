@@ -23,30 +23,35 @@ type Plugin struct {
 	ReplyService pluginsdk.ReplyService
 }
 
+func Manifest() pluginsdk.PluginManifest {
+	return pluginsdk.PluginManifest{
+		SchemaVersion: pluginsdk.SupportedPluginManifestSchemaVersion,
+		ID:            "plugin-echo",
+		Name:          "Echo Plugin",
+		Version:       "0.1.0",
+		APIVersion:    "v0",
+		Mode:          pluginsdk.ModeSubprocess,
+		Permissions: []string{
+			"reply:send",
+		},
+		ConfigSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"prefix": map[string]any{"type": "string"},
+			},
+		},
+		Publish: &pluginsdk.PluginPublish{
+			SourceType:          pluginsdk.PublishSourceTypeGit,
+			SourceURI:           pluginEchoPublishSourceURI,
+			RuntimeVersionRange: pluginEchoRuntimeVersionRange,
+		},
+		Entry: pluginsdk.PluginEntry{Module: "plugins/plugin-echo", Symbol: "Plugin"},
+	}
+}
+
 func New(replyService pluginsdk.ReplyService, config Config) Plugin {
 	return Plugin{
-		Manifest: pluginsdk.PluginManifest{
-			ID:         "plugin-echo",
-			Name:       "Echo Plugin",
-			Version:    "0.1.0",
-			APIVersion: "v0",
-			Mode:       pluginsdk.ModeSubprocess,
-			Permissions: []string{
-				"reply:send",
-			},
-			ConfigSchema: map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"prefix": map[string]any{"type": "string"},
-				},
-			},
-			Publish: &pluginsdk.PluginPublish{
-				SourceType:          pluginsdk.PublishSourceTypeGit,
-				SourceURI:           pluginEchoPublishSourceURI,
-				RuntimeVersionRange: pluginEchoRuntimeVersionRange,
-			},
-			Entry: pluginsdk.PluginEntry{Module: "plugins/plugin-echo", Symbol: "Plugin"},
-		},
+		Manifest:     Manifest(),
 		Config:       config,
 		ReplyService: replyService,
 	}

@@ -172,12 +172,13 @@ func TestFaultInjectionPluginCrashDoesNotKillRuntime(t *testing.T) {
 	runtime := runtimecore.NewInMemoryRuntime(runtimecore.NoopSupervisor{}, failingHost{})
 	if err := runtime.RegisterPlugin(pluginsdk.Plugin{
 		Manifest: pluginsdk.PluginManifest{
-			ID:         "plugin-crash",
-			Name:       "Crash Plugin",
-			Version:    "0.1.0",
-			APIVersion: "v0",
-			Mode:       pluginsdk.ModeSubprocess,
-			Entry:      pluginsdk.PluginEntry{Module: "plugins/crash", Symbol: "Plugin"},
+			SchemaVersion: pluginsdk.SupportedPluginManifestSchemaVersion,
+			ID:            "plugin-crash",
+			Name:          "Crash Plugin",
+			Version:       "0.1.0",
+			APIVersion:    "v0",
+			Mode:          pluginsdk.ModeSubprocess,
+			Entry:         pluginsdk.PluginEntry{Module: "plugins/crash", Symbol: "Plugin"},
 		},
 		Handlers: pluginsdk.Handlers{Event: noopEventHandler{}},
 	}); err != nil {

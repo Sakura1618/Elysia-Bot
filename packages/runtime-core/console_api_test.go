@@ -31,7 +31,7 @@ func TestConsoleAPIExposesReadOnlySystemState(t *testing.T) {
 	config := Config{Runtime: RuntimeConfig{Environment: "development", LogLevel: "debug", HTTPPort: 8080}}
 	logs := []string{"runtime started", "plugin-echo ready"}
 
-	if err := runtime.RegisterPlugin(pluginsdk.Plugin{
+	if err := registerPluginWithTestSchema(runtime, pluginsdk.Plugin{
 		Manifest: pluginsdk.PluginManifest{
 			ID:         "plugin-echo",
 			Name:       "Echo Plugin",
@@ -276,7 +276,7 @@ func TestConsoleAPIPluginStatusFallsBackToManifestOnlyEvidence(t *testing.T) {
 	t.Parallel()
 
 	runtime := NewInMemoryRuntime(NoopSupervisor{}, DirectPluginHost{})
-	if err := runtime.RegisterPlugin(pluginsdk.Plugin{
+	if err := registerPluginWithTestSchema(runtime, pluginsdk.Plugin{
 		Manifest: pluginsdk.PluginManifest{
 			ID:         "plugin-admin",
 			Name:       "Admin Plugin",
@@ -320,7 +320,7 @@ func TestConsoleAPIExposesPersistedPluginEnabledOverlay(t *testing.T) {
 		Mode:       pluginsdk.ModeSubprocess,
 		Entry:      pluginsdk.PluginEntry{Module: "plugins/plugin-echo", Symbol: "Plugin"},
 	}
-	if err := runtime.RegisterPlugin(pluginsdk.Plugin{Manifest: manifest, Handlers: pluginsdk.Handlers{Event: noopConsoleHandler{}}}); err != nil {
+	if err := registerPluginWithTestSchema(runtime, pluginsdk.Plugin{Manifest: manifest, Handlers: pluginsdk.Handlers{Event: noopConsoleHandler{}}}); err != nil {
 		t.Fatalf("register plugin: %v", err)
 	}
 	if err := store.SavePluginManifest(context.Background(), manifest); err != nil {
@@ -431,7 +431,7 @@ func TestConsoleAPIExposesPersistedPluginConfigStateForPluginEcho(t *testing.T) 
 		Mode:       pluginsdk.ModeSubprocess,
 		Entry:      pluginsdk.PluginEntry{Module: "plugins/plugin-echo", Symbol: "Plugin"},
 	}
-	if err := runtime.RegisterPlugin(pluginsdk.Plugin{Manifest: manifest, Handlers: pluginsdk.Handlers{Event: noopConsoleHandler{}}}); err != nil {
+	if err := registerPluginWithTestSchema(runtime, pluginsdk.Plugin{Manifest: manifest, Handlers: pluginsdk.Handlers{Event: noopConsoleHandler{}}}); err != nil {
 		t.Fatalf("register plugin: %v", err)
 	}
 	if err := store.SavePluginConfig(context.Background(), manifest.ID, json.RawMessage(`{"prefix":"persisted: "}`)); err != nil {
@@ -480,7 +480,7 @@ func TestConsoleAPIExposesBoundPluginConfigCapabilityWithoutPersistedState(t *te
 		Mode:       pluginsdk.ModeSubprocess,
 		Entry:      pluginsdk.PluginEntry{Module: "plugins/plugin-echo", Symbol: "Plugin"},
 	}
-	if err := runtime.RegisterPlugin(pluginsdk.Plugin{Manifest: manifest, Handlers: pluginsdk.Handlers{Event: noopConsoleHandler{}}}); err != nil {
+	if err := registerPluginWithTestSchema(runtime, pluginsdk.Plugin{Manifest: manifest, Handlers: pluginsdk.Handlers{Event: noopConsoleHandler{}}}); err != nil {
 		t.Fatalf("register plugin: %v", err)
 	}
 
@@ -518,7 +518,7 @@ func TestConsoleAPIUnboundPluginConfigRowDoesNotExposeConfigCapability(t *testin
 		Mode:       pluginsdk.ModeSubprocess,
 		Entry:      pluginsdk.PluginEntry{Module: "plugins/plugin-admin", Symbol: "Plugin"},
 	}
-	if err := runtime.RegisterPlugin(pluginsdk.Plugin{Manifest: manifest, Handlers: pluginsdk.Handlers{Event: noopConsoleHandler{}}}); err != nil {
+	if err := registerPluginWithTestSchema(runtime, pluginsdk.Plugin{Manifest: manifest, Handlers: pluginsdk.Handlers{Event: noopConsoleHandler{}}}); err != nil {
 		t.Fatalf("register plugin: %v", err)
 	}
 	if err := store.SavePluginConfig(context.Background(), manifest.ID, json.RawMessage(`{"ignored":true}`)); err != nil {
@@ -547,7 +547,7 @@ func TestConsoleAPIPluginStatusClassifiesInstanceConfigRejectBeforeLaunch(t *tes
 	t.Parallel()
 
 	runtime := NewInMemoryRuntime(NoopSupervisor{}, DirectPluginHost{})
-	if err := runtime.RegisterPlugin(pluginsdk.Plugin{
+	if err := registerPluginWithTestSchema(runtime, pluginsdk.Plugin{
 		Manifest: pluginsdk.PluginManifest{
 			ID:         "plugin-instance-config-reject",
 			Name:       "Instance Config Reject Plugin",
@@ -584,7 +584,7 @@ func TestConsoleAPIPluginStatusMarksRecoveredAfterFailure(t *testing.T) {
 	t.Parallel()
 
 	runtime := NewInMemoryRuntime(NoopSupervisor{}, DirectPluginHost{})
-	if err := runtime.RegisterPlugin(pluginsdk.Plugin{
+	if err := registerPluginWithTestSchema(runtime, pluginsdk.Plugin{
 		Manifest: pluginsdk.PluginManifest{
 			ID:         "plugin-recover",
 			Name:       "Recover Plugin",
@@ -619,7 +619,7 @@ func TestConsoleAPIPluginStatusDoesNotInventRecoveryFactsForAlwaysSuccessfulHist
 	t.Parallel()
 
 	runtime := NewInMemoryRuntime(NoopSupervisor{}, DirectPluginHost{})
-	if err := runtime.RegisterPlugin(pluginsdk.Plugin{
+	if err := registerPluginWithTestSchema(runtime, pluginsdk.Plugin{
 		Manifest: pluginsdk.PluginManifest{
 			ID:         "plugin-stable",
 			Name:       "Stable Plugin",
@@ -650,7 +650,7 @@ func TestConsoleAPIPluginStatusUsesPersistedSnapshotWhenNoLiveDispatchExists(t *
 	store := openTempSQLiteStore(t)
 	defer func() { _ = store.Close() }()
 	runtime := NewInMemoryRuntime(NoopSupervisor{}, DirectPluginHost{})
-	if err := runtime.RegisterPlugin(pluginsdk.Plugin{
+	if err := registerPluginWithTestSchema(runtime, pluginsdk.Plugin{
 		Manifest: pluginsdk.PluginManifest{
 			ID:         "plugin-persisted",
 			Name:       "Persisted Plugin",
@@ -747,7 +747,7 @@ func TestConsoleAPIPluginStatusLiveOverlayWinsOverPersistedSnapshot(t *testing.T
 	store := openTempSQLiteStore(t)
 	defer func() { _ = store.Close() }()
 	runtime := NewInMemoryRuntime(NoopSupervisor{}, DirectPluginHost{})
-	if err := runtime.RegisterPlugin(pluginsdk.Plugin{
+	if err := registerPluginWithTestSchema(runtime, pluginsdk.Plugin{
 		Manifest: pluginsdk.PluginManifest{
 			ID:         "plugin-overlay",
 			Name:       "Overlay Plugin",
@@ -818,7 +818,7 @@ func TestConsoleAPIObservabilityExposesMinimalAlertabilityBaseline(t *testing.T)
 	t.Parallel()
 
 	runtime := NewInMemoryRuntime(NoopSupervisor{}, DirectPluginHost{})
-	if err := runtime.RegisterPlugin(pluginsdk.Plugin{
+	if err := registerPluginWithTestSchema(runtime, pluginsdk.Plugin{
 		Manifest: pluginsdk.PluginManifest{
 			ID:         "plugin-alertability",
 			Name:       "Alertability Plugin",
@@ -1059,20 +1059,84 @@ func TestConsoleAPIExposesPersistedReplayAndRolloutOperations(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("save rollout operation record: %v", err)
 	}
+	if err := store.SaveRolloutHead(context.Background(), RolloutHeadState{
+		PluginID: "plugin-echo",
+		Stable: RolloutSnapshotState{
+			Version:    "0.1.0",
+			APIVersion: "v0",
+			Mode:       pluginsdk.ModeSubprocess,
+		},
+		Active: RolloutSnapshotState{
+			Version:    "0.2.0-candidate",
+			APIVersion: "v0",
+			Mode:       pluginsdk.ModeSubprocess,
+		},
+		Candidate: &RolloutSnapshotState{
+			Version:    "0.2.0-candidate",
+			APIVersion: "v0",
+			Mode:       pluginsdk.ModeSubprocess,
+		},
+		Phase:           string(pluginsdk.RolloutPhaseCanary),
+		Status:          string(pluginsdk.RolloutStatusCanarying),
+		LastOperationID: "rollout-op-console-1",
+		UpdatedAt:       rolloutAt,
+	}); err != nil {
+		t.Fatalf("save rollout head: %v", err)
+	}
 
 	api := NewConsoleAPI(nil, nil, Config{}, []string{"runtime started"}, NewInMemoryAuditLog())
 	api.SetReplayOperationReader(NewSQLiteConsoleReplayOperationReader(store))
 	api.SetRolloutOperationReader(NewSQLiteConsoleRolloutOperationReader(store))
-	api.SetMeta(map[string]any{"replay_policy": ReplayPolicy(), "secrets_policy": SecretPolicy(), "rollout_policy": RolloutPolicy(), "replay_record_read_model": "sqlite-replay-operation-records", "rollout_record_read_model": "sqlite-rollout-operation-records"})
+	api.SetRolloutHeadReader(NewSQLiteConsoleRolloutHeadReader(store))
+	api.SetMeta(map[string]any{"replay_policy": ReplayPolicy(), "secrets_policy": SecretPolicy(), "rollout_policy": RolloutPolicy(), "replay_record_read_model": "sqlite-replay-operation-records", "rollout_record_read_model": "sqlite-rollout-operation-records", "rollout_head_read_model": "sqlite-rollout-heads"})
 
 	raw, err := api.RenderJSON()
 	if err != nil {
 		t.Fatalf("render json: %v", err)
 	}
-	for _, expected := range []string{`"replayOps": [`, `"replayId": "replay-op-console-1"`, `"stateSource": "sqlite-replay-operation-records"`, `"persisted": true`, `"sourceEventId": "evt-source-console-1"`, `"reason": "replay_dispatched"`, `"rolloutOps": [`, `"operationId": "rollout-op-console-1"`, `"pluginId": "plugin-echo"`, `"action": "prepare"`, `"currentVersion": "0.1.0"`, `"candidateVersion": "0.2.0-candidate"`, `"stateSource": "sqlite-rollout-operation-records"`, `"replay_policy"`, `"secrets_policy"`, `"rollout_policy"`} {
+	for _, expected := range []string{`"replayOps": [`, `"replayId": "replay-op-console-1"`, `"stateSource": "sqlite-replay-operation-records"`, `"persisted": true`, `"sourceEventId": "evt-source-console-1"`, `"reason": "replay_dispatched"`, `"rolloutOps": [`, `"operationId": "rollout-op-console-1"`, `"pluginId": "plugin-echo"`, `"action": "prepare"`, `"currentVersion": "0.1.0"`, `"candidateVersion": "0.2.0-candidate"`, `"stateSource": "sqlite-rollout-operation-records"`, `"rolloutHeads": [`, `"pluginId": "plugin-echo"`, `"phase": "canary"`, `"status": "canarying"`, `"stable": {`, `"active": {`, `"candidate": {`, `"lastOperationId": "rollout-op-console-1"`, `"stateSource": "sqlite-rollout-heads"`, `"rollout_head_read_model"`, `"replay_policy"`, `"secrets_policy"`, `"rollout_policy"`} {
 		if !strings.Contains(raw, expected) {
 			t.Fatalf("expected console JSON to include %q, got %s", expected, raw)
 		}
+	}
+}
+
+func TestConsoleAPIRolloutHeadsExposePersistedCurrentTruth(t *testing.T) {
+	t.Parallel()
+
+	store := openTempSQLiteStore(t)
+	defer func() { _ = store.Close() }()
+	updatedAt := time.Date(2026, 4, 24, 11, 0, 0, 0, time.UTC)
+	if err := store.SaveRolloutHead(context.Background(), RolloutHeadState{
+		PluginID:        "plugin-echo",
+		Stable:          RolloutSnapshotState{Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess},
+		Active:          RolloutSnapshotState{Version: "0.2.0-candidate", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess},
+		Candidate:       &RolloutSnapshotState{Version: "0.2.0-candidate", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess},
+		Phase:           string(pluginsdk.RolloutPhaseCanary),
+		Status:          string(pluginsdk.RolloutStatusCanarying),
+		Reason:          "",
+		LastOperationID: "rollout-op-canary-1",
+		UpdatedAt:       updatedAt,
+	}); err != nil {
+		t.Fatalf("save rollout head: %v", err)
+	}
+
+	api := NewConsoleAPI(nil, nil, Config{}, nil, NewInMemoryAuditLog())
+	api.SetRolloutHeadReader(NewSQLiteConsoleRolloutHeadReader(store))
+
+	heads, err := api.RolloutHeads()
+	if err != nil {
+		t.Fatalf("load rollout heads: %v", err)
+	}
+	if len(heads) != 1 {
+		t.Fatalf("expected one rollout head, got %+v", heads)
+	}
+	head := heads[0]
+	if head.PluginID != "plugin-echo" || head.Phase != "canary" || head.Status != "canarying" || head.Stable.Version != "0.1.0" || head.Active.Version != "0.2.0-candidate" || head.Candidate == nil || head.Candidate.Version != "0.2.0-candidate" || head.LastOperationID != "rollout-op-canary-1" || head.StateSource != "sqlite-rollout-heads" || !head.Persisted {
+		t.Fatalf("unexpected rollout head %+v", head)
+	}
+	if !strings.Contains(head.Summary, "rollout head canary canarying for plugin-echo") || !strings.Contains(head.Summary, "stable=0.1.0 active=0.2.0-candidate") || !strings.Contains(head.Summary, "candidate=0.2.0-candidate") || !strings.Contains(head.Summary, "via sqlite-rollout-heads") {
+		t.Fatalf("expected rollout head summary to describe current truth, got %+v", head)
 	}
 }
 
@@ -1335,7 +1399,7 @@ func TestConsoleAPIServesFilteredPluginOverHTTP(t *testing.T) {
 			Entry:      pluginsdk.PluginEntry{Module: "plugins/plugin-admin", Symbol: "Plugin"},
 		},
 	} {
-		if err := runtime.RegisterPlugin(pluginsdk.Plugin{
+		if err := registerPluginWithTestSchema(runtime, pluginsdk.Plugin{
 			Manifest: manifest,
 			Handlers: pluginsdk.Handlers{Event: noopConsoleHandler{}},
 		}); err != nil {
@@ -1387,7 +1451,7 @@ func TestConsoleAPITreatsWhitespaceOnlyPluginQueryAsUnfiltered(t *testing.T) {
 			Entry:      pluginsdk.PluginEntry{Module: "plugins/plugin-admin", Symbol: "Plugin"},
 		},
 	} {
-		if err := runtime.RegisterPlugin(pluginsdk.Plugin{
+		if err := registerPluginWithTestSchema(runtime, pluginsdk.Plugin{
 			Manifest: manifest,
 			Handlers: pluginsdk.Handlers{Event: noopConsoleHandler{}},
 		}); err != nil {
@@ -1415,7 +1479,7 @@ func TestConsoleAPIUnknownPluginQueryReturnsEmptyPluginList(t *testing.T) {
 	t.Parallel()
 
 	runtime := NewInMemoryRuntime(NoopSupervisor{}, DirectPluginHost{})
-	if err := runtime.RegisterPlugin(pluginsdk.Plugin{
+	if err := registerPluginWithTestSchema(runtime, pluginsdk.Plugin{
 		Manifest: pluginsdk.PluginManifest{
 			ID:         "plugin-echo",
 			Name:       "Echo Plugin",

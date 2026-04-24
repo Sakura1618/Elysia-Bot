@@ -244,8 +244,14 @@ func ScaffoldRepoPlugin(options ScaffoldOptions) (string, error) {
 	}()
 
 	replacements := scaffoldReplacements(pluginID, pluginName)
-	for _, fileName := range []string{"plugin.go", "plugin_test.go", "manifest_test.go", "go.mod"} {
-		if err := rewriteFile(filepath.Join(targetDir, fileName), replacements); err != nil {
+	rewriteTargets, err := filepath.Glob(filepath.Join(targetDir, "*.go"))
+	if err != nil {
+		return "", fmt.Errorf("glob scaffolded Go files: %w", err)
+	}
+	sort.Strings(rewriteTargets)
+	rewriteTargets = append(rewriteTargets, filepath.Join(targetDir, "go.mod"))
+	for _, rewriteTarget := range rewriteTargets {
+		if err := rewriteFile(rewriteTarget, replacements); err != nil {
 			return "", err
 		}
 	}

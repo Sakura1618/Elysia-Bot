@@ -107,10 +107,7 @@ func TestSubprocessPluginHostSmokeWithBuiltFixtureExecutable(t *testing.T) {
 	if strings.Count(stdout, "handshake-ready") < 2 {
 		t.Fatalf("expected built fixture crash recovery to trigger a second handshake, got %s", stdout)
 	}
-	stderr := strings.Join(host.StderrLines(), "\n")
-	if !strings.Contains(stderr, "stderr-online") {
-		t.Fatalf("expected built fixture stderr capture, got %s", stderr)
-	}
+	stderr := assertSubprocessHostEventuallyCapturesStderr(t, host, "expected built fixture stderr capture")
 	t.Logf("built_fixture_stdout=%s", stdout)
 	t.Logf("built_fixture_stderr=%s", stderr)
 }
@@ -244,6 +241,115 @@ func TestSubprocessPluginHostHandlesWorkflowStartOrResumeCallbackBeforeTerminalE
 	}
 }
 
+func TestSubprocessPluginHostHandlesAdminRequestCallbackBeforeTerminalCommandResponse(t *testing.T) {
+	t.Parallel()
+
+	host := NewSubprocessPluginHost(testPluginProcessFactory(t, "admin-request-callback"))
+	t.Cleanup(func() { shutdownSubprocessHostForTest(host) })
+	var got SubprocessAdminRequest
+	host.SetAdminRequestCallback(func(ctx context.Context, request SubprocessAdminRequest) (SubprocessAdminResult, error) {
+		got = request
+		decision := &pluginsdk.AuthorizationDecision{Allowed: true, Permission: request.Permission}
+		record := &pluginsdk.RolloutRecord{PluginID: request.TargetPluginID, Phase: pluginsdk.RolloutPhaseCandidate, Status: pluginsdk.RolloutStatusPrepared}
+		return SubprocessAdminResult{Authorization: decision, RolloutRecord: record}, nil
+	})
+	plugin := pluginsdk.Plugin{Manifest: pluginsdk.PluginManifest{ID: "plugin-admin", Name: "Admin Plugin", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, Entry: pluginsdk.PluginEntry{Module: "plugins/plugin-admin", Symbol: "Plugin"}}}
+
+	if err := host.DispatchCommand(context.Background(), plugin, eventmodel.CommandInvocation{Name: "admin", Raw: "/admin prepare plugin-echo", Metadata: map[string]any{"actor": "admin-user"}}, eventmodel.ExecutionContext{TraceID: "trace-admin-request", EventID: "evt-admin-request", RunID: "run-admin-request", CorrelationID: "corr-admin-request"}); err != nil {
+		t.Fatalf("dispatch command with admin_request callback: %v", err)
+	}
+	if got.Action != "prepare_rollout" || got.TargetPluginID != "plugin-echo" || got.Permission != "plugin:rollout" || got.Actor != "admin-user" || got.Target != "plugin-echo" || got.TargetKind != pluginsdk.AuthorizationTargetPlugin {
+		t.Fatalf("unexpected admin callback request %+v", got)
+	}
+	if got.AuditEntry == nil || got.AuditEntry.Action != "plugin.rollout" || got.AuditEntry.Target != "plugin-echo" || got.AuditEntry.TraceID != "trace-admin-request" || got.AuditEntry.EventID != "evt-admin-request" || got.AuditEntry.RunID != "run-admin-request" || got.AuditEntry.CorrelationID != "corr-admin-request" || got.AuditEntry.PluginID != "plugin-admin" {
+		t.Fatalf("unexpected admin callback audit entry %+v", got.AuditEntry)
+	}
+	stdout := strings.Join(host.StdoutLines(), "\n")
+	for _, marker := range []string{"handshake-ready", `"callback":"admin_request"`, `"target_plugin_id":"plugin-echo"`, "command-ok"} {
+		if !strings.Contains(stdout, marker) {
+			t.Fatalf("expected stdout to include %q, got %s", marker, stdout)
+		}
+	}
+}
+
+func TestSubprocessPluginHostHandlesCanaryAdminRequestCallback(t *testing.T) {
+	t.Parallel()
+
+	host := NewSubprocessPluginHost(testPluginProcessFactory(t, "admin-request-callback"))
+	t.Cleanup(func() { shutdownSubprocessHostForTest(host) })
+	var got SubprocessAdminRequest
+	host.SetAdminRequestCallback(func(ctx context.Context, request SubprocessAdminRequest) (SubprocessAdminResult, error) {
+		got = request
+		decision := &pluginsdk.AuthorizationDecision{Allowed: true, Permission: request.Permission}
+		record := &pluginsdk.RolloutRecord{PluginID: request.TargetPluginID, Phase: pluginsdk.RolloutPhaseCanary, Status: pluginsdk.RolloutStatusCanarying}
+		return SubprocessAdminResult{Authorization: decision, RolloutRecord: record}, nil
+	})
+	plugin := pluginsdk.Plugin{Manifest: pluginsdk.PluginManifest{ID: "plugin-admin", Name: "Admin Plugin", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, Entry: pluginsdk.PluginEntry{Module: "plugins/plugin-admin", Symbol: "Plugin"}}}
+
+	if err := host.DispatchCommand(context.Background(), plugin, eventmodel.CommandInvocation{Name: "admin", Raw: "/admin canary plugin-echo", Metadata: map[string]any{"actor": "admin-user"}}, eventmodel.ExecutionContext{TraceID: "trace-admin-canary", EventID: "evt-admin-canary", RunID: "run-admin-canary", CorrelationID: "corr-admin-canary"}); err != nil {
+		t.Fatalf("dispatch canary command with admin_request callback: %v", err)
+	}
+	if got.Action != "canary_rollout" || got.TargetPluginID != "plugin-echo" || got.Permission != "plugin:rollout" || got.Actor != "admin-user" || got.Target != "plugin-echo" || got.TargetKind != pluginsdk.AuthorizationTargetPlugin {
+		t.Fatalf("unexpected canary admin callback request %+v", got)
+	}
+}
+
+func TestSubprocessPluginHostHandlesAIChatCallbacksBeforeTerminalJobResponse(t *testing.T) {
+	t.Parallel()
+
+	host := NewSubprocessPluginHost(testPluginProcessFactory(t, "ai-chat-callbacks"))
+	t.Cleanup(func() { shutdownSubprocessHostForTest(host) })
+	var (
+		gotQueue    []SubprocessAIChatQueueRequest
+		gotSession  []SubprocessAIChatSessionRequest
+		gotProvider []SubprocessAIChatProviderRequest
+	)
+	host.SetAIChatQueueCallback(func(ctx context.Context, request SubprocessAIChatQueueRequest) (SubprocessAIChatQueueResult, error) {
+		gotQueue = append(gotQueue, request)
+		switch request.Action {
+		case "inspect":
+			job := pluginsdk.NewJob(request.JobID, "ai.chat", 1, 30*time.Second)
+			job.Status = pluginsdk.JobStatusRunning
+			job.Payload = map[string]any{"prompt": "hello from queue"}
+			return SubprocessAIChatQueueResult{Job: &job}, nil
+		case "complete":
+			job := pluginsdk.NewJob(request.JobID, "ai.chat", 1, 30*time.Second)
+			job.Status = pluginsdk.JobStatusDone
+			return SubprocessAIChatQueueResult{Job: &job}, nil
+		default:
+			return SubprocessAIChatQueueResult{}, fmt.Errorf("unexpected queue action %q", request.Action)
+		}
+	})
+	host.SetAIChatSessionCallback(func(ctx context.Context, request SubprocessAIChatSessionRequest) error {
+		gotSession = append(gotSession, request)
+		return nil
+	})
+	host.SetAIChatProviderCallback(func(ctx context.Context, request SubprocessAIChatProviderRequest) (SubprocessAIChatProviderResult, error) {
+		gotProvider = append(gotProvider, request)
+		return SubprocessAIChatProviderResult{Text: "provider: " + request.Prompt}, nil
+	})
+	plugin := pluginsdk.Plugin{Manifest: pluginsdk.PluginManifest{ID: "plugin-ai-chat", Name: "AI Chat Plugin", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, Entry: pluginsdk.PluginEntry{Module: "plugins/plugin-ai-chat", Symbol: "Plugin"}}}
+
+	if err := host.DispatchJob(context.Background(), plugin, pluginsdk.JobInvocation{ID: "job-ai-chat-callback", Type: "ai.chat"}, eventmodel.ExecutionContext{TraceID: "trace-ai-chat-callback", EventID: "evt-ai-chat-callback", RunID: "run-ai-chat-callback", CorrelationID: "corr-ai-chat-callback", Reply: &eventmodel.ReplyHandle{Capability: "onebot.reply", TargetID: "group-42"}}); err != nil {
+		t.Fatalf("dispatch job with ai_chat callbacks: %v", err)
+	}
+	if len(gotQueue) != 2 || gotQueue[0].Action != "inspect" || gotQueue[0].JobID != "job-ai-chat-callback" || gotQueue[1].Action != "complete" || gotQueue[1].JobID != "job-ai-chat-callback" {
+		t.Fatalf("unexpected ai_chat_queue callbacks %+v", gotQueue)
+	}
+	if len(gotSession) != 1 || gotSession[0].Session.SessionID != "session-user-1" || gotSession[0].Session.PluginID != "plugin-ai-chat" {
+		t.Fatalf("unexpected ai_chat_session callbacks %+v", gotSession)
+	}
+	if len(gotProvider) != 1 || gotProvider[0].Prompt != "hello from queue" {
+		t.Fatalf("unexpected ai_chat_provider callbacks %+v", gotProvider)
+	}
+	stdout := strings.Join(host.StdoutLines(), "\n")
+	for _, marker := range []string{"handshake-ready", `"callback":"ai_chat_queue"`, `"callback":"ai_chat_session"`, `"callback":"ai_chat_provider"`, "job-ok"} {
+		if !strings.Contains(stdout, marker) {
+			t.Fatalf("expected stdout to include %q, got %s", marker, stdout)
+		}
+	}
+}
+
 func TestSubprocessPluginHostFailsClosedWhenCommandFactoryReturnsLaunchGuardError(t *testing.T) {
 	t.Parallel()
 
@@ -348,7 +454,7 @@ func TestSubprocessPluginHostRejectsIncompatibleManifestBeforeProcessLaunch(t *t
 		expectedEnumValue       string
 	}{
 		{
-			plugin:                  pluginsdk.Plugin{Manifest: pluginsdk.PluginManifest{ID: "plugin-inproc", Name: "Inproc", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeInProc, Entry: pluginsdk.PluginEntry{Module: "plugins/inproc", Symbol: "Plugin"}}},
+			plugin:                  pluginsdk.Plugin{Manifest: pluginsdk.PluginManifest{SchemaVersion: pluginsdk.SupportedPluginManifestSchemaVersion, ID: "plugin-inproc", Name: "Inproc", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeInProc, Entry: pluginsdk.PluginEntry{Module: "plugins/inproc", Symbol: "Plugin"}}},
 			expectedReason:          "manifest_mode_mismatch",
 			expectedRule:            "mode",
 			expectedManifestMode:    pluginsdk.ModeInProc,
@@ -357,7 +463,7 @@ func TestSubprocessPluginHostRejectsIncompatibleManifestBeforeProcessLaunch(t *t
 			expectedModulePresent:   true,
 		},
 		{
-			plugin:                  pluginsdk.Plugin{Manifest: pluginsdk.PluginManifest{ID: "plugin-api", Name: "API", Version: "0.1.0", APIVersion: "v9", Mode: pluginsdk.ModeSubprocess, Entry: pluginsdk.PluginEntry{Module: "plugins/api", Symbol: "Plugin"}}},
+			plugin:                  pluginsdk.Plugin{Manifest: pluginsdk.PluginManifest{SchemaVersion: pluginsdk.SupportedPluginManifestSchemaVersion, ID: "plugin-api", Name: "API", Version: "0.1.0", APIVersion: "v9", Mode: pluginsdk.ModeSubprocess, Entry: pluginsdk.PluginEntry{Module: "plugins/api", Symbol: "Plugin"}}},
 			expectedReason:          "manifest_unsupported_api_version",
 			expectedRule:            "api_version",
 			expectedManifestMode:    pluginsdk.ModeSubprocess,
@@ -376,7 +482,7 @@ func TestSubprocessPluginHostRejectsIncompatibleManifestBeforeProcessLaunch(t *t
 			expectedErrorContains:   `current runtime version "0.1.0" does not satisfy required runtimeVersionRange ">=0.2.0 <1.0.0"`,
 		},
 		{
-			plugin:                  pluginsdk.Plugin{Manifest: pluginsdk.PluginManifest{ID: "plugin-entry", Name: "Entry", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, Entry: pluginsdk.PluginEntry{Symbol: "Plugin"}}},
+			plugin:                  pluginsdk.Plugin{Manifest: pluginsdk.PluginManifest{SchemaVersion: pluginsdk.SupportedPluginManifestSchemaVersion, ID: "plugin-entry", Name: "Entry", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, Entry: pluginsdk.PluginEntry{Symbol: "Plugin"}}},
 			expectedReason:          "manifest_missing_entry_target",
 			expectedRule:            "entry_target",
 			expectedManifestMode:    pluginsdk.ModeSubprocess,
@@ -385,7 +491,7 @@ func TestSubprocessPluginHostRejectsIncompatibleManifestBeforeProcessLaunch(t *t
 			expectedModulePresent:   false,
 		},
 		{
-			plugin:                  pluginsdk.Plugin{Manifest: pluginsdk.PluginManifest{ID: "plugin-config", Name: "Config", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, ConfigSchema: map[string]any{"type": "string"}, Entry: pluginsdk.PluginEntry{Module: "plugins/config", Symbol: "Plugin"}}},
+			plugin:                  pluginsdk.Plugin{Manifest: pluginsdk.PluginManifest{SchemaVersion: pluginsdk.SupportedPluginManifestSchemaVersion, ID: "plugin-config", Name: "Config", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, ConfigSchema: map[string]any{"type": "string"}, Entry: pluginsdk.PluginEntry{Module: "plugins/config", Symbol: "Plugin"}}},
 			expectedReason:          "manifest_invalid_config_schema",
 			expectedRule:            "config_schema",
 			expectedManifestMode:    pluginsdk.ModeSubprocess,
@@ -394,7 +500,7 @@ func TestSubprocessPluginHostRejectsIncompatibleManifestBeforeProcessLaunch(t *t
 			expectedModulePresent:   true,
 		},
 		{
-			plugin:                  pluginsdk.Plugin{Manifest: pluginsdk.PluginManifest{ID: "plugin-required", Name: "Required", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, ConfigSchema: map[string]any{"type": "object", "required": []any{"token"}, "properties": map[string]any{}}, Entry: pluginsdk.PluginEntry{Module: "plugins/required", Symbol: "Plugin"}}},
+			plugin:                  pluginsdk.Plugin{Manifest: pluginsdk.PluginManifest{SchemaVersion: pluginsdk.SupportedPluginManifestSchemaVersion, ID: "plugin-required", Name: "Required", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, ConfigSchema: map[string]any{"type": "object", "required": []any{"token"}, "properties": map[string]any{}}, Entry: pluginsdk.PluginEntry{Module: "plugins/required", Symbol: "Plugin"}}},
 			expectedReason:          "manifest_missing_required_config",
 			expectedRule:            "config_required",
 			expectedManifestMode:    pluginsdk.ModeSubprocess,
@@ -404,11 +510,12 @@ func TestSubprocessPluginHostRejectsIncompatibleManifestBeforeProcessLaunch(t *t
 		},
 		{
 			plugin: pluginsdk.Plugin{Manifest: pluginsdk.PluginManifest{
-				ID:         "plugin-required-invalid-container",
-				Name:       "RequiredInvalidContainer",
-				Version:    "0.1.0",
-				APIVersion: "v0",
-				Mode:       pluginsdk.ModeSubprocess,
+				SchemaVersion: pluginsdk.SupportedPluginManifestSchemaVersion,
+				ID:            "plugin-required-invalid-container",
+				Name:          "RequiredInvalidContainer",
+				Version:       "0.1.0",
+				APIVersion:    "v0",
+				Mode:          pluginsdk.ModeSubprocess,
 				ConfigSchema: map[string]any{
 					"type":     "object",
 					"required": true,
@@ -428,11 +535,12 @@ func TestSubprocessPluginHostRejectsIncompatibleManifestBeforeProcessLaunch(t *t
 		},
 		{
 			plugin: pluginsdk.Plugin{Manifest: pluginsdk.PluginManifest{
-				ID:         "plugin-required-invalid-entry",
-				Name:       "RequiredInvalidEntry",
-				Version:    "0.1.0",
-				APIVersion: "v0",
-				Mode:       pluginsdk.ModeSubprocess,
+				SchemaVersion: pluginsdk.SupportedPluginManifestSchemaVersion,
+				ID:            "plugin-required-invalid-entry",
+				Name:          "RequiredInvalidEntry",
+				Version:       "0.1.0",
+				APIVersion:    "v0",
+				Mode:          pluginsdk.ModeSubprocess,
 				ConfigSchema: map[string]any{
 					"type":     "object",
 					"required": []any{true},
@@ -452,11 +560,12 @@ func TestSubprocessPluginHostRejectsIncompatibleManifestBeforeProcessLaunch(t *t
 		},
 		{
 			plugin: pluginsdk.Plugin{Manifest: pluginsdk.PluginManifest{
-				ID:         "plugin-properties-invalid-container",
-				Name:       "PropertiesInvalidContainer",
-				Version:    "0.1.0",
-				APIVersion: "v0",
-				Mode:       pluginsdk.ModeSubprocess,
+				SchemaVersion: pluginsdk.SupportedPluginManifestSchemaVersion,
+				ID:            "plugin-properties-invalid-container",
+				Name:          "PropertiesInvalidContainer",
+				Version:       "0.1.0",
+				APIVersion:    "v0",
+				Mode:          pluginsdk.ModeSubprocess,
 				ConfigSchema: map[string]any{
 					"type":       "object",
 					"properties": true,
@@ -472,7 +581,7 @@ func TestSubprocessPluginHostRejectsIncompatibleManifestBeforeProcessLaunch(t *t
 			expectedErrorContains:   `config schema properties must be an object map, got "boolean"`,
 		},
 		{
-			plugin:                  pluginsdk.Plugin{Manifest: pluginsdk.PluginManifest{ID: "plugin-typed-config", Name: "TypedConfig", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, ConfigSchema: map[string]any{"type": "object", "required": []any{"prefix"}, "properties": map[string]any{"prefix": map[string]any{}}}, Entry: pluginsdk.PluginEntry{Module: "plugins/typed-config", Symbol: "Plugin"}}},
+			plugin:                  pluginsdk.Plugin{Manifest: pluginsdk.PluginManifest{SchemaVersion: pluginsdk.SupportedPluginManifestSchemaVersion, ID: "plugin-typed-config", Name: "TypedConfig", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, ConfigSchema: map[string]any{"type": "object", "required": []any{"prefix"}, "properties": map[string]any{"prefix": map[string]any{}}}, Entry: pluginsdk.PluginEntry{Module: "plugins/typed-config", Symbol: "Plugin"}}},
 			expectedReason:          "manifest_invalid_config_property",
 			expectedRule:            "config_property_type",
 			expectedManifestMode:    pluginsdk.ModeSubprocess,
@@ -481,7 +590,7 @@ func TestSubprocessPluginHostRejectsIncompatibleManifestBeforeProcessLaunch(t *t
 			expectedModulePresent:   true,
 		},
 		{
-			plugin:                  pluginsdk.Plugin{Manifest: pluginsdk.PluginManifest{ID: "plugin-typed-config-default", Name: "TypedConfigDefault", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, ConfigSchema: map[string]any{"type": "object", "required": []any{"prefix"}, "properties": map[string]any{"prefix": map[string]any{"type": "string", "default": true}}}, Entry: pluginsdk.PluginEntry{Module: "plugins/typed-config-default", Symbol: "Plugin"}}},
+			plugin:                  pluginsdk.Plugin{Manifest: pluginsdk.PluginManifest{SchemaVersion: pluginsdk.SupportedPluginManifestSchemaVersion, ID: "plugin-typed-config-default", Name: "TypedConfigDefault", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, ConfigSchema: map[string]any{"type": "object", "required": []any{"prefix"}, "properties": map[string]any{"prefix": map[string]any{"type": "string", "default": true}}}, Entry: pluginsdk.PluginEntry{Module: "plugins/typed-config-default", Symbol: "Plugin"}}},
 			expectedReason:          "manifest_invalid_config_property",
 			expectedRule:            "config_property_value_type",
 			expectedManifestMode:    pluginsdk.ModeSubprocess,
@@ -490,7 +599,7 @@ func TestSubprocessPluginHostRejectsIncompatibleManifestBeforeProcessLaunch(t *t
 			expectedModulePresent:   true,
 		},
 		{
-			plugin:                  pluginsdk.Plugin{Manifest: pluginsdk.PluginManifest{ID: "plugin-typed-config-enum-value", Name: "TypedConfigEnumValue", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, ConfigSchema: map[string]any{"type": "object", "required": []any{"prefix"}, "properties": map[string]any{"prefix": map[string]any{"type": "string", "enum": []any{"hello", true}}}}, Entry: pluginsdk.PluginEntry{Module: "plugins/typed-config-enum-value", Symbol: "Plugin"}}},
+			plugin:                  pluginsdk.Plugin{Manifest: pluginsdk.PluginManifest{SchemaVersion: pluginsdk.SupportedPluginManifestSchemaVersion, ID: "plugin-typed-config-enum-value", Name: "TypedConfigEnumValue", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, ConfigSchema: map[string]any{"type": "object", "required": []any{"prefix"}, "properties": map[string]any{"prefix": map[string]any{"type": "string", "enum": []any{"hello", true}}}}, Entry: pluginsdk.PluginEntry{Module: "plugins/typed-config-enum-value", Symbol: "Plugin"}}},
 			expectedReason:          "manifest_invalid_config_property",
 			expectedRule:            "config_property_enum_value_type",
 			expectedManifestMode:    pluginsdk.ModeSubprocess,
@@ -501,7 +610,7 @@ func TestSubprocessPluginHostRejectsIncompatibleManifestBeforeProcessLaunch(t *t
 			expectedEnumValue:       "true",
 		},
 		{
-			plugin:                  pluginsdk.Plugin{Manifest: pluginsdk.PluginManifest{ID: "plugin-typed-config-shape", Name: "TypedConfigShape", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, ConfigSchema: map[string]any{"type": "object", "required": []any{"prefix"}, "properties": map[string]any{"prefix": true}}, Entry: pluginsdk.PluginEntry{Module: "plugins/typed-config-shape", Symbol: "Plugin"}}},
+			plugin:                  pluginsdk.Plugin{Manifest: pluginsdk.PluginManifest{SchemaVersion: pluginsdk.SupportedPluginManifestSchemaVersion, ID: "plugin-typed-config-shape", Name: "TypedConfigShape", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, ConfigSchema: map[string]any{"type": "object", "required": []any{"prefix"}, "properties": map[string]any{"prefix": true}}, Entry: pluginsdk.PluginEntry{Module: "plugins/typed-config-shape", Symbol: "Plugin"}}},
 			expectedReason:          "manifest_invalid_config_property",
 			expectedRule:            "config_property_schema_shape",
 			expectedManifestMode:    pluginsdk.ModeSubprocess,
@@ -1196,7 +1305,7 @@ func TestSubprocessPluginHostAcceptsSupportedSubprocessManifest(t *testing.T) {
 	t.Parallel()
 
 	host := NewSubprocessPluginHost(testPluginProcessFactory(t, "echo"))
-	plugin := pluginsdk.Plugin{Manifest: pluginsdk.PluginManifest{ID: "plugin-ok", Name: "OK", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, Entry: pluginsdk.PluginEntry{Module: "plugins/ok", Symbol: "Plugin"}}}
+	plugin := pluginsdk.Plugin{Manifest: pluginsdk.PluginManifest{SchemaVersion: pluginsdk.SupportedPluginManifestSchemaVersion, ID: "plugin-ok", Name: "OK", Version: "0.1.0", APIVersion: "v0", Mode: pluginsdk.ModeSubprocess, Entry: pluginsdk.PluginEntry{Module: "plugins/ok", Symbol: "Plugin"}}}
 
 	if err := host.DispatchEvent(context.Background(), plugin, testPluginEvent(), eventmodel.ExecutionContext{TraceID: "trace-ok", EventID: "evt-ok"}); err != nil {
 		t.Fatalf("expected compatible subprocess plugin to dispatch, got %v", err)
@@ -1216,6 +1325,7 @@ func TestSubprocessPluginHostAcceptsSupportedRuntimeVersionRange(t *testing.T) {
 
 func subprocessPluginWithRuntimeVersionRange(pluginID, runtimeVersionRange string) pluginsdk.Plugin {
 	manifestJSON := fmt.Sprintf(`{
+		"schemaVersion":%q,
 		"id":%q,
 		"name":"Runtime Range",
 		"version":"0.1.0",
@@ -1230,7 +1340,7 @@ func subprocessPluginWithRuntimeVersionRange(pluginID, runtimeVersionRange strin
 			"module":"plugins/%s",
 			"symbol":"Plugin"
 		}
-	}`, pluginID, pluginID, runtimeVersionRange, pluginID)
+	}`, pluginsdk.SupportedPluginManifestSchemaVersion, pluginID, pluginID, runtimeVersionRange, pluginID)
 	var manifest pluginsdk.PluginManifest
 	if err := json.Unmarshal([]byte(manifestJSON), &manifest); err != nil {
 		panic(fmt.Sprintf("unmarshal subprocess runtime version range manifest: %v", err))
@@ -1244,11 +1354,12 @@ func TestSubprocessPluginHostSendsInstanceConfigWhenConfigured(t *testing.T) {
 	host := NewSubprocessPluginHost(testPluginProcessFactory(t, "assert-instance-config"))
 	plugin := pluginsdk.Plugin{
 		Manifest: pluginsdk.PluginManifest{
-			ID:         "plugin-typed-config-instance-config",
-			Name:       "TypedConfigInstanceConfig",
-			Version:    "0.1.0",
-			APIVersion: "v0",
-			Mode:       pluginsdk.ModeSubprocess,
+			SchemaVersion: pluginsdk.SupportedPluginManifestSchemaVersion,
+			ID:            "plugin-typed-config-instance-config",
+			Name:          "TypedConfigInstanceConfig",
+			Version:       "0.1.0",
+			APIVersion:    "v0",
+			Mode:          pluginsdk.ModeSubprocess,
 			ConfigSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -1278,11 +1389,12 @@ func TestBuildSubprocessHostRequestDoesNotInjectTopLevelManifestDefaultIntoInsta
 
 	plugin := pluginsdk.Plugin{
 		Manifest: pluginsdk.PluginManifest{
-			ID:         "plugin-instance-config-default-omitted-request",
-			Name:       "InstanceConfigDefaultOmittedRequest",
-			Version:    "0.1.0",
-			APIVersion: "v0",
-			Mode:       pluginsdk.ModeSubprocess,
+			SchemaVersion: pluginsdk.SupportedPluginManifestSchemaVersion,
+			ID:            "plugin-instance-config-default-omitted-request",
+			Name:          "InstanceConfigDefaultOmittedRequest",
+			Version:       "0.1.0",
+			APIVersion:    "v0",
+			Mode:          pluginsdk.ModeSubprocess,
 			ConfigSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -1335,9 +1447,7 @@ func TestBuiltSubprocessFixtureDoesNotReceiveInjectedTopLevelManifestDefault(t *
 			t.Fatalf("expected built fixture stdout to include %q, got %s", expected, stdout)
 		}
 	}
-	if len(host.StderrLines()) == 0 {
-		t.Fatal("expected built fixture to preserve stderr capture lines")
-	}
+	assertSubprocessHostEventuallyCapturesStderr(t, host, "expected built fixture to preserve stderr capture lines")
 }
 
 func TestSubprocessPluginHostRejectsTopLevelInstanceConfigValueTypeMismatchBeforeProcessLaunch(t *testing.T) {
@@ -1520,10 +1630,7 @@ func TestBuiltSubprocessFixtureReceivesTopLevelInstanceConfigValueOutsideManifes
 			t.Fatalf("expected built fixture stdout to include %q, got %s", expected, stdout)
 		}
 	}
-	stderr := strings.Join(host.StderrLines(), "\n")
-	if !strings.Contains(stderr, "stderr-online") {
-		t.Fatalf("expected built fixture stderr capture, got %s", stderr)
-	}
+	assertSubprocessHostEventuallyCapturesStderr(t, host, "expected built fixture stderr capture")
 }
 
 func TestBuildSubprocessHostRequestDoesNotInjectNestedManifestDefaultIntoInstanceConfig(t *testing.T) {
@@ -1617,10 +1724,7 @@ func TestBuiltSubprocessFixtureDoesNotReceiveInjectedNestedManifestDefault(t *te
 			t.Fatalf("expected built fixture stdout to include %q, got %s", expected, stdout)
 		}
 	}
-	stderr := strings.Join(host.StderrLines(), "\n")
-	if !strings.Contains(stderr, "stderr-online") {
-		t.Fatalf("expected built fixture stderr capture, got %s", stderr)
-	}
+	assertSubprocessHostEventuallyCapturesStderr(t, host, "expected built fixture stderr capture")
 }
 
 func TestBuildSubprocessHostRequestPreservesNestedInstanceConfigValueOutsideManifestEnum(t *testing.T) {
@@ -1709,10 +1813,7 @@ func TestBuiltSubprocessFixtureReceivesNestedInstanceConfigValueOutsideManifestE
 			t.Fatalf("expected built fixture stdout to include %q, got %s", expected, stdout)
 		}
 	}
-	stderr := strings.Join(host.StderrLines(), "\n")
-	if !strings.Contains(stderr, "stderr-online") {
-		t.Fatalf("expected built fixture stderr capture, got %s", stderr)
-	}
+	assertSubprocessHostEventuallyCapturesStderr(t, host, "expected built fixture stderr capture")
 }
 
 func TestSubprocessPluginHostRejectsNestedInstanceConfigValueTypeMismatchBeforeProcessLaunch(t *testing.T) {
@@ -2411,10 +2512,7 @@ func TestBuiltSubprocessFixtureDoesNotReceiveInjectedDeeperNestedManifestDefault
 			t.Fatalf("expected built fixture stdout to include %q, got %s", expected, stdout)
 		}
 	}
-	stderr := strings.Join(host.StderrLines(), "\n")
-	if !strings.Contains(stderr, "stderr-online") {
-		t.Fatalf("expected built fixture stderr capture, got %s", stderr)
-	}
+	assertSubprocessHostEventuallyCapturesStderr(t, host, "expected built fixture stderr capture")
 }
 
 func TestBuildSubprocessHostRequestRejectsBeyondSupportedDeeperNestedTypeMismatch(t *testing.T) {
@@ -2660,10 +2758,7 @@ func TestBuiltSubprocessFixtureReceivesBeyondSupportedDeeperNestedMergedDefault(
 			t.Fatalf("expected built fixture stdout to include %q, got %s", expected, stdout)
 		}
 	}
-	stderr := strings.Join(host.StderrLines(), "\n")
-	if !strings.Contains(stderr, "stderr-online") {
-		t.Fatalf("expected built fixture stderr capture, got %s", stderr)
-	}
+	assertSubprocessHostEventuallyCapturesStderr(t, host, "expected built fixture stderr capture")
 }
 
 func TestSubprocessPluginHostRejectsBeyondSupportedDeeperNestedObjectNodeMismatchBeforeProcessLaunch(t *testing.T) {
@@ -2750,11 +2845,12 @@ func testBeyondSupportedDeeperNestedNamingManifest(id string, name string, modul
 		namingSchema["required"] = []any{"prefix"}
 	}
 	return pluginsdk.PluginManifest{
-		ID:         id,
-		Name:       name,
-		Version:    "0.1.0",
-		APIVersion: "v0",
-		Mode:       pluginsdk.ModeSubprocess,
+		SchemaVersion: pluginsdk.SupportedPluginManifestSchemaVersion,
+		ID:            id,
+		Name:          name,
+		Version:       "0.1.0",
+		APIVersion:    "v0",
+		Mode:          pluginsdk.ModeSubprocess,
 		ConfigSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -3686,10 +3782,7 @@ func TestBuiltSubprocessFixtureTreatsNilAndEmptyInstanceConfigAsEquivalentBeyond
 					t.Fatalf("expected built fixture command stdout to include %q, got %s", expected, stdout)
 				}
 			}
-			stderr := strings.Join(host.StderrLines(), "\n")
-			if !strings.Contains(stderr, "stderr-online") {
-				t.Fatalf("expected built fixture command stderr capture, got %s", stderr)
-			}
+			assertSubprocessHostEventuallyCapturesStderr(t, host, "expected built fixture command stderr capture")
 		})
 	}
 }
@@ -3752,10 +3845,7 @@ func TestBuiltSubprocessFixtureTreatsNilAndEmptyInstanceConfigAsEquivalentBeyond
 					t.Fatalf("expected built fixture job stdout to include %q, got %s", expected, stdout)
 				}
 			}
-			stderr := strings.Join(host.StderrLines(), "\n")
-			if !strings.Contains(stderr, "stderr-online") {
-				t.Fatalf("expected built fixture job stderr capture, got %s", stderr)
-			}
+			assertSubprocessHostEventuallyCapturesStderr(t, host, "expected built fixture job stderr capture")
 		})
 	}
 }
@@ -3818,10 +3908,7 @@ func TestBuiltSubprocessFixtureTreatsNilAndEmptyInstanceConfigAsEquivalentBeyond
 					t.Fatalf("expected built fixture schedule stdout to include %q, got %s", expected, stdout)
 				}
 			}
-			stderr := strings.Join(host.StderrLines(), "\n")
-			if !strings.Contains(stderr, "stderr-online") {
-				t.Fatalf("expected built fixture schedule stderr capture, got %s", stderr)
-			}
+			assertSubprocessHostEventuallyCapturesStderr(t, host, "expected built fixture schedule stderr capture")
 		})
 	}
 }
@@ -3896,10 +3983,7 @@ func TestBuiltSubprocessFixtureMergesBeyondSupportedDeeperNestedDefaultVariantsO
 					t.Fatalf("expected built fixture stdout to include %q, got %s", expected, stdout)
 				}
 			}
-			stderr := strings.Join(host.StderrLines(), "\n")
-			if !strings.Contains(stderr, "stderr-online") {
-				t.Fatalf("expected built fixture stderr capture, got %s", stderr)
-			}
+			assertSubprocessHostEventuallyCapturesStderr(t, host, "expected built fixture stderr capture")
 		})
 	}
 }
@@ -3954,10 +4038,7 @@ func TestBuiltSubprocessFixtureReceivesBeyondSupportedDeeperNestedRequiredEnumDe
 			t.Fatalf("expected built fixture stdout to include %q, got %s", expected, stdout)
 		}
 	}
-	stderr := strings.Join(host.StderrLines(), "\n")
-	if !strings.Contains(stderr, "stderr-online") {
-		t.Fatalf("expected built fixture stderr capture, got %s", stderr)
-	}
+	assertSubprocessHostEventuallyCapturesStderr(t, host, "expected built fixture stderr capture")
 }
 
 func TestBuiltSubprocessFixtureReceivesBeyondSupportedDeeperNestedRequiredEnumDefaultParentOmissionBoundary(t *testing.T) {
@@ -4010,10 +4091,7 @@ func TestBuiltSubprocessFixtureReceivesBeyondSupportedDeeperNestedRequiredEnumDe
 			t.Fatalf("expected built fixture stdout to include %q, got %s", expected, stdout)
 		}
 	}
-	stderr := strings.Join(host.StderrLines(), "\n")
-	if !strings.Contains(stderr, "stderr-online") {
-		t.Fatalf("expected built fixture stderr capture, got %s", stderr)
-	}
+	assertSubprocessHostEventuallyCapturesStderr(t, host, "expected built fixture stderr capture")
 }
 
 func TestBuiltSubprocessFixtureReceivesBeyondSupportedDeeperNestedRequiredEnumDefaultRootOmissionBoundary(t *testing.T) {
@@ -4066,10 +4144,7 @@ func TestBuiltSubprocessFixtureReceivesBeyondSupportedDeeperNestedRequiredEnumDe
 			t.Fatalf("expected built fixture stdout to include %q, got %s", expected, stdout)
 		}
 	}
-	stderr := strings.Join(host.StderrLines(), "\n")
-	if !strings.Contains(stderr, "stderr-online") {
-		t.Fatalf("expected built fixture stderr capture, got %s", stderr)
-	}
+	assertSubprocessHostEventuallyCapturesStderr(t, host, "expected built fixture stderr capture")
 }
 
 func TestBuiltSubprocessFixtureTreatsNilAndEmptyInstanceConfigAsEquivalentBeyondSupportedDeeperNestedRequiredEnumDefaultRootOmissionBoundary(t *testing.T) {
@@ -4130,10 +4205,7 @@ func TestBuiltSubprocessFixtureTreatsNilAndEmptyInstanceConfigAsEquivalentBeyond
 					t.Fatalf("expected built fixture stdout to include %q, got %s", expected, stdout)
 				}
 			}
-			stderr := strings.Join(host.StderrLines(), "\n")
-			if !strings.Contains(stderr, "stderr-online") {
-				t.Fatalf("expected built fixture stderr capture, got %s", stderr)
-			}
+			assertSubprocessHostEventuallyCapturesStderr(t, host, "expected built fixture stderr capture")
 		})
 	}
 }
@@ -4502,10 +4574,7 @@ func TestBuiltSubprocessFixtureReceivesNestedInstanceConfigObjectMissingManifest
 			t.Fatalf("expected built fixture stdout to include %q, got %s", expected, stdout)
 		}
 	}
-	stderr := strings.Join(host.StderrLines(), "\n")
-	if !strings.Contains(stderr, "stderr-online") {
-		t.Fatalf("expected built fixture stderr capture, got %s", stderr)
-	}
+	assertSubprocessHostEventuallyCapturesStderr(t, host, "expected built fixture stderr capture")
 }
 
 func TestSubprocessPluginHostRejectsInvalidCaptureLimits(t *testing.T) {
@@ -4898,15 +4967,31 @@ func shutdownSubprocessHostForTest(host *SubprocessPluginHost) {
 	}
 }
 
+func assertSubprocessHostEventuallyCapturesStderr(t *testing.T, host *SubprocessPluginHost, message string) string {
+	t.Helper()
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	stderr := strings.Join(host.StderrLines(), "\n")
+	for !strings.Contains(stderr, "stderr-online") && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+		stderr = strings.Join(host.StderrLines(), "\n")
+	}
+	if !strings.Contains(stderr, "stderr-online") {
+		t.Fatalf("%s, got %s", message, stderr)
+	}
+	return stderr
+}
+
 func testPluginDefinition() pluginsdk.Plugin {
 	return pluginsdk.Plugin{
 		Manifest: pluginsdk.PluginManifest{
-			ID:         "plugin-subprocess-demo",
-			Name:       "Subprocess Demo",
-			Version:    "0.1.0",
-			APIVersion: "v0",
-			Mode:       pluginsdk.ModeSubprocess,
-			Entry:      pluginsdk.PluginEntry{Module: "plugins/subprocess-demo", Symbol: "Plugin"},
+			SchemaVersion: pluginsdk.SupportedPluginManifestSchemaVersion,
+			ID:            "plugin-subprocess-demo",
+			Name:          "Subprocess Demo",
+			Version:       "0.1.0",
+			APIVersion:    "v0",
+			Mode:          pluginsdk.ModeSubprocess,
+			Entry:         pluginsdk.PluginEntry{Module: "plugins/subprocess-demo", Symbol: "Plugin"},
 		},
 	}
 }
@@ -5146,10 +5231,191 @@ func TestHelperPluginProcess(t *testing.T) {
 			continue
 		}
 		if strings.Contains(line, `"type":"command"`) {
+			if mode == "admin-request-callback" {
+				action := "prepare_rollout"
+				status := pluginsdk.RolloutStatusPrepared
+				phase := pluginsdk.RolloutPhaseCandidate
+				if strings.Contains(line, `/admin canary plugin-echo`) {
+					action = "canary_rollout"
+					status = pluginsdk.RolloutStatusCanarying
+					phase = pluginsdk.RolloutPhaseCanary
+				}
+				callbackEnvelope := map[string]any{
+					"type":     "callback",
+					"callback": "admin_request",
+					"admin_request": map[string]any{
+						"action":           action,
+						"target_plugin_id": "plugin-echo",
+						"actor":            "admin-user",
+						"permission":       "plugin:rollout",
+						"target":           "plugin-echo",
+						"target_kind":      "plugin",
+						"audit_entry": map[string]any{
+							"actor":          "admin-user",
+							"permission":     "plugin:rollout",
+							"action":         "plugin.rollout",
+							"target":         "plugin-echo",
+							"allowed":        true,
+							"trace_id":       "trace-admin-request",
+							"event_id":       "evt-admin-request",
+							"plugin_id":      "plugin-admin",
+							"run_id":         "run-admin-request",
+							"correlation_id": "corr-admin-request",
+							"occurred_at":    "2026-04-24T00:00:00Z",
+						},
+					},
+				}
+				encoded, err := json.Marshal(callbackEnvelope)
+				if err != nil {
+					_, _ = os.Stdout.WriteString("{\"type\":\"command\",\"status\":\"error\",\"error\":\"failed to encode admin callback envelope\"}\n")
+					continue
+				}
+				_, _ = os.Stdout.WriteString(string(encoded) + "\n")
+				ackLine, err := reader.ReadString('\n')
+				if err != nil {
+					_, _ = os.Stdout.WriteString("{\"type\":\"command\",\"status\":\"error\",\"error\":\"failed to read admin callback ack\"}\n")
+					continue
+				}
+				var ack hostCallbackResult
+				if err := json.Unmarshal([]byte(strings.TrimSpace(ackLine)), &ack); err != nil {
+					_, _ = os.Stdout.WriteString("{\"type\":\"command\",\"status\":\"error\",\"error\":\"failed to decode admin callback ack\"}\n")
+					continue
+				}
+				if ack.Type != "callback_result" || ack.Status != "ok" || ack.AdminRequest == nil || ack.AdminRequest.Authorization == nil || !ack.AdminRequest.Authorization.Allowed || ack.AdminRequest.RolloutRecord == nil || ack.AdminRequest.RolloutRecord.Status != status || ack.AdminRequest.RolloutRecord.Phase != phase {
+					_, _ = os.Stdout.WriteString("{\"type\":\"command\",\"status\":\"error\",\"error\":\"unexpected admin callback ack\"}\n")
+					continue
+				}
+				_, _ = os.Stdout.WriteString("{\"type\":\"command\",\"status\":\"ok\",\"message\":\"command-ok\"}\n")
+				continue
+			}
 			_, _ = os.Stdout.WriteString("{\"type\":\"command\",\"status\":\"ok\",\"message\":\"command-ok\"}\n")
 			continue
 		}
 		if strings.Contains(line, `"type":"job"`) {
+			if mode == "ai-chat-callbacks" {
+				queueInspectEnvelope := map[string]any{
+					"type":     "callback",
+					"callback": "ai_chat_queue",
+					"ai_chat_queue": map[string]any{
+						"action": "inspect",
+						"job_id": "job-ai-chat-callback",
+					},
+				}
+				encoded, err := json.Marshal(queueInspectEnvelope)
+				if err != nil {
+					_, _ = os.Stdout.WriteString("{\"type\":\"job\",\"status\":\"error\",\"error\":\"failed to encode ai_chat_queue inspect callback\"}\n")
+					continue
+				}
+				_, _ = os.Stdout.WriteString(string(encoded) + "\n")
+				ackLine, err := reader.ReadString('\n')
+				if err != nil {
+					_, _ = os.Stdout.WriteString("{\"type\":\"job\",\"status\":\"error\",\"error\":\"failed to read ai_chat_queue inspect ack\"}\n")
+					continue
+				}
+				var inspectAck hostCallbackResult
+				if err := json.Unmarshal([]byte(strings.TrimSpace(ackLine)), &inspectAck); err != nil {
+					_, _ = os.Stdout.WriteString("{\"type\":\"job\",\"status\":\"error\",\"error\":\"failed to decode ai_chat_queue inspect ack\"}\n")
+					continue
+				}
+				if inspectAck.Type != "callback_result" || inspectAck.Status != "ok" || inspectAck.AIChatQueue == nil || inspectAck.AIChatQueue.Job == nil {
+					_, _ = os.Stdout.WriteString("{\"type\":\"job\",\"status\":\"error\",\"error\":\"unexpected ai_chat_queue inspect ack\"}\n")
+					continue
+				}
+				prompt, _ := inspectAck.AIChatQueue.Job.Payload["prompt"].(string)
+
+				sessionEnvelope := map[string]any{
+					"type":     "callback",
+					"callback": "ai_chat_session",
+					"ai_chat_session": map[string]any{
+						"session": map[string]any{
+							"sessionId": "session-user-1",
+							"pluginId":  "plugin-ai-chat",
+							"state": map[string]any{
+								"last_prompt": prompt,
+							},
+						},
+					},
+				}
+				encoded, err = json.Marshal(sessionEnvelope)
+				if err != nil {
+					_, _ = os.Stdout.WriteString("{\"type\":\"job\",\"status\":\"error\",\"error\":\"failed to encode ai_chat_session callback\"}\n")
+					continue
+				}
+				_, _ = os.Stdout.WriteString(string(encoded) + "\n")
+				ackLine, err = reader.ReadString('\n')
+				if err != nil {
+					_, _ = os.Stdout.WriteString("{\"type\":\"job\",\"status\":\"error\",\"error\":\"failed to read ai_chat_session ack\"}\n")
+					continue
+				}
+				var sessionAck hostCallbackResult
+				if err := json.Unmarshal([]byte(strings.TrimSpace(ackLine)), &sessionAck); err != nil {
+					_, _ = os.Stdout.WriteString("{\"type\":\"job\",\"status\":\"error\",\"error\":\"failed to decode ai_chat_session ack\"}\n")
+					continue
+				}
+				if sessionAck.Type != "callback_result" || sessionAck.Status != "ok" {
+					_, _ = os.Stdout.WriteString("{\"type\":\"job\",\"status\":\"error\",\"error\":\"unexpected ai_chat_session ack\"}\n")
+					continue
+				}
+
+				providerEnvelope := map[string]any{
+					"type":     "callback",
+					"callback": "ai_chat_provider",
+					"ai_chat_provider": map[string]any{
+						"prompt": prompt,
+					},
+				}
+				encoded, err = json.Marshal(providerEnvelope)
+				if err != nil {
+					_, _ = os.Stdout.WriteString("{\"type\":\"job\",\"status\":\"error\",\"error\":\"failed to encode ai_chat_provider callback\"}\n")
+					continue
+				}
+				_, _ = os.Stdout.WriteString(string(encoded) + "\n")
+				ackLine, err = reader.ReadString('\n')
+				if err != nil {
+					_, _ = os.Stdout.WriteString("{\"type\":\"job\",\"status\":\"error\",\"error\":\"failed to read ai_chat_provider ack\"}\n")
+					continue
+				}
+				var providerAck hostCallbackResult
+				if err := json.Unmarshal([]byte(strings.TrimSpace(ackLine)), &providerAck); err != nil {
+					_, _ = os.Stdout.WriteString("{\"type\":\"job\",\"status\":\"error\",\"error\":\"failed to decode ai_chat_provider ack\"}\n")
+					continue
+				}
+				if providerAck.Type != "callback_result" || providerAck.Status != "ok" || providerAck.AIChatProvider == nil || providerAck.AIChatProvider.Text != "provider: hello from queue" {
+					_, _ = os.Stdout.WriteString("{\"type\":\"job\",\"status\":\"error\",\"error\":\"unexpected ai_chat_provider ack\"}\n")
+					continue
+				}
+
+				queueCompleteEnvelope := map[string]any{
+					"type":     "callback",
+					"callback": "ai_chat_queue",
+					"ai_chat_queue": map[string]any{
+						"action": "complete",
+						"job_id": "job-ai-chat-callback",
+					},
+				}
+				encoded, err = json.Marshal(queueCompleteEnvelope)
+				if err != nil {
+					_, _ = os.Stdout.WriteString("{\"type\":\"job\",\"status\":\"error\",\"error\":\"failed to encode ai_chat_queue complete callback\"}\n")
+					continue
+				}
+				_, _ = os.Stdout.WriteString(string(encoded) + "\n")
+				ackLine, err = reader.ReadString('\n')
+				if err != nil {
+					_, _ = os.Stdout.WriteString("{\"type\":\"job\",\"status\":\"error\",\"error\":\"failed to read ai_chat_queue complete ack\"}\n")
+					continue
+				}
+				var completeAck hostCallbackResult
+				if err := json.Unmarshal([]byte(strings.TrimSpace(ackLine)), &completeAck); err != nil {
+					_, _ = os.Stdout.WriteString("{\"type\":\"job\",\"status\":\"error\",\"error\":\"failed to decode ai_chat_queue complete ack\"}\n")
+					continue
+				}
+				if completeAck.Type != "callback_result" || completeAck.Status != "ok" || completeAck.AIChatQueue == nil || completeAck.AIChatQueue.Job == nil || completeAck.AIChatQueue.Job.Status != pluginsdk.JobStatusDone {
+					_, _ = os.Stdout.WriteString("{\"type\":\"job\",\"status\":\"error\",\"error\":\"unexpected ai_chat_queue complete ack\"}\n")
+					continue
+				}
+				_, _ = os.Stdout.WriteString("{\"type\":\"job\",\"status\":\"ok\",\"message\":\"job-ok\"}\n")
+				continue
+			}
 			_, _ = os.Stdout.WriteString("{\"type\":\"job\",\"status\":\"ok\",\"message\":\"job-ok\"}\n")
 			continue
 		}
