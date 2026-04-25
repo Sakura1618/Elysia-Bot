@@ -9,12 +9,7 @@
 
 ## Backlog
 
-### 1. 继续打磨插件开发最小闭环
-- 收口 scaffold → manifest → package → smoke 的 repo-local 插件开发流，减少模板与真实路径脱节。
-- 增补官方参考插件与插件开发手册，但目标是验证 runtime 语义，不是提前扩张插件市场。
-- 补权限声明、配置 schema、观测、发布约束等开发约定文档。
-
-### 2. 在读面优先前提下补有限控制面写路径
+### 1. 在读面优先前提下补有限控制面写路径
 - 在认证与审计收口后，再扩 plugin config、schedule、dead-letter、rollout 等最小写入口。
 - 保持 `console-web` 不是完整产品化控制面，避免 UI 范围再次跑到 runtime 收口前面。
 - 先补详情与状态可见性，再考虑批量操作和更强交互。

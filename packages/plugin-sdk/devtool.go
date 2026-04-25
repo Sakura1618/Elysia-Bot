@@ -83,16 +83,25 @@ func GenerateManifestFromPluginDir(pluginDir string) (PluginManifest, []byte, er
 	}
 
 	tempProbePath := filepath.Join(resolvedPluginDir, "plugindev_manifest_probe_test.go")
-	probeSource := fmt.Sprintf("package %s\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n)\n\nfunc TestPluginDevPrintManifest(t *testing.T) {\n\trawManifest, err := json.Marshal(Manifest())\n\tif err != nil {\n\t\tt.Fatalf(\"marshal manifest: %%v\", err)\n\t}\n\tfmt.Printf(\"%s%%s\\n\", rawManifest)\n}\n", packageName, manifestProbeOutputPrefix)
-	if err := os.WriteFile(tempProbePath, []byte(probeSource), 0o644); err != nil {
+	tempProbeFile, err := os.CreateTemp(resolvedPluginDir, "plugindev_manifest_probe_*_test.go")
+	if err != nil {
+		return PluginManifest{}, nil, fmt.Errorf("create manifest probe: %w", err)
+	}
+	tempProbePath = tempProbeFile.Name()
+	probeTestName := toPascalCase(strings.TrimSuffix(filepath.Base(tempProbePath), filepath.Ext(tempProbePath)))
+	probeSource := fmt.Sprintf("package %s\n\nimport (\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"testing\"\n)\n\nfunc Test%s(t *testing.T) {\n\trawManifest, err := json.Marshal(Manifest())\n\tif err != nil {\n\t\tt.Fatalf(\"marshal manifest: %%v\", err)\n\t}\n\tfmt.Printf(\"%s%%s\\n\", rawManifest)\n}\n", packageName, probeTestName, manifestProbeOutputPrefix)
+	if _, err := tempProbeFile.Write([]byte(probeSource)); err != nil {
+		_ = tempProbeFile.Close()
+		_ = os.Remove(tempProbePath)
 		return PluginManifest{}, nil, fmt.Errorf("write manifest probe: %w", err)
+	}
+	if err := tempProbeFile.Close(); err != nil {
+		_ = os.Remove(tempProbePath)
+		return PluginManifest{}, nil, fmt.Errorf("close manifest probe: %w", err)
 	}
 	defer os.Remove(tempProbePath)
 
-	command := exec.Command("go", "test", "-run", "^TestPluginDevPrintManifest$", "-count=1", "-v")
-	command.Dir = resolvedPluginDir
-	command.Env = append(os.Environ(), "GOWORK=off")
-	output, err := command.CombinedOutput()
+	output, err := runGoCommand(resolvedPluginDir, "test", "-run", "^Test"+probeTestName+"$", "-count=1", "-v")
 	if err != nil {
 		return PluginManifest{}, nil, fmt.Errorf("load manifest from plugin source: %w\n%s", err, string(output))
 	}
@@ -192,6 +201,28 @@ func PackagePlugin(pluginDir string) (string, error) {
 		if err := copyFile(sourcePath, filepath.Join(distDir, fileName)); err != nil {
 			return "", err
 		}
+	}
+
+	return distDir, nil
+}
+
+func SmokePlugin(pluginDir string) (string, error) {
+	resolvedPluginDir, err := filepath.Abs(strings.TrimSpace(pluginDir))
+	if err != nil {
+		return "", fmt.Errorf("resolve plugin directory: %w", err)
+	}
+
+	if err := CheckGeneratedManifest(resolvedPluginDir); err != nil {
+		return "", fmt.Errorf("manifest check: %w", err)
+	}
+
+	distDir, err := PackagePlugin(resolvedPluginDir)
+	if err != nil {
+		return "", fmt.Errorf("package plugin: %w", err)
+	}
+
+	if err := runPluginTests(resolvedPluginDir); err != nil {
+		return "", err
 	}
 
 	return distDir, nil
@@ -387,7 +418,28 @@ func rewriteFile(path string, replacements []stringReplacement) error {
 }
 
 func scaffoldReadme(pluginID string) string {
-	return fmt.Sprintf("# %s\n\n`%s` 由 `plugins/plugin-template-smoke` 通过当前仓库内的 `plugin-dev` 脚手架生成。\n\n## 当前开发工作流\n\n1. 修改 `plugin.go` 中的业务逻辑与 `Manifest()`。\n2. 运行 `npm run plugin:dev -- manifest write -plugin ./plugins/%s` 生成 `manifest.json`。\n3. 运行 `go test ./plugins/%s` 验证当前插件。\n4. 如需本地轻量打包产物，运行 `npm run plugin:dev -- package -plugin ./plugins/%s`，产物会写到 `plugins/%s/dist/`。\n\n## 说明\n\n- `manifest.json` 是生成物，不再手工维护。\n- `manifest_test.go` 会校验 `Manifest()`、`manifest.json` 与 `go.mod` 中的 module / entry.module 仍保持同步。\n- 如果要把这个插件接入 runtime 或 e2e smoke，请按实际需要单独注册；当前脚手架不自动扩展 runtime 装配路径。\n", pluginID, pluginID, pluginID, pluginID, pluginID, pluginID)
+	return fmt.Sprintf("# %s\n\n`%s` 由 `plugins/plugin-template-smoke` 通过当前仓库内的 `plugin-dev` 脚手架生成。\n\n## 当前开发工作流\n\n1. 修改 `plugin.go` 中的业务逻辑与 `Manifest()`。\n2. 如果 `Manifest()` 有变化，运行 `npm run plugin:manifest:write -- -plugin ./plugins/%s` 刷新 `manifest.json`。\n3. 运行 `npm run plugin:smoke -- -plugin ./plugins/%s`，按 `manifest check -> package -> go test` 验证当前插件。\n4. 如需只查看本地轻量打包产物，仍可单独运行 `npm run plugin:package -- -plugin ./plugins/%s`，产物会写到 `plugins/%s/dist/`。\n\n## 说明\n\n- `manifest.json` 是生成物，不再手工维护；`plugin:smoke` 会先做 `manifest check`，所以忘记刷新时会直接失败。\n- `manifest_test.go` 会校验 `Manifest()`、`manifest.json` 与 `go.mod` 中的 module / entry.module 仍保持同步。\n- 如果要把这个插件接入 runtime 或 e2e smoke，请按实际需要单独注册；当前脚手架不自动扩展 runtime 装配路径。\n", pluginID, pluginID, pluginID, pluginID, pluginID, pluginID)
+}
+
+func runPluginTests(pluginDir string) error {
+	resolvedPluginDir, err := filepath.Abs(strings.TrimSpace(pluginDir))
+	if err != nil {
+		return fmt.Errorf("resolve plugin directory: %w", err)
+	}
+
+	output, err := runGoCommand(resolvedPluginDir, "test", "-count=1", "./...")
+	if err != nil {
+		return fmt.Errorf("go test plugin %s: %w\n%s", resolvedPluginDir, err, string(output))
+	}
+
+	return nil
+}
+
+func runGoCommand(dir string, args ...string) ([]byte, error) {
+	command := exec.Command("go", args...)
+	command.Dir = dir
+	command.Env = append(os.Environ(), "GOWORK=off")
+	return command.CombinedOutput()
 }
 
 func updateGoWorkUseEntry(workspaceRoot, newEntry string) error {

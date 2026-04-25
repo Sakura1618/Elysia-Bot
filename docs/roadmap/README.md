@@ -6,7 +6,7 @@
 
 当前判断基于仓库内已经存在的真值：`README.md`、`docs/TODO.md`、`AGENTS.md`、`apps/console-web/README.md`、`plugins/plugin-template-smoke/README.md`、`deploy/config.dev.yaml`、`package.json`、`.github/workflows/nightly-validation.yml`。
 
-当前已拆出的专题文档：[`docs/topics/operator-console-auth.md`](../topics/operator-console-auth.md)、[`docs/topics/plugin-development-main-path.md`](../topics/plugin-development-main-path.md) 与 [`docs/topics/runtime-storage-main-path.md`](../topics/runtime-storage-main-path.md)，分别用于收口 operator console / bearer auth / limited control surface、repo-local 插件开发主路径 / `Manifest()` 真值规则 / nightly 验证口径，以及 runtime storage 主路径 / Postgres 非默认验证路径 / 相邻 provider 分类的成熟度边界。
+当前已拆出的专题文档：[`docs/topics/operator-console-auth.md`](../topics/operator-console-auth.md)、[`docs/topics/plugin-development-main-path.md`](../topics/plugin-development-main-path.md)、[`docs/topics/plugin-development-conventions.md`](../topics/plugin-development-conventions.md) 与 [`docs/topics/runtime-storage-main-path.md`](../topics/runtime-storage-main-path.md)，分别用于收口 operator console / bearer auth / limited control surface、repo-local 插件开发主路径 / `Manifest()` 真值规则 / nightly 验证口径、repo-local 插件作者需要跟随的权限 / config schema / observability / publish 约定，以及 runtime storage 主路径 / Postgres 非默认验证路径 / 相邻 provider 分类的成熟度边界。
 
 ## 当前阶段：先收口，再扩张
 
@@ -61,7 +61,7 @@
 #### repo-local 插件开发流是当前插件主路径
 
 - `plugins/plugin-template-smoke/README.md` 把 `plugin-template-smoke` 定义为最小 repo-local 插件模板
-- `package.json` 提供 `plugin:dev`、`plugin:scaffold`、`plugin:manifest:write`、`plugin:manifest:check`、`plugin:package`
+- `package.json` 提供 `plugin:dev`、`plugin:scaffold`、`plugin:manifest:write`、`plugin:manifest:check`、`plugin:package`、`plugin:smoke`
 - 根 README 把 `plugin-template-smoke`、`packages/plugin-sdk/cmd/plugin-dev`、`npm run test:plugin-template:smoke` 收口成当前最小插件开发入口
 - nightly validation 也把 `plugin-template-smoke` 放进 plugin matrix
 

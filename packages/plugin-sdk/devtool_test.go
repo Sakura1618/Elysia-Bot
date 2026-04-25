@@ -3,10 +3,10 @@ package pluginsdk
 import (
 	"bytes"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -17,6 +17,79 @@ func TestCheckGeneratedManifestMatchesTemplateSmoke(t *testing.T) {
 	pluginDir := filepath.Join(repoRoot, "plugins", "plugin-template-smoke")
 	if err := CheckGeneratedManifest(pluginDir); err != nil {
 		t.Fatalf("check generated manifest: %v", err)
+	}
+}
+
+func TestSmokePluginMatchesTemplateSmoke(t *testing.T) {
+	t.Parallel()
+
+	workspaceRoot := createPluginWorkspaceFixture(t)
+	pluginDir := filepath.Join(workspaceRoot, "plugins", "plugin-template-smoke")
+
+	distDir, err := SmokePlugin(pluginDir)
+	if err != nil {
+		t.Fatalf("smoke plugin: %v", err)
+	}
+
+	for _, fileName := range []string{"manifest.json", "README.md"} {
+		if _, err := os.Stat(filepath.Join(distDir, fileName)); err != nil {
+			t.Fatalf("expected smoke dist artifact %s: %v", fileName, err)
+		}
+	}
+}
+
+func TestSmokePluginStopsOnManifestDrift(t *testing.T) {
+	t.Parallel()
+
+	workspaceRoot := createPluginWorkspaceFixture(t)
+	pluginDir := filepath.Join(workspaceRoot, "plugins", "plugin-template-smoke")
+	manifestPath := filepath.Join(pluginDir, "manifest.json")
+
+	rawManifest, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatalf("read manifest.json: %v", err)
+	}
+
+	driftedManifest := strings.Replace(string(rawManifest), "Plugin Template Smoke", "Plugin Template Smoke Drifted", 1)
+	if err := os.WriteFile(manifestPath, []byte(driftedManifest), 0o644); err != nil {
+		t.Fatalf("write drifted manifest.json: %v", err)
+	}
+
+	_, err = SmokePlugin(pluginDir)
+	if err == nil {
+		t.Fatal("expected smoke plugin to fail on manifest drift")
+	}
+	if !strings.Contains(err.Error(), "manifest.json is out of date") {
+		t.Fatalf("expected manifest drift error, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(pluginDir, "dist")); !os.IsNotExist(err) {
+		t.Fatalf("expected smoke to stop before packaging, got err=%v", err)
+	}
+}
+
+func TestCheckGeneratedManifestSupportsConcurrentCalls(t *testing.T) {
+	t.Parallel()
+
+	workspaceRoot := createPluginWorkspaceFixture(t)
+	pluginDir := filepath.Join(workspaceRoot, "plugins", "plugin-template-smoke")
+
+	const concurrentChecks = 4
+	errs := make(chan error, concurrentChecks)
+	var waitGroup sync.WaitGroup
+	for range concurrentChecks {
+		waitGroup.Add(1)
+		go func() {
+			defer waitGroup.Done()
+			errs <- CheckGeneratedManifest(pluginDir)
+		}()
+	}
+	waitGroup.Wait()
+	close(errs)
+
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("expected concurrent manifest checks to succeed, got %v", err)
+		}
 	}
 }
 
@@ -84,23 +157,15 @@ func TestScaffoldRepoPluginCreatesRepoLocalPluginFlow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read scaffolded README: %v", err)
 	}
-	for _, expected := range []string{"# plugin-sample-alpha", "manifest write -plugin ./plugins/plugin-sample-alpha", "package -plugin ./plugins/plugin-sample-alpha"} {
+	for _, expected := range []string{"# plugin-sample-alpha", "npm run plugin:manifest:write -- -plugin ./plugins/plugin-sample-alpha", "npm run plugin:smoke -- -plugin ./plugins/plugin-sample-alpha"} {
 		if !strings.Contains(string(readmeContent), expected) {
 			t.Fatalf("scaffolded README missing %q\n%s", expected, readmeContent)
 		}
 	}
 
-	command := exec.Command("go", "test", "./...")
-	command.Dir = targetDir
-	command.Env = append(os.Environ(), "GOWORK=off")
-	output, err := command.CombinedOutput()
+	distDir, err := SmokePlugin(targetDir)
 	if err != nil {
-		t.Fatalf("go test scaffolded plugin: %v\n%s", err, string(output))
-	}
-
-	distDir, err := PackagePlugin(targetDir)
-	if err != nil {
-		t.Fatalf("package scaffolded plugin: %v", err)
+		t.Fatalf("smoke scaffolded plugin: %v", err)
 	}
 	for _, fileName := range []string{"manifest.json", "README.md"} {
 		if _, err := os.Stat(filepath.Join(distDir, fileName)); err != nil {

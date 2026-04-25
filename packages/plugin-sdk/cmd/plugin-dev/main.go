@@ -27,6 +27,8 @@ func run(args []string) error {
 		return runManifest(args[1:])
 	case "package":
 		return runPackage(args[1:])
+	case "smoke":
+		return runSmoke(args[1:])
 	case "-h", "--help", "help":
 		printUsage()
 		return nil
@@ -113,6 +115,34 @@ func runPackage(args []string) error {
 	return nil
 }
 
+func runSmoke(args []string) error {
+	flags := flag.NewFlagSet("smoke", flag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+	pluginPath := flags.String("plugin", ".", "plugin directory")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+
+	resolvedPluginPath := *pluginPath
+	if flags.NArg() > 1 {
+		return fmt.Errorf("smoke accepts at most one positional plugin directory\n\n%s", usageText())
+	}
+	if flags.NArg() == 1 {
+		if resolvedPluginPath != "." {
+			return fmt.Errorf("smoke accepts either -plugin <plugin-dir> or one positional plugin directory\n\n%s", usageText())
+		}
+		resolvedPluginPath = flags.Arg(0)
+	}
+
+	distDir, err := pluginsdk.SmokePlugin(resolvedPluginPath)
+	if err != nil {
+		return err
+	}
+
+	fmt.Fprintf(os.Stdout, "smoke OK: %s (dist: %s)\n", resolvedPluginPath, distDir)
+	return nil
+}
+
 func usageError() error {
 	return fmt.Errorf("%s", usageText())
 }
@@ -122,5 +152,5 @@ func printUsage() {
 }
 
 func usageText() string {
-	return "plugin-dev usage:\n  plugin-dev scaffold -id plugin-example [-name \"Plugin Example\"] [-workspace <repo-root>]\n  plugin-dev manifest write [-plugin <plugin-dir>]\n  plugin-dev manifest check [-plugin <plugin-dir>]\n  plugin-dev package [-plugin <plugin-dir>]\n"
+	return "plugin-dev usage:\n  plugin-dev scaffold -id plugin-example [-name \"Plugin Example\"] [-workspace <repo-root>]\n  plugin-dev manifest write [-plugin <plugin-dir>]\n  plugin-dev manifest check [-plugin <plugin-dir>]\n  plugin-dev package [-plugin <plugin-dir>]\n  plugin-dev smoke [-plugin <plugin-dir>]\n"
 }
