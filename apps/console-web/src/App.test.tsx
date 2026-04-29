@@ -166,6 +166,66 @@ describe('App', () => {
     expect(finalRequest.searchParams.get('plugin_id')).toBe('plugin-echo');
   });
 
+  it('disables a plugin from the routed detail page and proves the final refetched disabled state on the same route', async () => {
+    const disabledPayload = cloneMockConsoleData();
+    const disabledPlugin = disabledPayload.plugins.find((plugin) => plugin.id === 'plugin-echo');
+    if (!disabledPlugin) {
+      throw new Error('missing plugin-echo in mock payload');
+    }
+    disabledPlugin.enabled = false;
+    disabledPlugin.enabledStateSource = 'sqlite-plugin-enabled-overlay';
+    disabledPlugin.enabledStatePersisted = true;
+
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(createFetchResponse(consolePayload))
+      .mockResolvedValueOnce(
+        createFetchResponse({
+          status: 'ok',
+          action: 'disable',
+          target: 'plugin-echo',
+          accepted: true,
+          reason: 'plugin_disabled',
+          plugin_id: 'plugin-echo',
+          enabled: false,
+        }),
+      )
+      .mockResolvedValueOnce(createFetchResponse(disabledPayload));
+    globalThis.fetch = fetchMock as typeof fetch;
+    window.localStorage.setItem('bot-platform.console.operator-bearer-token', 'opaque-viewer-token');
+    window.history.replaceState({}, '', '/plugins/plugin-echo');
+
+    render(<App />);
+    await screen.findByRole('heading', { name: 'Echo Plugin · plugin-echo' });
+    expect(screen.getByRole('button', { name: 'Disable plugin' })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Disable plugin' }));
+
+    await screen.findByRole('heading', { name: 'Operator action accepted' });
+    await screen.findByRole('button', { name: 'Enable plugin' });
+    await screen.findByText('sqlite-plugin-enabled-overlay');
+
+    const [initialURL, initialInit] = requestAt(fetchMock, 0);
+    expect(initialURL.pathname).toBe('/api/console');
+    expect(initialURL.searchParams.get('plugin_id')).toBe('plugin-echo');
+    expect((initialInit?.headers as Headers).get('Authorization')).toBe('Bearer opaque-viewer-token');
+
+    const [actionURL, actionInit] = requestAt(fetchMock, 1);
+    expect(actionURL.pathname).toBe('/demo/plugins/plugin-echo/disable');
+    expect(actionInit?.method).toBe('POST');
+    expect((actionInit?.headers as Headers).get('Authorization')).toBe('Bearer opaque-viewer-token');
+
+    const [refetchURL, refetchInit] = requestAt(fetchMock, 2);
+    expect(refetchURL.pathname).toBe('/api/console');
+    expect(refetchURL.searchParams.get('plugin_id')).toBe('plugin-echo');
+    expect((refetchInit?.headers as Headers).get('Authorization')).toBe('Bearer opaque-viewer-token');
+
+    expect(requestPathnames(fetchMock)).toEqual(['/api/console', '/demo/plugins/plugin-echo/disable', '/api/console']);
+    expect(window.location.pathname).toBe('/plugins/plugin-echo');
+    expect(screen.queryByRole('button', { name: 'Disable plugin' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Enable plugin' })).toBeInTheDocument();
+  });
+
   it('shows read-only rollout state, recent rollout evidence, and rollout provenance on the plugin detail route', async () => {
     const fetchMock = vi.fn().mockResolvedValue(createFetchResponse(consolePayload));
     globalThis.fetch = fetchMock as typeof fetch;
