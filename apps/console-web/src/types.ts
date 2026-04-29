@@ -68,7 +68,7 @@ export type PluginManifest = {
   statusStaleness?: string;
 };
 
-export type JobStatus = 'pending' | 'running' | 'retrying' | 'cancelled' | 'failed' | 'dead' | 'done';
+export type JobStatus = 'pending' | 'paused' | 'running' | 'retrying' | 'cancelled' | 'failed' | 'dead' | 'done';
 
 export type ConsoleRBACDeclaration = {
   actor?: string;

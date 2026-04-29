@@ -25,6 +25,18 @@ function findRequestByPath(fetchMock: ReturnType<typeof vi.fn>, pathname: string
   return [call[0] as URL, call[1] as RequestInit | undefined];
 }
 
+function requestPathnames(fetchMock: ReturnType<typeof vi.fn>): string[] {
+  return fetchMock.mock.calls.map((entry) => (entry[0] as URL).pathname);
+}
+
+function requestAt(fetchMock: ReturnType<typeof vi.fn>, index: number): [URL, RequestInit | undefined] {
+  const call = fetchMock.mock.calls[index];
+  if (!call) {
+    throw new Error(`missing fetch call at index ${index}`);
+  }
+  return [call[0] as URL, call[1] as RequestInit | undefined];
+}
+
 describe('App', () => {
   const originalFetch = globalThis.fetch;
 
@@ -56,7 +68,7 @@ describe('App', () => {
     expect(screen.getByText('session-operator-bearer-viewer-user')).toBeInTheDocument();
     expect(screen.getByText('viewer-main')).toBeInTheDocument();
     expect(screen.getByText('bearer')).toBeInTheDocument();
-    expect(screen.getByText('read+operator-plugin-enable-disable+plugin-config+job-retry+schedule-cancel')).toBeInTheDocument();
+    expect(screen.getByText('read+operator-plugin-enable-disable+plugin-config+job-control+schedule-cancel')).toBeInTheDocument();
     expect(screen.getByText('Recovery and alert evidence')).toBeInTheDocument();
     expect(screen.getAllByText('job-dead-letter-console').length).toBeGreaterThan(0);
     expect(screen.getByText('workflow-user-1')).toBeInTheDocument();
@@ -213,6 +225,78 @@ describe('App', () => {
     expect(screen.getAllByText('sqlite-rollout-operation-records').length).toBeGreaterThan(0);
   });
 
+  it('shows pause and cancel actions for a queued job while hiding resume and retry', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(createFetchResponse(consolePayload));
+    globalThis.fetch = fetchMock as typeof fetch;
+
+    render(<App />);
+    await screen.findByRole('heading', { name: 'Local operator console' });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Jobs' }));
+    fireEvent.click(screen.getByLabelText('Open job job-console-ready details'));
+    await screen.findByRole('heading', { name: 'job-console-ready · ai.chat' });
+
+    expect(screen.getByRole('heading', { name: 'Job operator actions' })).toBeInTheDocument();
+    expect(
+      screen.getByText('Pause keeps a queued job from dispatching again until a later resume, then the route refetch shows the runtime queue truth.'),
+    ).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Pause job' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Cancel job' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Resume job' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Retry dead-letter job' })).not.toBeInTheDocument();
+  });
+
+  it('shows resume and cancel for a paused job while hiding pause and retry', async () => {
+    const pausedPayload = cloneMockConsoleData();
+    const pausedJob = pausedPayload.jobs.find((job) => job.id === 'job-console-ready');
+    if (!pausedJob) {
+      throw new Error('missing queued job in mock payload');
+    }
+    pausedJob.status = 'paused';
+    pausedJob.queueStateSummary = 'paused by operator';
+
+    const fetchMock = vi.fn().mockResolvedValue(createFetchResponse(pausedPayload));
+    globalThis.fetch = fetchMock as typeof fetch;
+
+    render(<App />);
+    await screen.findByRole('heading', { name: 'Local operator console' });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Jobs' }));
+    fireEvent.click(screen.getByLabelText('Open job job-console-ready details'));
+    await screen.findByRole('heading', { name: 'job-console-ready · ai.chat' });
+
+    expect(screen.getByText('paused')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Resume job' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Cancel job' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Pause job' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Retry dead-letter job' })).not.toBeInTheDocument();
+  });
+
+  it('shows pause and cancel actions for a retrying job while hiding resume and retry', async () => {
+    const retryingPayload = cloneMockConsoleData();
+    const retryingJob = retryingPayload.jobs.find((job) => job.id === 'job-console-ready');
+    if (!retryingJob) {
+      throw new Error('missing queued job in mock payload');
+    }
+    retryingJob.status = 'retrying';
+    retryingJob.queueStateSummary = 'waiting to retry after previous failure';
+
+    const fetchMock = vi.fn().mockResolvedValue(createFetchResponse(retryingPayload));
+    globalThis.fetch = fetchMock as typeof fetch;
+
+    render(<App />);
+    await screen.findByRole('heading', { name: 'Local operator console' });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Jobs' }));
+    fireEvent.click(screen.getByLabelText('Open job job-console-ready details'));
+    await screen.findByRole('heading', { name: 'job-console-ready · ai.chat' });
+
+    expect(screen.getByRole('button', { name: 'Pause job' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Cancel job' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Resume job' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Retry dead-letter job' })).not.toBeInTheDocument();
+  });
+
   it('retries a dead-letter job from the routed detail page and refetches the console payload afterward', async () => {
     const retriedPayload = cloneMockConsoleData();
     const retriedJob = retriedPayload.jobs.find((job) => job.id === 'job-dead-letter-console');
@@ -259,8 +343,231 @@ describe('App', () => {
     expect(actionURL.pathname).toBe('/demo/jobs/job-dead-letter-console/retry');
     expect((actionInit?.headers as Headers).get('Authorization')).toBe('Bearer opaque-viewer-token');
     expect(fetchMock).toHaveBeenCalledTimes(4);
-    const finalRequest = fetchMock.mock.calls[3]?.[0] as URL;
+    const finalRequest = fetchMock.mock.calls[fetchMock.mock.calls.length - 1]?.[0] as URL;
     expect(finalRequest.pathname).toBe('/api/console');
+    expect(screen.queryByRole('button', { name: 'Pause job' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Resume job' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Cancel job' })).not.toBeInTheDocument();
+  });
+
+  it('pauses a queued job from the routed detail page and proves the final refetched paused state', async () => {
+    const pausedPayload = cloneMockConsoleData();
+    const pausedJob = pausedPayload.jobs.find((job) => job.id === 'job-console-ready');
+    if (!pausedJob) {
+      throw new Error('missing queued job in mock payload');
+    }
+    pausedJob.status = 'paused';
+    pausedJob.queueStateSummary = 'paused by operator after verification refetch';
+
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(createFetchResponse(consolePayload))
+      .mockResolvedValueOnce(
+        createFetchResponse({
+          status: 'ok',
+          action: 'pause',
+          target: 'job-console-ready',
+          accepted: true,
+          reason: 'job_paused',
+          job_id: 'job-console-ready',
+        }),
+      )
+      .mockResolvedValueOnce(createFetchResponse(pausedPayload));
+    globalThis.fetch = fetchMock as typeof fetch;
+    window.localStorage.setItem('bot-platform.console.operator-bearer-token', 'opaque-viewer-token');
+    window.history.replaceState({}, '', '/jobs/job-console-ready');
+
+    render(<App />);
+    await screen.findByRole('heading', { name: 'job-console-ready · ai.chat' });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Pause job' }));
+    await screen.findByRole('button', { name: 'Resume job' });
+    await screen.findByText('paused by operator after verification refetch');
+    await screen.findByText('Operator action accepted');
+
+    const [initialURL, initialInit] = requestAt(fetchMock, 0);
+    expect(initialURL.pathname).toBe('/api/console');
+    expect((initialInit?.headers as Headers).get('Authorization')).toBe('Bearer opaque-viewer-token');
+
+    const [actionURL, actionInit] = requestAt(fetchMock, 1);
+    expect(actionURL.pathname).toBe('/demo/jobs/job-console-ready/pause');
+    expect(actionInit?.method).toBe('POST');
+    expect((actionInit?.headers as Headers).get('Authorization')).toBe('Bearer opaque-viewer-token');
+
+    const [refetchURL, refetchInit] = requestAt(fetchMock, 2);
+    expect(refetchURL.pathname).toBe('/api/console');
+    expect((refetchInit?.headers as Headers).get('Authorization')).toBe('Bearer opaque-viewer-token');
+    expect(requestPathnames(fetchMock)).toEqual(['/api/console', '/demo/jobs/job-console-ready/pause', '/api/console']);
+    expect(window.location.pathname).toBe('/jobs/job-console-ready');
+    expect(screen.queryByRole('button', { name: 'Pause job' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Cancel job' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Retry dead-letter job' })).not.toBeInTheDocument();
+  });
+
+  it('resumes a paused job from the routed detail page and proves the final refetched ready state', async () => {
+    const pausedPayload = cloneMockConsoleData();
+    const pausedJob = pausedPayload.jobs.find((job) => job.id === 'job-console-ready');
+    if (!pausedJob) {
+      throw new Error('missing queued job in mock payload');
+    }
+    pausedJob.status = 'paused';
+    pausedJob.queueStateSummary = 'paused before resume verification';
+
+    const resumedPayload = cloneMockConsoleData();
+    const resumedJob = resumedPayload.jobs.find((job) => job.id === 'job-console-ready');
+    if (!resumedJob) {
+      throw new Error('missing resumed queued job in mock payload');
+    }
+    resumedJob.queueStateSummary = 'ready again after verification refetch';
+
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(createFetchResponse(pausedPayload))
+      .mockResolvedValueOnce(
+        createFetchResponse({
+          status: 'ok',
+          action: 'resume',
+          target: 'job-console-ready',
+          accepted: true,
+          reason: 'job_resumed',
+          job_id: 'job-console-ready',
+        }),
+      )
+      .mockResolvedValueOnce(createFetchResponse(resumedPayload));
+    globalThis.fetch = fetchMock as typeof fetch;
+    window.localStorage.setItem('bot-platform.console.operator-bearer-token', 'opaque-viewer-token');
+    window.history.replaceState({}, '', '/jobs/job-console-ready');
+
+    render(<App />);
+    await screen.findByRole('heading', { name: 'job-console-ready · ai.chat' });
+    expect(screen.getByText('paused before resume verification')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Resume job' }));
+    await screen.findByRole('button', { name: 'Pause job' });
+    await screen.findByRole('button', { name: 'Cancel job' });
+    await screen.findByText('ready again after verification refetch');
+    await screen.findByText('Operator action accepted');
+
+    const [initialURL, initialInit] = requestAt(fetchMock, 0);
+    expect(initialURL.pathname).toBe('/api/console');
+    expect((initialInit?.headers as Headers).get('Authorization')).toBe('Bearer opaque-viewer-token');
+
+    const [actionURL, actionInit] = requestAt(fetchMock, 1);
+    expect(actionURL.pathname).toBe('/demo/jobs/job-console-ready/resume');
+    expect(actionInit?.method).toBe('POST');
+    expect((actionInit?.headers as Headers).get('Authorization')).toBe('Bearer opaque-viewer-token');
+
+    const [refetchURL, refetchInit] = requestAt(fetchMock, 2);
+    expect(refetchURL.pathname).toBe('/api/console');
+    expect((refetchInit?.headers as Headers).get('Authorization')).toBe('Bearer opaque-viewer-token');
+    expect(requestPathnames(fetchMock)).toEqual(['/api/console', '/demo/jobs/job-console-ready/resume', '/api/console']);
+    expect(window.location.pathname).toBe('/jobs/job-console-ready');
+    expect(screen.queryByRole('button', { name: 'Resume job' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Retry dead-letter job' })).not.toBeInTheDocument();
+  });
+
+  it('cancels a queued job from the routed detail page and proves the final refetched cancelled state', async () => {
+    const cancelledPayload = cloneMockConsoleData();
+    const cancelledJob = cancelledPayload.jobs.find((job) => job.id === 'job-console-ready');
+    if (!cancelledJob) {
+      throw new Error('missing queued job in mock payload');
+    }
+    cancelledJob.status = 'cancelled';
+    cancelledJob.queueStateSummary = 'cancelled by operator after verification refetch';
+
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(createFetchResponse(consolePayload))
+      .mockResolvedValueOnce(
+        createFetchResponse({
+          status: 'ok',
+          action: 'cancel',
+          target: 'job-console-ready',
+          accepted: true,
+          reason: 'job_cancelled',
+          job_id: 'job-console-ready',
+        }),
+      )
+      .mockResolvedValueOnce(createFetchResponse(cancelledPayload));
+    globalThis.fetch = fetchMock as typeof fetch;
+    window.localStorage.setItem('bot-platform.console.operator-bearer-token', 'opaque-viewer-token');
+    window.history.replaceState({}, '', '/jobs/job-console-ready');
+
+    render(<App />);
+    await screen.findByRole('heading', { name: 'job-console-ready · ai.chat' });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel job' }));
+    await screen.findByText('No job operator actions for this state');
+    await screen.findByText('cancelled by operator after verification refetch');
+    await screen.findByText('Operator action accepted');
+
+    const [initialURL, initialInit] = requestAt(fetchMock, 0);
+    expect(initialURL.pathname).toBe('/api/console');
+    expect((initialInit?.headers as Headers).get('Authorization')).toBe('Bearer opaque-viewer-token');
+
+    const [actionURL, actionInit] = requestAt(fetchMock, 1);
+    expect(actionURL.pathname).toBe('/demo/jobs/job-console-ready/cancel');
+    expect(actionInit?.method).toBe('POST');
+    expect((actionInit?.headers as Headers).get('Authorization')).toBe('Bearer opaque-viewer-token');
+
+    const [refetchURL, refetchInit] = requestAt(fetchMock, 2);
+    expect(refetchURL.pathname).toBe('/api/console');
+    expect((refetchInit?.headers as Headers).get('Authorization')).toBe('Bearer opaque-viewer-token');
+    expect(requestPathnames(fetchMock)).toEqual(['/api/console', '/demo/jobs/job-console-ready/cancel', '/api/console']);
+    expect(window.location.pathname).toBe('/jobs/job-console-ready');
+    expect(screen.queryByRole('button', { name: 'Pause job' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Resume job' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Cancel job' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Retry dead-letter job' })).not.toBeInTheDocument();
+  });
+
+  it('surfaces a distinct verification failure when a job action write succeeds but the post-action console refetch fails', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(createFetchResponse(consolePayload))
+      .mockResolvedValueOnce(
+        createFetchResponse({
+          status: 'ok',
+          action: 'pause',
+          target: 'job-console-ready',
+          accepted: true,
+          reason: 'job_paused',
+          job_id: 'job-console-ready',
+        }),
+      )
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 503,
+        json: async () => ({ message: 'console refetch denied' }),
+        text: async () => 'console refetch denied',
+      });
+    globalThis.fetch = fetchMock as typeof fetch;
+    window.localStorage.setItem('bot-platform.console.operator-bearer-token', 'opaque-viewer-token');
+    window.history.replaceState({}, '', '/jobs/job-console-ready');
+
+    render(<App />);
+    await screen.findByRole('heading', { name: 'job-console-ready · ai.chat' });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Pause job' }));
+
+    await screen.findByRole('heading', { name: 'Operator action accepted, but verification refetch failed' });
+    expect(screen.queryByRole('heading', { name: 'Operator action accepted' })).not.toBeInTheDocument();
+    expect(screen.getByText('Console API unavailable')).toBeInTheDocument();
+    expect(screen.getAllByText('console refetch denied').length).toBeGreaterThan(0);
+
+    const [initialURL, initialInit] = requestAt(fetchMock, 0);
+    expect(initialURL.pathname).toBe('/api/console');
+    expect((initialInit?.headers as Headers).get('Authorization')).toBe('Bearer opaque-viewer-token');
+
+    const [actionURL, actionInit] = requestAt(fetchMock, 1);
+    expect(actionURL.pathname).toBe('/demo/jobs/job-console-ready/pause');
+    expect(actionInit?.method).toBe('POST');
+    expect((actionInit?.headers as Headers).get('Authorization')).toBe('Bearer opaque-viewer-token');
+
+    const [refetchURL, refetchInit] = requestAt(fetchMock, 2);
+    expect(refetchURL.pathname).toBe('/api/console');
+    expect((refetchInit?.headers as Headers).get('Authorization')).toBe('Bearer opaque-viewer-token');
+    expect(requestPathnames(fetchMock)).toEqual(['/api/console', '/demo/jobs/job-console-ready/pause', '/api/console']);
   });
 
   it('cancels a schedule from the routed detail page and refetches the console payload afterward', async () => {

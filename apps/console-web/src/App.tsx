@@ -39,6 +39,7 @@ type ActionState =
   | { kind: 'idle' }
   | { kind: 'pending'; label: string }
   | { kind: 'success'; label: string; details: Record<string, unknown>; occurredAt: string }
+  | { kind: 'verification-error'; label: string; details: Record<string, unknown>; message: string; occurredAt: string }
   | { kind: 'error'; label: string; message: string; occurredAt: string };
 
 type PanelProps = {
@@ -63,6 +64,16 @@ type DetailFieldProps = {
 };
 
 type StatusTone = 'default' | 'good' | 'danger' | 'warning' | 'muted';
+
+type JobOperatorActionDescriptor = {
+  key: 'pause' | 'resume' | 'cancel' | 'retry';
+  title: string;
+  description: string;
+  buttonLabel: string;
+  requestLabel: string;
+  permission: string;
+  path: string;
+};
 
 type RolloutSnapshot = ConsolePayload['rolloutHeads'][number]['stable'];
 
@@ -297,7 +308,7 @@ function getStatusToneFromJob(job: Job): StatusTone {
   if (job.deadLetter || job.status === 'dead' || job.status === 'failed') {
     return 'danger';
   }
-  if (job.status === 'retrying') {
+  if (job.status === 'paused' || job.status === 'retrying') {
     return 'warning';
   }
   if (job.status === 'done') {
@@ -307,6 +318,69 @@ function getStatusToneFromJob(job: Job): StatusTone {
     return 'default';
   }
   return 'muted';
+}
+
+function supportsOperatorAction(availableActions: string[] | undefined, path: string): boolean {
+  return availableActions?.includes(path) ?? false;
+}
+
+function getJobOperatorActions(meta: ConsolePayload['meta'], job: Job): JobOperatorActionDescriptor[] {
+  const actions: JobOperatorActionDescriptor[] = [];
+
+  if (!job.deadLetter && (job.status === 'pending' || job.status === 'retrying') && supportsOperatorAction(meta.job_operator_actions, '/demo/jobs/{job-id}/pause')) {
+    actions.push({
+      key: 'pause',
+      title: 'Pause queued job',
+      description: 'Pause keeps a queued job from dispatching again until a later resume, then the route refetch shows the runtime queue truth.',
+      buttonLabel: 'Pause job',
+      requestLabel: 'Pause',
+      permission: 'job:pause',
+      path: `/demo/jobs/${job.id}/pause`,
+    });
+  }
+
+  if (!job.deadLetter && job.status === 'paused' && supportsOperatorAction(meta.job_operator_actions, '/demo/jobs/{job-id}/resume')) {
+    actions.push({
+      key: 'resume',
+      title: 'Resume queued job',
+      description: 'Resume hands a paused job back to the runtime queue and relies on the follow-up console read to confirm the current state.',
+      buttonLabel: 'Resume job',
+      requestLabel: 'Resume',
+      permission: 'job:resume',
+      path: `/demo/jobs/${job.id}/resume`,
+    });
+  }
+
+  if (
+    !job.deadLetter &&
+    (job.status === 'pending' || job.status === 'retrying' || job.status === 'paused') &&
+    supportsOperatorAction(meta.job_operator_actions, '/demo/jobs/{job-id}/cancel')
+  ) {
+    actions.push({
+      key: 'cancel',
+      title: 'Cancel queued job',
+      description:
+        'Cancel stops further queued dispatch attempts for pending, retrying, or paused jobs through the existing runtime endpoint instead of inventing any client-side authority.',
+      buttonLabel: 'Cancel job',
+      requestLabel: 'Cancel',
+      permission: 'job:cancel',
+      path: `/demo/jobs/${job.id}/cancel`,
+    });
+  }
+
+  if (job.deadLetter && supportsOperatorAction(meta.job_operator_actions, '/demo/jobs/{job-id}/retry')) {
+    actions.push({
+      key: 'retry',
+      title: 'Retry dead-letter job',
+      description: 'Retry stays limited to dead-letter jobs, then the route refetches /api/console so alerts and queue evidence can converge.',
+      buttonLabel: 'Retry dead-letter job',
+      requestLabel: 'Retry',
+      permission: 'job:retry',
+      path: `/demo/jobs/${job.id}/retry`,
+    });
+  }
+
+  return actions;
 }
 
 function getStatusToneFromSchedule(schedule: Schedule): StatusTone {
@@ -519,7 +593,7 @@ function App() {
     };
   }, []);
 
-  const refreshConsole = useCallback(async () => {
+  const refreshConsole = useCallback(async (options?: { throwOnError?: boolean }) => {
     const initialLoad = !hasLoadedOnce.current;
     if (initialLoad) {
       setLoading(true);
@@ -533,9 +607,14 @@ function App() {
       setData(payload);
       setError('');
       setLastFetchedAt(new Date().toISOString());
+      return payload;
     } catch (fetchError) {
       const message = fetchError instanceof Error ? fetchError.message : 'Failed to load Console API payload';
       setError(message);
+      if (options?.throwOnError) {
+        throw new Error(message);
+      }
+      return null;
     } finally {
       setLoading(false);
       setRefreshing(false);
@@ -603,13 +682,26 @@ function App() {
       setActionState({ kind: 'pending', label });
       try {
         const result = await postOperatorAction(window.location.origin, currentBearerToken, path, body);
-        await refreshConsole();
-        setActionState({
-          kind: 'success',
-          label,
-          details: result,
-          occurredAt: new Date().toISOString(),
-        });
+        try {
+          await refreshConsole({ throwOnError: true });
+          setActionState({
+            kind: 'success',
+            label,
+            details: result,
+            occurredAt: new Date().toISOString(),
+          });
+        } catch (refetchError) {
+          setActionState({
+            kind: 'verification-error',
+            label,
+            details: result,
+            message:
+              refetchError instanceof Error
+                ? refetchError.message
+                : 'The runtime write succeeded, but the follow-up console verification refetch failed',
+            occurredAt: new Date().toISOString(),
+          });
+        }
       } catch (actionError) {
         setActionState({
           kind: 'error',
@@ -673,6 +765,21 @@ function App() {
         </Panel>
       );
     }
+    if (actionState.kind === 'verification-error') {
+      return (
+        <Panel
+          title="Operator action accepted, but verification refetch failed"
+          description={`${actionState.label} at ${formatTimestamp(actionState.occurredAt)}`}
+          tone="error"
+        >
+          <p className="muted-copy">
+            The runtime write endpoint returned success, but the follow-up <code>/api/console</code> read failed, so this route may still show stale state until a later successful refresh.
+          </p>
+          <pre className="code-block">{actionState.message}</pre>
+          <pre className="code-block">{JSON.stringify(actionState.details, null, 2)}</pre>
+        </Panel>
+      );
+    }
     return (
       <Panel title="Operator action accepted" description={`${actionState.label} at ${formatTimestamp(actionState.occurredAt)}`}>
         <pre className="code-block">{JSON.stringify(actionState.details, null, 2)}</pre>
@@ -721,8 +828,9 @@ function App() {
                 <code>{formatStringList(payload.meta.plugin_config_operator_actions)}</code>
               </article>
               <article className="capability-card">
-                <strong>Dead-letter retry</strong>
-                <p>Retry only dead-letter jobs and then refetch the console snapshot for evidence.</p>
+                <strong>Job control</strong>
+                <p>Pause, resume, or cancel queued jobs, and retry dead-letter jobs, through the existing runtime operator endpoints.</p>
+                <p>Scope: {payload.meta.job_operator_scope ?? 'not declared'}</p>
                 <code>{formatStringList(payload.meta.job_operator_actions)}</code>
               </article>
               <article className="capability-card">
@@ -1268,12 +1376,14 @@ function App() {
       const jobAlerts = payload.alerts.filter((alert) => alert.objectId === job.id);
       const jobAudits = relatedAudits(payload.audits, job.id);
       const jobLogs = relatedLogs(payload.logs, job.id, job.traceId, job.eventId, filters.logQuery);
+      const jobOperatorActions = getJobOperatorActions(payload.meta, job);
+      const jobOperatorScope = formatMetaString(payload.meta.job_operator_scope);
 
       return (
         <>
           <Panel
             title={`${job.id} · ${job.type}`}
-            description="Job detail routes carry the dead-letter retry surface, dispatch contract evidence, and the alert/audit context around queue recovery."
+            description="Job detail routes carry the current job-control surface, dispatch contract evidence, and the alert/audit context around queue recovery."
             actions={
               <RouteLink to={{ section: 'jobs' }} navigate={navigate} className="secondary-link" ariaLabel="Back to jobs">
                 Back to jobs
@@ -1293,22 +1403,34 @@ function App() {
           </Panel>
 
           <div className="page-grid two-column">
-            <Panel title="Dead-letter retry" description="Retry goes through the existing runtime operator endpoint and then refetches /api/console for current evidence.">
-              <div className="action-card">
-                <div className="action-copy">
-                  <strong>Retry dead-letter job</strong>
-                  <p>The button remains visible only because this route is where dead-letter evidence, alerts, and retry semantics meet.</p>
-                  <span className="list-meta">Likely RBAC actors: {formatStringList(actorsLikelyAllowed(payload.config, 'job:retry', job.id))}</span>
+            <Panel title="Job operator actions" description="Controls stay on the existing runtime job endpoints, then refetch /api/console so the route reflects queue truth instead of optimistic browser state.">
+              {jobOperatorActions.length === 0 ? (
+                <EmptyState
+                  title="No job operator actions for this state"
+                  description={`The current runtime scope says ${jobOperatorScope}, but this job does not presently match any supported action state.`}
+                />
+              ) : (
+                <div className="action-group">
+                  {jobOperatorActions.map((action) => (
+                    <div key={action.key} className="action-card">
+                      <div className="action-copy">
+                        <strong>{action.title}</strong>
+                        <p>{action.description}</p>
+                        <span className="list-meta">Runtime scope: {jobOperatorScope}</span>
+                        <span className="list-meta">Likely RBAC actors: {formatStringList(actorsLikelyAllowed(payload.config, action.permission, job.id))}</span>
+                      </div>
+                      <button
+                        type="button"
+                        className="primary-button"
+                        disabled={actionBusy}
+                        onClick={() => void runAction(`${action.requestLabel} ${job.id}`, action.path)}
+                      >
+                        {action.buttonLabel}
+                      </button>
+                    </div>
+                  ))}
                 </div>
-                <button
-                  type="button"
-                  className="primary-button"
-                  disabled={actionBusy || !job.deadLetter}
-                  onClick={() => void runAction(`Retry ${job.id}`, `/demo/jobs/${job.id}/retry`)}
-                >
-                  Retry dead-letter job
-                </button>
-              </div>
+              )}
             </Panel>
 
             <Panel title="Dispatch and queue contract" description="These fields come from the existing runtime queue projection rather than from frontend-only interpretation.">
@@ -1325,7 +1447,7 @@ function App() {
           </div>
 
           <div className="page-grid two-column">
-            <Panel title="Alerts and audits" description="Dead-letter alerts clear only after a successful retry path and a fresh read-model fetch.">
+            <Panel title="Alerts and audits" description="Queued-state writes should leave audit evidence after refetch, while dead-letter alerts only clear after a successful retry path is reflected in the next read model.">
               {jobAlerts.length === 0 && jobAudits.length === 0 ? (
                 <EmptyState title="No job evidence rows" description="The current snapshot does not include matching alerts or audit entries for this job." />
               ) : (
@@ -1374,7 +1496,7 @@ function App() {
     }
 
     return (
-      <Panel title="Jobs" description="The jobs route keeps the current queue projection browsable and links dead-letter evidence into the retry detail route.">
+      <Panel title="Jobs" description="The jobs route keeps the current queue projection browsable and links queue evidence into the detail-scoped job-control surface.">
         <div className="filter-row">
           <label className="field-label" htmlFor="job-filter">
             Job filter

@@ -32,6 +32,7 @@ repo 级 operator console / auth 成熟度边界统一见 [`../../docs/topics/op
 - 当前仓库已支持的 operator 写操作：
   - plugin enable / disable
   - plugin-echo config update
+  - queued job pause / resume / cancel
   - dead-letter job retry
   - schedule cancel
 - 更完整的读面证据：
