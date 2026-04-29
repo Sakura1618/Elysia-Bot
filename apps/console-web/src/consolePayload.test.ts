@@ -28,6 +28,33 @@ describe('parseConsolePayload', () => {
     expect(parsed.rolloutHeads[0]?.phase).toBe('canary');
     expect(parsed.rolloutHeads[0]?.active.version).toBe('0.2.0-candidate');
     expect(parsed.rolloutHeads[0]?.stateSource).toBe('sqlite-rollout-heads');
+    expect(parsed.meta.rollout_policy).toEqual({
+      entryPoints: ['/admin prepare <plugin-id>', '/admin activate <plugin-id>'],
+      preflightChecks: ['manifest.id-match', 'manifest.mode-match', 'manifest.api-version-match', 'manifest.version-changed'],
+      activationChecks: ['prepared-record-required', 'prepare-time-drift-recheck', 'lifecycle-enable-before-activated-mark'],
+      auditReasons: ['rollout_prepared', 'rollout_activated', 'rollout_drifted', 'rollout_failed'],
+      recordStore: 'sqlite-current-runtime-rollout-operations',
+      supportedModes: ['manual-prepare-activate', 'manifest-preflight', 'activate-time-drift-recheck', 'minimal-audit-reasons'],
+      unsupportedModes: [
+        'rollback',
+        'staged-rollout',
+        'health-check-gate',
+        'automatic-rollback',
+        'persisted-rollout-history',
+        'approval-workflow',
+        'schema-migration-gate',
+      ],
+      verificationEndpoints: ['GET /api/console', 'go test ./packages/runtime-core ./plugins/plugin-admin ./apps/runtime -run Rollout'],
+      facts: [
+        'rollout is currently a manual admin chain limited to /admin prepare <plugin-id> and /admin activate <plugin-id>',
+        'prepare records only minimal manifest compatibility facts for ID, Mode, APIVersion, and Version change',
+        'activate re-checks current and candidate manifests before lifecycle enable so prepare-time drift is rejected',
+        'rollout prepare and activate attempts are persisted as operational records and remain visible after restart',
+      ],
+      summary:
+        'manual /admin prepare|activate only; preflight checks ID|Mode|APIVersion|Version; activate re-checks drift before lifecycle enable; rollout attempts persist as operational records; audit reasons are minimal; no rollback or staged rollout',
+    });
+    expect(parsed.meta.rollout_record_store).toBe('sqlite-current-runtime-rollout-operations');
     expect(parsed.meta.request_identity).toEqual({
       actor_id: 'viewer-user',
       token_id: 'viewer-main',
@@ -87,6 +114,13 @@ describe('parseConsolePayload', () => {
 
 		expect(() => parseConsolePayload(payload)).toThrow('Console API payload shape is incompatible with Console Web A11');
 	});
+
+  it('rejects payloads when rollout policy declaration fields stop using strings and string arrays', () => {
+    const payload = cloneMockConsoleData();
+    payload.meta.rollout_policy = { ...payload.meta.rollout_policy, entryPoints: [123 as never] };
+
+    expect(() => parseConsolePayload(payload)).toThrow('Console API payload shape is incompatible with Console Web A11');
+  });
 
   it('rejects payloads when request identity metadata stops using strings', () => {
     const payload = cloneMockConsoleData();

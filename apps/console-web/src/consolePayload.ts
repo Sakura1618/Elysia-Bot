@@ -316,6 +316,24 @@ function hasAuthorizationPolicyShape(value: unknown): boolean {
   );
 }
 
+function hasRolloutPolicyDeclarationShape(value: unknown): boolean {
+  if (!isRecord(value)) {
+    return false;
+  }
+  return (
+    isStringArrayOrUndefined(value.entryPoints) &&
+    isStringArrayOrUndefined(value.preflightChecks) &&
+    isStringArrayOrUndefined(value.activationChecks) &&
+    isStringArrayOrUndefined(value.auditReasons) &&
+    (value.recordStore === undefined || isString(value.recordStore)) &&
+    isStringArrayOrUndefined(value.supportedModes) &&
+    isStringArrayOrUndefined(value.unsupportedModes) &&
+    isStringArrayOrUndefined(value.verificationEndpoints) &&
+    isStringArrayOrUndefined(value.facts) &&
+    (value.summary === undefined || isString(value.summary))
+  );
+}
+
 function hasConfigShape(value: unknown): boolean {
   if (!isRecord(value) || !isRecord(value.Runtime)) {
     return false;
@@ -362,9 +380,11 @@ function hasMetaShape(value: unknown): boolean {
      (value.rbac_console_read_actor_header === undefined || isString(value.rbac_console_read_actor_header)) &&
      (value.rbac_console_read_permission === undefined || isBoolean(value.rbac_console_read_permission)) &&
      isStringArrayOrUndefined(value.rbac_console_limitations) &&
-     (value.rollout_record_read_model === undefined || isString(value.rollout_record_read_model)) &&
-     (value.rollout_record_persisted === undefined || isBoolean(value.rollout_record_persisted)) &&
-     (value.rollout_head_read_model === undefined || isString(value.rollout_head_read_model)) &&
+      (value.rollout_policy === undefined || hasRolloutPolicyDeclarationShape(value.rollout_policy)) &&
+      (value.rollout_record_store === undefined || isString(value.rollout_record_store)) &&
+      (value.rollout_record_read_model === undefined || isString(value.rollout_record_read_model)) &&
+      (value.rollout_record_persisted === undefined || isBoolean(value.rollout_record_persisted)) &&
+      (value.rollout_head_read_model === undefined || isString(value.rollout_head_read_model)) &&
      (value.rollout_head_persisted === undefined || isBoolean(value.rollout_head_persisted)) &&
      isStringArrayOrUndefined(value.rollout_console_limitations) &&
      (value.request_identity === undefined ||

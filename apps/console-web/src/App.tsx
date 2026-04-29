@@ -14,6 +14,7 @@ import type {
   ConsoleAuthorizationPolicy,
   ConsoleConfig,
   ConsoleFilters,
+  ConsoleRolloutPolicyDeclaration,
   ConsolePayload,
   Job,
   PluginManifest,
@@ -193,6 +194,22 @@ function formatRolloutSnapshot(snapshot?: RolloutSnapshot | null): string {
     return 'not returned';
   }
   return parts.join(' · ');
+}
+
+function rolloutPolicyDetails(policy: ConsoleRolloutPolicyDeclaration | undefined): Array<{ label: string; items: string[] }> {
+  if (!policy) {
+    return [];
+  }
+  return [
+    { label: 'Entry points', items: policy.entryPoints ?? [] },
+    { label: 'Preflight checks', items: policy.preflightChecks ?? [] },
+    { label: 'Activation checks', items: policy.activationChecks ?? [] },
+    { label: 'Audit reasons', items: policy.auditReasons ?? [] },
+    { label: 'Supported modes', items: policy.supportedModes ?? [] },
+    { label: 'Unsupported modes', items: policy.unsupportedModes ?? [] },
+    { label: 'Verification endpoints', items: policy.verificationEndpoints ?? [] },
+    { label: 'Facts', items: policy.facts ?? [] },
+  ].filter((section) => section.items.length > 0);
 }
 
 function getStatusToneFromRolloutStatus(status?: string | null): StatusTone {
@@ -896,6 +913,9 @@ function App() {
       const pluginRolloutOps = sortRolloutOperations(
         payload.rolloutOps.filter((candidate) => candidate.pluginId === plugin.id),
       ).slice(0, 5);
+      const rolloutPolicy = payload.meta.rollout_policy;
+      const rolloutPolicySections = rolloutPolicyDetails(rolloutPolicy);
+      const rolloutRecordStore = rolloutPolicy?.recordStore ?? payload.meta.rollout_record_store ?? 'not declared';
       const rolloutHeadReadModel = formatMetaString(payload.meta.rollout_head_read_model);
       const rolloutRecordReadModel = formatMetaString(payload.meta.rollout_record_read_model);
       const rolloutConsoleLimitations = formatMetaStringList(payload.meta.rollout_console_limitations);
@@ -1004,6 +1024,43 @@ function App() {
 
           <div className="page-grid two-column">
             <Panel
+              title="Rollout policy declaration"
+              description="This panel mirrors the existing rollout declaration returned by /api/console. It stays evidence-oriented and read-only; rollout writes remain outside this route."
+            >
+              {rolloutPolicy ? (
+                <>
+                  <div className="detail-grid">
+                    <DetailField label="Record store" value={rolloutRecordStore} />
+                    <DetailField label="Operation read model" value={rolloutRecordReadModel} />
+                    <DetailField label="Head read model" value={rolloutHeadReadModel} />
+                    <DetailField label="Operations persisted" value={formatMetaBoolean(payload.meta.rollout_record_persisted)} />
+                    <DetailField label="Head persisted" value={formatMetaBoolean(payload.meta.rollout_head_persisted)} />
+                  </div>
+                  <p className="muted-copy">{rolloutPolicy.summary ?? 'No rollout policy summary available.'}</p>
+                  {rolloutPolicySections.length === 0 ? (
+                    <p className="muted-copy">No rollout policy declaration details were returned in console meta.</p>
+                  ) : (
+                    <div className="stack-list compact-stack">
+                      {rolloutPolicySections.map((section) => (
+                        <article key={`${plugin.id}-rollout-policy-${section.label}`} className="list-card static-card">
+                          <strong>{section.label}</strong>
+                          {section.items.map((item) => (
+                            <p key={`${section.label}-${item}`}>{item}</p>
+                          ))}
+                        </article>
+                      ))}
+                    </div>
+                  )}
+                </>
+              ) : (
+                <EmptyState
+                  title="No rollout policy declaration"
+                  description="The current console payload does not include meta.rollout_policy for this runtime snapshot."
+                />
+              )}
+            </Panel>
+
+            <Panel
               title="Rollout state"
               description="Read-only rollout visibility comes directly from the current /api/console snapshot. This route does not add rollout prepare, canary, activate, or rollback controls."
             >
@@ -1037,7 +1094,9 @@ function App() {
                 />
               )}
             </Panel>
+          </div>
 
+          <div className="page-grid">
             <Panel
               title="Recent rollout evidence and limitations"
               description="Operation rows and rollout console meta stay read-only so the plugin route can surface rollout provenance without becoming a new control-plane surface."

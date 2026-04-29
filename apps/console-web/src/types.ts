@@ -267,6 +267,19 @@ export type ConsoleRBACConfig = {
   ConsoleReadPermission?: string;
 };
 
+export type ConsoleRolloutPolicyDeclaration = {
+  entryPoints?: string[];
+  preflightChecks?: string[];
+  activationChecks?: string[];
+  auditReasons?: string[];
+  recordStore?: string;
+  supportedModes?: string[];
+  unsupportedModes?: string[];
+  verificationEndpoints?: string[];
+  facts?: string[];
+  summary?: string;
+};
+
 export type ConsoleConfig = {
   Runtime: {
     Environment: string;
@@ -306,6 +319,8 @@ export type ConsoleMeta = {
   rbac_console_read_actor_header?: string;
   rbac_console_read_permission?: boolean;
   rbac_console_limitations?: string[];
+  rollout_policy?: ConsoleRolloutPolicyDeclaration;
+  rollout_record_store?: string;
   rollout_record_read_model?: string;
   rollout_record_persisted?: boolean;
   rollout_head_read_model?: string;

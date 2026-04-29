@@ -164,6 +164,17 @@ describe('App', () => {
     fireEvent.click(screen.getByLabelText('Open plugin plugin-echo details'));
     await screen.findByRole('heading', { name: 'Echo Plugin · plugin-echo' });
 
+    expect(screen.getByRole('heading', { name: 'Rollout policy declaration' })).toBeInTheDocument();
+    expect(screen.getByText('sqlite-current-runtime-rollout-operations')).toBeInTheDocument();
+    expect(screen.getByText('/admin prepare <plugin-id>')).toBeInTheDocument();
+    expect(screen.getByText('/admin activate <plugin-id>')).toBeInTheDocument();
+    expect(screen.getByText('manifest.id-match')).toBeInTheDocument();
+    expect(screen.getByText('prepared-record-required')).toBeInTheDocument();
+    expect(screen.getByText('rollout_prepared')).toBeInTheDocument();
+    expect(screen.getByText('manual-prepare-activate')).toBeInTheDocument();
+    expect(screen.getByText('staged-rollout')).toBeInTheDocument();
+    expect(screen.getByText('rollout is currently a manual admin chain limited to /admin prepare <plugin-id> and /admin activate <plugin-id>')).toBeInTheDocument();
+    expect(screen.getByText('manual /admin prepare|activate only; preflight checks ID|Mode|APIVersion|Version; activate re-checks drift before lifecycle enable; rollout attempts persist as operational records; audit reasons are minimal; no rollback or staged rollout')).toBeInTheDocument();
     expect(screen.getByRole('heading', { name: 'Rollout state' })).toBeInTheDocument();
     expect(screen.getByText('canary')).toBeInTheDocument();
     expect(screen.getByText('canarying')).toBeInTheDocument();
@@ -192,12 +203,14 @@ describe('App', () => {
     await screen.findByRole('heading', { name: 'Admin Plugin · plugin-admin' });
 
     expect(screen.getByRole('heading', { name: 'Rollout state' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Rollout policy declaration' })).toBeInTheDocument();
     expect(screen.getByText('No rollout state for this plugin')).toBeInTheDocument();
     expect(screen.getByText('The current console payload does not include a rollout head or rollout operation records for this plugin.')).toBeInTheDocument();
     expect(screen.getByText('No recent rollout operations')).toBeInTheDocument();
     expect(screen.getByText('The current console payload does not include rollout operation evidence for this plugin.')).toBeInTheDocument();
+    expect(screen.getByText('/admin prepare <plugin-id>')).toBeInTheDocument();
     expect(screen.getAllByText('sqlite-rollout-heads').length).toBeGreaterThan(0);
-    expect(screen.getByText('sqlite-rollout-operation-records')).toBeInTheDocument();
+    expect(screen.getAllByText('sqlite-rollout-operation-records').length).toBeGreaterThan(0);
   });
 
   it('retries a dead-letter job from the routed detail page and refetches the console payload afterward', async () => {
