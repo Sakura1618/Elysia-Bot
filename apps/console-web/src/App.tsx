@@ -42,6 +42,12 @@ type ActionState =
   | { kind: 'verification-error'; label: string; details: Record<string, unknown>; message: string; occurredAt: string }
   | { kind: 'error'; label: string; message: string; occurredAt: string };
 
+type ScheduleCancelVerificationState = {
+  scheduleId: string;
+  actionAccepted: boolean;
+  verifiedMissingAfterRefetch: boolean;
+};
+
 type PanelProps = {
   title: string;
   description?: string;
@@ -555,6 +561,7 @@ function App() {
   const [autoRefresh, setAutoRefresh] = useState(() => getStoredAutoRefresh());
   const [pluginEchoPrefixDraft, setPluginEchoPrefixDraft] = useState('');
   const [pluginEchoDirty, setPluginEchoDirty] = useState(false);
+  const [scheduleCancelVerification, setScheduleCancelVerification] = useState<ScheduleCancelVerificationState | null>(null);
   const hasLoadedOnce = useRef(false);
 
   const effectiveFilters = useMemo<ConsoleFilters>(() => {
@@ -680,10 +687,27 @@ function App() {
   const runAction = useCallback(
     async (label: string, path: string, body?: Record<string, unknown>) => {
       setActionState({ kind: 'pending', label });
+      const scheduleCancelTarget = /^\/demo\/schedules\/([^/]+)\/cancel$/u.exec(path)?.[1];
+      if (scheduleCancelTarget) {
+        setScheduleCancelVerification({
+          scheduleId: decodeURIComponent(scheduleCancelTarget),
+          actionAccepted: false,
+          verifiedMissingAfterRefetch: false,
+        });
+      }
       try {
         const result = await postOperatorAction(window.location.origin, currentBearerToken, path, body);
         try {
-          await refreshConsole({ throwOnError: true });
+          const payload = await refreshConsole({ throwOnError: true });
+          if (scheduleCancelTarget) {
+            const scheduleId = decodeURIComponent(scheduleCancelTarget);
+            const scheduleStillPresent = payload?.schedules.some((schedule) => schedule.id === scheduleId) ?? false;
+            setScheduleCancelVerification({
+              scheduleId,
+              actionAccepted: true,
+              verifiedMissingAfterRefetch: !scheduleStillPresent,
+            });
+          }
           setActionState({
             kind: 'success',
             label,
@@ -691,6 +715,13 @@ function App() {
             occurredAt: new Date().toISOString(),
           });
         } catch (refetchError) {
+          if (scheduleCancelTarget) {
+            setScheduleCancelVerification((current) =>
+              current && current.scheduleId === decodeURIComponent(scheduleCancelTarget)
+                ? { ...current, actionAccepted: true, verifiedMissingAfterRefetch: false }
+                : current,
+            );
+          }
           setActionState({
             kind: 'verification-error',
             label,
@@ -703,6 +734,9 @@ function App() {
           });
         }
       } catch (actionError) {
+        if (scheduleCancelTarget) {
+          setScheduleCancelVerification(null);
+        }
         setActionState({
           kind: 'error',
           label,
@@ -1540,9 +1574,39 @@ function App() {
   }
 
   function renderSchedules(payload: ConsolePayload) {
+    const scheduleOperatorScope = formatMetaString(payload.meta.schedule_operator_scope);
+    const scheduleOperatorActions = formatStringList(payload.meta.schedule_operator_actions);
+    const scheduleCancelSupported = supportsOperatorAction(payload.meta.schedule_operator_actions, '/demo/schedules/{schedule-id}/cancel');
+
     if (route.section === 'schedules' && route.scheduleId) {
       const schedule = payload.schedules.find((candidate) => candidate.id === route.scheduleId) ?? null;
       if (!schedule) {
+        const successfulScheduleCancel =
+          scheduleCancelVerification?.scheduleId === route.scheduleId &&
+          scheduleCancelVerification.actionAccepted &&
+          scheduleCancelVerification.verifiedMissingAfterRefetch;
+
+        if (successfulScheduleCancel) {
+          return (
+            <Panel
+              title="Schedule no longer returned after verification refetch"
+              description="The runtime accepted the existing cancel route, then the follow-up /api/console snapshot stopped returning this schedule ID. The detail route stays mounted so that verified absence remains explicit."
+              actions={
+                <RouteLink to={{ section: 'schedules' }} navigate={navigate} className="secondary-link" ariaLabel="Back to schedules">
+                  Back to schedules
+                </RouteLink>
+              }
+            >
+              <div className="detail-grid">
+                <DetailField label="Schedule ID" value={route.scheduleId} />
+                <DetailField label="Verification outcome" value="Absent from the refetched /api/console schedule snapshot" />
+                <DetailField label="Runtime scope" value={scheduleOperatorScope} />
+                <DetailField label="Runtime route" value={scheduleOperatorActions} />
+              </div>
+            </Panel>
+          );
+        }
+
         return <EmptyState title="Schedule not found" description="The current runtime snapshot does not include this schedule ID." />;
       }
 
@@ -1553,7 +1617,7 @@ function App() {
         <>
           <Panel
             title={`${schedule.id} · ${schedule.eventType}`}
-            description="Schedule detail routes carry persisted due-at evidence, startup recovery facts, and the existing cancel write path."
+            description="Schedule detail routes now keep due source, persisted readiness, claim context, and recovery provenance visible alongside the existing cancel write path."
             actions={
               <RouteLink to={{ section: 'schedules' }} navigate={navigate} className="secondary-link" ariaLabel="Back to schedules">
                 Back to schedules
@@ -1561,39 +1625,76 @@ function App() {
             }
           >
             <div className="detail-grid">
+              <DetailField
+                label="Due state"
+                value={<StatusPill label={schedule.dueStateSummary ?? 'scheduled'} tone={getStatusToneFromSchedule(schedule)} />}
+              />
               <DetailField label="Kind" value={schedule.kind} />
               <DetailField label="Source" value={schedule.source} />
+              <DetailField label="Config" value={scheduleConfigSummary(schedule)} />
               <DetailField label="Due at" value={formatTimestamp(schedule.dueAt)} />
-              <DetailField label="Due evidence" value={schedule.dueAtEvidence ?? '—'} />
-              <DetailField label="Recovery state" value={schedule.recoveryState ?? '—'} />
+              <DetailField label="Due source" value={formatMetaString(schedule.dueAtSource, 'not returned')} />
+              <DetailField
+                label="Due persisted"
+                value={
+                  <StatusPill
+                    label={schedule.dueAtPersisted ? 'persisted' : 'not persisted'}
+                    tone={schedule.dueAtPersisted ? 'good' : 'muted'}
+                  />
+                }
+              />
+              <DetailField
+                label="Due readiness"
+                value={<StatusPill label={schedule.dueReady ? 'ready for scheduler loop' : 'not ready yet'} tone={schedule.dueReady ? 'warning' : 'muted'} />}
+              />
+              <DetailField
+                label="Claim state"
+                value={<StatusPill label={schedule.claimed ? 'claimed' : 'not claimed'} tone={schedule.claimed ? 'default' : 'muted'} />}
+              />
               <DetailField label="Claim owner" value={schedule.claimOwner || '—'} />
               <DetailField label="Claimed at" value={formatTimestamp(schedule.claimedAt)} />
-              <DetailField label="Config" value={scheduleConfigSummary(schedule)} />
+              <DetailField
+                label="Overdue"
+                value={<StatusPill label={schedule.overdue ? 'overdue' : 'within due window'} tone={schedule.overdue ? 'danger' : 'good'} />}
+              />
+              <DetailField label="Recovery state" value={formatMetaString(schedule.recoveryState, 'not returned')} />
             </div>
           </Panel>
 
           <div className="page-grid two-column">
             <Panel title="Schedule cancel" description="Cancel remains a narrow runtime operator action; the browser carries bearer auth and refetches evidence afterward.">
-              <div className="action-card">
-                <div className="action-copy">
-                  <strong>Cancel schedule</strong>
-                  <p>Useful for local/dev operators when a due or stale schedule should stop before the next scheduler loop.</p>
-                  <span className="list-meta">Likely RBAC actors: {formatStringList(actorsLikelyAllowed(payload.config, 'schedule:cancel', schedule.id))}</span>
+              {!scheduleCancelSupported ? (
+                <EmptyState
+                  title="Schedule cancel not exposed by this snapshot"
+                  description={`The current runtime scope says ${scheduleOperatorScope}, but this schedule snapshot did not advertise the cancel endpoint.`}
+                />
+              ) : (
+                <div className="action-card">
+                  <div className="action-copy">
+                    <strong>Cancel schedule</strong>
+                    <p>Useful for local/dev operators when a due or stale schedule should stop before the next scheduler loop.</p>
+                    <span className="list-meta">Runtime scope: {scheduleOperatorScope}</span>
+                    <span className="list-meta">Runtime route: {scheduleOperatorActions}</span>
+                    <span className="list-meta">Likely RBAC actors: {formatStringList(actorsLikelyAllowed(payload.config, 'schedule:cancel', schedule.id))}</span>
+                  </div>
+                  <button
+                    type="button"
+                    className="primary-button"
+                    disabled={actionBusy}
+                    onClick={() => void runAction(`Cancel ${schedule.id}`, `/demo/schedules/${schedule.id}/cancel`)}
+                  >
+                    Cancel schedule
+                  </button>
                 </div>
-                <button
-                  type="button"
-                  className="primary-button"
-                  disabled={actionBusy}
-                  onClick={() => void runAction(`Cancel ${schedule.id}`, `/demo/schedules/${schedule.id}/cancel`)}
-                >
-                  Cancel schedule
-                </button>
-              </div>
+              )}
             </Panel>
 
-            <Panel title="Schedule evidence" description="The browser surfaces more of the persisted schedule payload because it materially improves the detail experience.">
+            <Panel
+              title="Schedule recovery and provenance"
+              description="These facts already come from the runtime schedule snapshot; the route now keeps them explicit so persistence, due evidence, and restart recovery are not compressed into one line."
+            >
               <div className="detail-grid">
-                <DetailField label="Due state" value={schedule.dueStateSummary ?? '—'} />
+                <DetailField label="Due evidence" value={formatMetaString(schedule.dueAtEvidence, 'not returned')} />
                 <DetailField label="Due summary" value={schedule.dueSummary ?? '—'} />
                 <DetailField label="Schedule summary" value={schedule.scheduleSummary ?? '—'} />
                 <DetailField label="Created at" value={formatTimestamp(schedule.createdAt)} />
@@ -1615,7 +1716,10 @@ function App() {
                         <StatusPill label={entry.allowed ? 'allowed' : 'denied'} tone={entry.allowed ? 'good' : 'danger'} />
                       </div>
                       <p>{entry.reason ?? 'no reason'}</p>
-                      <span className="list-meta">{entry.actor || 'header omitted'} · {formatTimestamp(entry.occurred_at)}</span>
+                      <span className="list-meta">
+                        {entry.actor || 'header omitted'} · {entry.permission ?? 'no permission field'} · session {entry.session_id ?? 'not returned'} ·{' '}
+                        {formatTimestamp(entry.occurred_at)}
+                      </span>
                       {formatAuditObservability(entry) ? <span className="list-meta">{formatAuditObservability(entry)}</span> : null}
                     </article>
                   ))}

@@ -613,7 +613,7 @@ describe('App', () => {
     await screen.findByRole('heading', { name: 'Operator action accepted, but verification refetch failed' });
     expect(screen.queryByRole('heading', { name: 'Operator action accepted' })).not.toBeInTheDocument();
     expect(screen.getByText('Console API unavailable')).toBeInTheDocument();
-    expect(screen.getAllByText('console refetch denied').length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/console refetch denied/i).length).toBeGreaterThan(0);
 
     const [initialURL, initialInit] = requestAt(fetchMock, 0);
     expect(initialURL.pathname).toBe('/api/console');
@@ -630,7 +630,28 @@ describe('App', () => {
     expect(requestPathnames(fetchMock)).toEqual(['/api/console', '/demo/jobs/job-console-ready/pause', '/api/console']);
   });
 
-  it('cancels a schedule from the routed detail page and refetches the console payload afterward', async () => {
+  it('shows schedule recovery and provenance evidence on the routed schedule detail page', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(createFetchResponse(consolePayload));
+    globalThis.fetch = fetchMock as typeof fetch;
+
+    render(<App />);
+    await screen.findByRole('heading', { name: 'Local operator console' });
+
+    fireEvent.click(screen.getByLabelText('Open schedule schedule-console details'));
+    await screen.findByRole('heading', { name: 'schedule-console · message.received' });
+
+    expect(screen.getByText('claimed after due recovery')).toBeInTheDocument();
+    expect(screen.getByText('sqlite-schedule-plans')).toBeInTheDocument();
+    expect(screen.getByText('persisted dueAt restored from sqlite schedule plan state during runtime recovery')).toBeInTheDocument();
+    expect(screen.getByText('runtime-local:scheduler-loop')).toBeInTheDocument();
+    expect(screen.getByText('recovered-from-persisted-schedule-plan')).toBeInTheDocument();
+    expect(screen.getByText(/currently-registered schedules only/i)).toBeInTheDocument();
+    expect(screen.getByText(/\/demo\/schedules\/\{schedule-id\}\/cancel/i)).toBeInTheDocument();
+    expect(screen.getByText(/schedule-console recovered persisted dueAt and claimed by runtime-local:scheduler-loop/i)).toBeInTheDocument();
+    expect(screen.getByText('No schedule audits')).toBeInTheDocument();
+  });
+
+  it('cancels a schedule from the routed detail page, refetches the console payload, and keeps the route in a verified absent state afterward', async () => {
     const cancelledPayload = cloneMockConsoleData();
     cancelledPayload.schedules = [];
 
@@ -648,9 +669,14 @@ describe('App', () => {
 
     fireEvent.click(screen.getByLabelText('Open schedule schedule-console details'));
     await screen.findByRole('heading', { name: 'schedule-console · message.received' });
+    expect(window.location.pathname).toBe('/schedules/schedule-console');
 
     fireEvent.click(screen.getByRole('button', { name: 'Cancel schedule' }));
-    await screen.findByText('Operator action accepted');
+    await screen.findByRole('heading', { name: 'Operator action accepted' });
+    await screen.findByRole('heading', { name: 'Schedule no longer returned after verification refetch' });
+    await screen.findByText('Absent from the refetched /api/console schedule snapshot');
+    await screen.findByText(/currently-registered schedules only/i);
+    await screen.findByText(/\/demo\/schedules\/\{schedule-id\}\/cancel/i);
 
     const actionCall = findRequestByPath(fetchMock, '/demo/schedules/schedule-console/cancel');
     expect(actionCall).toBeDefined();
@@ -659,10 +685,56 @@ describe('App', () => {
     }
     const [actionURL, actionInit] = actionCall;
     expect(actionURL.pathname).toBe('/demo/schedules/schedule-console/cancel');
+    expect(actionInit?.method).toBe('POST');
     expect((actionInit?.headers as Headers).get('Authorization')).toBe('Bearer opaque-viewer-token');
     expect(fetchMock).toHaveBeenCalledTimes(4);
+
+    const [initialURL, initialInit] = requestAt(fetchMock, 0);
+    expect(initialURL.pathname).toBe('/api/console');
+    expect(initialURL.searchParams.get('plugin_id')).toBeNull();
+    expect((initialInit?.headers as Headers).get('Authorization')).toBe('Bearer opaque-viewer-token');
+
+    const [secondURL] = requestAt(fetchMock, 1);
+    expect(secondURL.pathname).toBe('/api/console');
+
     const finalRequest = fetchMock.mock.calls[3]?.[0] as URL;
     expect(finalRequest.pathname).toBe('/api/console');
+    expect(requestPathnames(fetchMock)).toEqual(['/api/console', '/api/console', '/demo/schedules/schedule-console/cancel', '/api/console']);
+    expect(window.location.pathname).toBe('/schedules/schedule-console');
+    expect(screen.queryByRole('button', { name: 'Cancel schedule' })).not.toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'Back to schedules' })).toBeInTheDocument();
+  });
+
+  it('shows schedule cancel verification failure without claiming the schedule disappeared', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(createFetchResponse(consolePayload))
+      .mockResolvedValueOnce(createFetchResponse(consolePayload))
+      .mockResolvedValueOnce(createFetchResponse({ status: 'ok', schedule_id: 'schedule-console', action: 'cancel' }))
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 503,
+        json: async () => ({ message: 'console refetch denied' }),
+        text: async () => 'console refetch denied',
+      })
+      .mockResolvedValueOnce(createFetchResponse({
+        ...cloneMockConsoleData(),
+        schedules: [],
+      }));
+    globalThis.fetch = fetchMock as typeof fetch;
+    window.localStorage.setItem('bot-platform.console.operator-bearer-token', 'opaque-viewer-token');
+    window.history.replaceState({}, '', '/schedules/schedule-console');
+
+    render(<App />);
+    await screen.findByRole('heading', { name: 'schedule-console · message.received' });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel schedule' }));
+
+    await screen.findByRole('heading', { name: 'Operator action accepted, but verification refetch failed' });
+    expect(screen.getByText('Console API unavailable')).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Schedule no longer returned after verification refetch' })).not.toBeInTheDocument();
+
+    expect(window.location.pathname).toBe('/schedules/schedule-console');
   });
 
   it('shows workflow observability ids on the routed workflow detail page', async () => {

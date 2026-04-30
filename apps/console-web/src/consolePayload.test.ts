@@ -7,6 +7,8 @@ describe('parseConsolePayload', () => {
     const payload = cloneMockConsoleData();
 
     const parsed = parseConsolePayload(payload);
+    const pluginDisableAudit = parsed.audits.find((entry) => entry.target === 'plugin-echo' && entry.action === 'disable');
+    const jobRetryAudit = parsed.audits.find((entry) => entry.target === 'job-dead-letter-console' && entry.action === 'retry');
 
     expect(parsed.meta.console_mode).toBe('read+operator-plugin-enable-disable+plugin-config+job-control+schedule-cancel');
     expect(parsed.meta.job_operator_actions).toEqual([
@@ -20,16 +22,21 @@ describe('parseConsolePayload', () => {
     expect(parsed.meta.rbac_console_read_actor_header).toBe('X-Bot-Platform-Actor');
     expect(parsed.plugins[0]?.config).toEqual({ prefix: 'persisted: ' });
     expect(parsed.alerts[0]?.objectId).toBe('job-dead-letter-console');
+    expect(parsed.schedules[0]?.dueAtSource).toBe('sqlite-schedule-plans');
+    expect(parsed.schedules[0]?.dueReady).toBe(false);
+    expect(parsed.schedules[0]?.claimOwner).toBe('runtime-local:scheduler-loop');
+    expect(parsed.schedules[0]?.recoveryState).toBe('recovered-from-persisted-schedule-plan');
     expect(parsed.workflows[0]?.status).toBe('waiting_event');
     expect(parsed.workflows[0]?.traceId).toBe('trace-workflow-console');
     expect(parsed.workflows[0]?.eventId).toBe('evt-workflow-console-origin');
     expect(parsed.workflows[0]?.runId).toBe('run-workflow-console');
     expect(parsed.workflows[0]?.correlationId).toBe('corr-workflow-console');
-    expect(parsed.audits[0]?.occurred_at).toBe('2026-04-19T11:43:00Z');
-    expect(parsed.audits[0]?.trace_id).toBe('trace-console-audit-plugin-disable');
-    expect(parsed.audits[0]?.session_id).toBe('session-operator-bearer-admin-user');
-    expect(parsed.audits[0]?.error_code).toBe('plugin_disabled');
-    expect(parsed.audits[2]?.session_id).toBe('session-operator-bearer-job-operator');
+    expect(pluginDisableAudit?.occurred_at).toBe('2026-04-19T11:43:00Z');
+    expect(pluginDisableAudit?.trace_id).toBe('trace-console-audit-plugin-disable');
+    expect(pluginDisableAudit?.session_id).toBe('session-operator-bearer-admin-user');
+    expect(pluginDisableAudit?.error_code).toBe('plugin_disabled');
+    expect(jobRetryAudit?.session_id).toBe('session-operator-bearer-job-operator');
+    expect(parsed.audits.some((entry) => entry.target === 'schedule-console' && entry.action === 'cancel')).toBe(false);
     expect(parsed.rolloutHeads[0]?.pluginId).toBe('plugin-echo');
     expect(parsed.rolloutHeads[0]?.phase).toBe('canary');
     expect(parsed.rolloutHeads[0]?.active.version).toBe('0.2.0-candidate');
